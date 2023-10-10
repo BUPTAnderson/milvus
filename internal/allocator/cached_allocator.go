@@ -18,13 +18,14 @@ package allocator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 const (

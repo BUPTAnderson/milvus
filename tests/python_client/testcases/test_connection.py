@@ -541,7 +541,8 @@ class TestConnectionOperation(TestcaseBase):
         self.connection_wrap.get_connection_addr(alias=connect_name, check_task=ct.CheckTasks.ccr,
                                                  check_items={ct.dict_content: {"address": f"{host}:{port}",
                                                                                 "user": ""}})
-
+     
+    @pytest.mark.skip("not support now")
     @pytest.mark.tags(ct.CaseLabel.L2)
     @pytest.mark.parametrize("connect_name", [DefaultConfig.DEFAULT_USING, "test_alias_nme"])
     def test_connection_connect_wrong_params(self, host, port, connect_name):
@@ -822,7 +823,7 @@ class TestConnect(TestcaseBase):
         self.connection_wrap.disconnect(alias=connect_name)
 
     @pytest.mark.tags(ct.CaseLabel.L2)
-    @pytest.mark.parametrize("protocol", ["http", "https", "ftp", "tcp"])
+    @pytest.mark.parametrize("protocol", ["http", "ftp", "tcp"])
     @pytest.mark.parametrize("connect_name", [DefaultConfig.DEFAULT_USING])
     def test_parameters_with_uri_connection(self, host, port, connect_name, protocol):
         """
@@ -845,7 +846,7 @@ class TestConnect(TestcaseBase):
         address = "{}:{}".format(host, port)
         self.connection_wrap.connect(alias=connect_name, address=address, check_task=ct.CheckTasks.ccr)
 
-    @pytest.mark.tags(ct.CaseLabel.L3)
+    @pytest.mark.tags(ct.CaseLabel.RBAC)
     @pytest.mark.parametrize("connect_name", [DefaultConfig.DEFAULT_USING])
     def test_connect_with_default_user_password(self, host, port, connect_name):
         """
@@ -930,7 +931,7 @@ class TestConnectUriInvalid(TestcaseBase):
                                      check_items={ct.err_code: 2})
 
     @pytest.mark.tags(ct.CaseLabel.L2)
-    @pytest.mark.parametrize("port", ["8080", "443", "0", "65536"])
+    @pytest.mark.parametrize("port", ["8080", "443", "0", "65534"])
     @pytest.mark.parametrize("connect_name", [DefaultConfig.DEFAULT_USING])
     @pytest.mark.parametrize("protocol", ["http", "https"])
     def test_parameters_with_invalid_port(self, host, port, connect_name, protocol):
@@ -946,7 +947,7 @@ class TestConnectUriInvalid(TestcaseBase):
 
     @pytest.mark.tags(ct.CaseLabel.L2)
     @pytest.mark.parametrize("host", ["www.google.com"])
-    @pytest.mark.parametrize("port", ["65535", "19530"])
+    @pytest.mark.parametrize("port", ["65534", "19530"])
     @pytest.mark.parametrize("connect_name", [DefaultConfig.DEFAULT_USING])
     @pytest.mark.parametrize("protocol", ["http", "https"])
     def test_parameters_with_invalid_url(self, host, port, connect_name, protocol):
@@ -997,19 +998,19 @@ class TestConnectUserPasswordInvalid(TestcaseBase):
     Test connect server with user and password , the result should be failed
     """
 
-    @pytest.mark.tags(ct.CaseLabel.L3)
-    @pytest.mark.parametrize("port", ["19530"])
+    @pytest.mark.tags(ct.CaseLabel.RBAC)
     def test_connect_without_user_password_after_authorization_enabled(self, host, port):
         """
         target: test connect without user password after authorization enabled
         method: connect without parameters of user and password
         excepted: connected is false
         """
-        self.connection_wrap.connect(host=host, port=port, check_task=ct.CheckTasks.ccr)
-        self.utility_wrap.list_collections(check_task=ct.CheckTasks.err_res,
-                                           check_items={ct.err_code: 1})
+        self.connection_wrap.connect(host=host, port=port,
+                                     check_task=ct.CheckTasks.err_res,
+                                     check_items={ct.err_code: 2,
+                                                  ct.err_msg: "Fail connecting to server"})
 
-    @pytest.mark.tags(ct.CaseLabel.L3)
+    @pytest.mark.tags(ct.CaseLabel.RBAC)
     @pytest.mark.parametrize("user", ["alice3333"])
     def test_connect_with_invalid_user_connection(self, host, port, user):
         """
@@ -1018,11 +1019,11 @@ class TestConnectUserPasswordInvalid(TestcaseBase):
         excepted: connected is false
         """
         self.connection_wrap.connect(host=host, port=port, user=user, password="abc123",
-                                     check_task=ct.CheckTasks.ccr)
-        self.utility_wrap.list_collections(check_task=ct.CheckTasks.err_res,
-                                           check_items={ct.err_code: 1})
+                                     check_task=ct.CheckTasks.err_res,
+                                     check_items={ct.err_code: 2,
+                                                  ct.err_msg: "Fail connecting to server"})
 
-    @pytest.mark.tags(ct.CaseLabel.L3)
+    @pytest.mark.tags(ct.CaseLabel.RBAC)
     @pytest.mark.parametrize("user", ["anny015"])
     @pytest.mark.parametrize("connect_name", [DefaultConfig.DEFAULT_USING])
     def test_connect_with_password_invalid(self, host, port, user, connect_name):
@@ -1040,6 +1041,7 @@ class TestConnectUserPasswordInvalid(TestcaseBase):
 
         # 3.connect with the created user and wrong password
         self.connection_wrap.disconnect(alias=connect_name)
-        self.connection_wrap.connect(host=host, port=port, user=user, password=ct.default_password)
-        self.utility_wrap.list_collections(check_task=ct.CheckTasks.err_res,
-                                           check_items={ct.err_code: 1})
+        self.connection_wrap.connect(host=host, port=port, user=user, password=ct.default_password,
+                                     check_task=ct.CheckTasks.err_res,
+                                     check_items={ct.err_code: 2,
+                                                  ct.err_msg: "Fail connecting to server"})

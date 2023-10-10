@@ -16,27 +16,34 @@
 
 #pragma once
 
-#include <memory>
-#include <limits>
-#include <string>
-#include <utility>
-#include <vector>
-#include <unordered_map>
 #include <tbb/concurrent_unordered_map.h>
 #include <tbb/concurrent_unordered_set.h>
+#include <nlohmann/json.hpp>
+#include <NamedType/named_type.hpp>
 #include <boost/align/aligned_allocator.hpp>
 #include <boost/container/vector.hpp>
 #include <boost/dynamic_bitset.hpp>
-#include <NamedType/named_type.hpp>
-#include <variant>
+#include <folly/FBVector.h>
 
-#include "knowhere/index/vector_index/helpers/IndexParameter.h"
-#include <knowhere/index/IndexType.h>
-#include "knowhere/common/BinarySet.h"
-#include "knowhere/common/Dataset.h"
+#include <limits>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "fmt/core.h"
+#include "knowhere/binaryset.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
+#include "simdjson.h"
+#include "pb/plan.pb.h"
 #include "pb/schema.pb.h"
 #include "pb/segcore.pb.h"
-#include "pb/plan.pb.h"
+#include "Json.h"
 
 namespace milvus {
 
@@ -44,6 +51,33 @@ using idx_t = int64_t;
 using offset_t = int32_t;
 using date_t = int32_t;
 using distance_t = float;
+
+union float16 {
+    unsigned short bits;
+    struct {
+        unsigned short mantissa : 10;
+        unsigned short exponent : 5;
+        unsigned short sign : 1;
+    } parts;
+    float16() {
+    }
+    float16(float f) {
+        unsigned int i = *(unsigned int*)&f;
+        unsigned int sign = (i >> 31) & 0x0001;
+        unsigned int exponent = ((i >> 23) & 0xff) - 127 + 15;
+        unsigned int mantissa = (i >> 13) & 0x3ff;
+        parts.sign = sign;
+        parts.exponent = exponent;
+        parts.mantissa = mantissa;
+    }
+    operator float() const {
+        unsigned int sign = parts.sign << 31;
+        unsigned int exponent = (parts.exponent - 15 + 127) << 23;
+        unsigned int mantissa = parts.mantissa << 13;
+        unsigned int bits = sign | exponent | mantissa;
+        return *(float*)&bits;
+    }
+};
 
 enum class DataType {
     NONE = 0,
@@ -58,9 +92,12 @@ enum class DataType {
 
     STRING = 20,
     VARCHAR = 21,
+    ARRAY = 22,
+    JSON = 23,
 
     VECTOR_BINARY = 100,
     VECTOR_FLOAT = 101,
+    VECTOR_FLOAT16 = 102,
 };
 
 using Timestamp = uint64_t;  // TODO: use TiKV-like timestamp
@@ -75,6 +112,7 @@ using VectorArray = proto::schema::VectorField;
 using IdArray = proto::schema::IDs;
 using InsertData = proto::segcore::InsertRecord;
 using PkType = std::variant<std::monostate, int64_t, std::string>;
+using ContainsType = proto::plan::JSONContainsExpr_JSONOp;
 
 inline bool
 IsPrimaryKeyDataType(DataType data_type) {
@@ -90,7 +128,8 @@ template <class...>
 constexpr std::false_type always_false{};
 
 template <typename T>
-using aligned_vector = std::vector<T, boost::alignment::aligned_allocator<T, 64>>;
+using aligned_vector =
+    std::vector<T, boost::alignment::aligned_allocator<T, 64>>;
 
 namespace impl {
 // hide identifier name to make auto-completion happy
@@ -100,29 +139,159 @@ struct FieldOffsetTag;
 struct SegOffsetTag;
 };  // namespace impl
 
-using FieldId = fluent::NamedType<int64_t, impl::FieldIdTag, fluent::Comparable, fluent::Hashable>;
-using FieldName = fluent::NamedType<std::string, impl::FieldNameTag, fluent::Comparable, fluent::Hashable>;
+using FieldId = fluent::
+    NamedType<int64_t, impl::FieldIdTag, fluent::Comparable, fluent::Hashable>;
+using FieldName = fluent::NamedType<std::string,
+                                    impl::FieldNameTag,
+                                    fluent::Comparable,
+                                    fluent::Hashable>;
 // using FieldOffset = fluent::NamedType<int64_t, impl::FieldOffsetTag, fluent::Comparable, fluent::Hashable>;
-using SegOffset = fluent::NamedType<int64_t, impl::SegOffsetTag, fluent::Arithmetic>;
+using SegOffset =
+    fluent::NamedType<int64_t, impl::SegOffsetTag, fluent::Arithmetic>;
 
 using BitsetType = boost::dynamic_bitset<>;
 using BitsetTypePtr = std::shared_ptr<boost::dynamic_bitset<>>;
 using BitsetTypeOpt = std::optional<BitsetType>;
 
 template <typename Type>
-using FixedVector = boost::container::vector<Type>;
+using FixedVector = folly::fbvector<
+    Type>;  // boost::container::vector has memory leak when version > 1.79, so use folly::fbvector instead
 
 using Config = nlohmann::json;
-using TargetBitmap = boost::dynamic_bitset<>;
+using TargetBitmap = FixedVector<bool>;
 using TargetBitmapPtr = std::unique_ptr<TargetBitmap>;
 
 using BinaryPtr = knowhere::BinaryPtr;
 using BinarySet = knowhere::BinarySet;
-using DatasetPtr = knowhere::DatasetPtr;
+using Dataset = knowhere::DataSet;
+using DatasetPtr = knowhere::DataSetPtr;
 using MetricType = knowhere::MetricType;
+using IndexVersion = knowhere::IndexVersion;
 // TODO :: type define milvus index type(vector index type and scalar index type)
 using IndexType = knowhere::IndexType;
-// TODO :: type define milvus index mode, add transfer func from milvus index mode to knowhere index mode
-using IndexMode = knowhere::IndexMode;
 
+// Plus 1 because we can't use greater(>) symbol
+constexpr size_t REF_SIZE_THRESHOLD = 16 + 1;
+
+using BitsetBlockType = BitsetType::block_type;
+constexpr size_t BITSET_BLOCK_SIZE = sizeof(BitsetType::block_type);
+constexpr size_t BITSET_BLOCK_BIT_SIZE = sizeof(BitsetType::block_type) * 8;
+template <typename T>
+using MayConstRef = std::conditional_t<std::is_same_v<T, std::string> ||
+                                           std::is_same_v<T, milvus::Json>,
+                                       const T&,
+                                       T>;
+static_assert(std::is_same_v<const std::string&, MayConstRef<std::string>>);
 }  // namespace milvus
+   //
+template <>
+struct fmt::formatter<milvus::DataType> : formatter<string_view> {
+    auto
+    format(milvus::DataType c, format_context& ctx) const {
+        string_view name = "unknown";
+        switch (c) {
+            case milvus::DataType::NONE:
+                name = "NONE";
+                break;
+            case milvus::DataType::BOOL:
+                name = "BOOL";
+                break;
+            case milvus::DataType::INT8:
+                name = "INT8";
+                break;
+            case milvus::DataType::INT16:
+                name = "INT16";
+                break;
+            case milvus::DataType::INT32:
+                name = "INT32";
+                break;
+            case milvus::DataType::INT64:
+                name = "INT64";
+                break;
+            case milvus::DataType::FLOAT:
+                name = "FLOAT";
+                break;
+            case milvus::DataType::DOUBLE:
+                name = "DOUBLE";
+                break;
+            case milvus::DataType::STRING:
+                name = "STRING";
+                break;
+            case milvus::DataType::VARCHAR:
+                name = "VARCHAR";
+                break;
+            case milvus::DataType::ARRAY:
+                name = "ARRAY";
+                break;
+            case milvus::DataType::JSON:
+                name = "JSON";
+                break;
+            case milvus::DataType::VECTOR_BINARY:
+                name = "VECTOR_BINARY";
+                break;
+            case milvus::DataType::VECTOR_FLOAT:
+                name = "VECTOR_FLOAT";
+                break;
+            case milvus::DataType::VECTOR_FLOAT16:
+                name = "VECTOR_FLOAT16";
+                break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};
+
+template <>
+struct fmt::formatter<milvus::OpType> : formatter<string_view> {
+    auto
+    format(milvus::OpType c, format_context& ctx) const {
+        string_view name = "unknown";
+        switch (c) {
+            case milvus::OpType::Invalid:
+                name = "Invalid";
+                break;
+            case milvus::OpType::GreaterThan:
+                name = "GreaterThan";
+                break;
+            case milvus::OpType::GreaterEqual:
+                name = "GreaterEqual";
+                break;
+            case milvus::OpType::LessThan:
+                name = "LessThan";
+                break;
+            case milvus::OpType::LessEqual:
+                name = "LessEqual";
+                break;
+            case milvus::OpType::Equal:
+                name = "Equal";
+                break;
+            case milvus::OpType::NotEqual:
+                name = "NotEqual";
+                break;
+            case milvus::OpType::PrefixMatch:
+                name = "PrefixMatch";
+                break;
+            case milvus::OpType::PostfixMatch:
+                name = "PostfixMatch";
+                break;
+            case milvus::OpType::Match:
+                name = "Match";
+                break;
+            case milvus::OpType::Range:
+                name = "Range";
+                break;
+            case milvus::OpType::In:
+                name = "In";
+                break;
+            case milvus::OpType::NotIn:
+                name = "NotIn";
+                break;
+            case milvus::OpType::OpType_INT_MIN_SENTINEL_DO_NOT_USE_:
+                name = "OpType_INT_MIN_SENTINEL_DO_NOT_USE";
+                break;
+            case milvus::OpType::OpType_INT_MAX_SENTINEL_DO_NOT_USE_:
+                name = "OpType_INT_MAX_SENTINEL_DO_NOT_USE";
+                break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};

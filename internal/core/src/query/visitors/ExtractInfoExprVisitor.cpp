@@ -19,7 +19,8 @@ namespace impl {
 // WILL BE USED BY GENERATOR UNDER suvlim/core_gen/
 class ExtractInfoExprVisitor : ExprVisitor {
  public:
-    explicit ExtractInfoExprVisitor(ExtractedPlanInfo& plan_info) : plan_info_(plan_info) {
+    explicit ExtractInfoExprVisitor(ExtractedPlanInfo& plan_info)
+        : plan_info_(plan_info) {
     }
 
  private:
@@ -40,17 +41,17 @@ ExtractInfoExprVisitor::visit(LogicalBinaryExpr& expr) {
 
 void
 ExtractInfoExprVisitor::visit(TermExpr& expr) {
-    plan_info_.add_involved_field(expr.field_id_);
+    plan_info_.add_involved_field(expr.column_.field_id);
 }
 
 void
 ExtractInfoExprVisitor::visit(UnaryRangeExpr& expr) {
-    plan_info_.add_involved_field(expr.field_id_);
+    plan_info_.add_involved_field(expr.column_.field_id);
 }
 
 void
 ExtractInfoExprVisitor::visit(BinaryRangeExpr& expr) {
-    plan_info_.add_involved_field(expr.field_id_);
+    plan_info_.add_involved_field(expr.column_.field_id);
 }
 
 void
@@ -61,7 +62,22 @@ ExtractInfoExprVisitor::visit(CompareExpr& expr) {
 
 void
 ExtractInfoExprVisitor::visit(BinaryArithOpEvalRangeExpr& expr) {
-    plan_info_.add_involved_field(expr.field_id_);
+    plan_info_.add_involved_field(expr.column_.field_id);
+}
+
+void
+ExtractInfoExprVisitor::visit(ExistsExpr& expr) {
+    plan_info_.add_involved_field(expr.column_.field_id);
+}
+
+void
+ExtractInfoExprVisitor::visit(AlwaysTrueExpr& expr) {
+    // all is involved.
+}
+
+void
+ExtractInfoExprVisitor::visit(JsonContainsExpr& expr) {
+    plan_info_.add_involved_field(expr.column_.field_id);
 }
 
 }  // namespace milvus::query

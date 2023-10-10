@@ -19,14 +19,15 @@ package storage
 import (
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 const originalSizeKey = "original_size"
@@ -64,7 +65,6 @@ func (data *descriptorEventData) GetEventDataFixPartSize() int32 {
 // GetMemoryUsageInBytes returns the memory size of DescriptorEventDataFixPart.
 func (data *descriptorEventData) GetMemoryUsageInBytes() int32 {
 	return data.GetEventDataFixPartSize() + int32(binary.Size(data.PostHeaderLengths)) + int32(binary.Size(data.ExtraLength)) + data.ExtraLength
-
 }
 
 // AddExtra add extra params to description event.
@@ -367,36 +367,42 @@ func newInsertEventData() *insertEventData {
 		EndTimestamp:   0,
 	}
 }
+
 func newDeleteEventData() *deleteEventData {
 	return &deleteEventData{
 		StartTimestamp: 0,
 		EndTimestamp:   0,
 	}
 }
+
 func newCreateCollectionEventData() *createCollectionEventData {
 	return &createCollectionEventData{
 		StartTimestamp: 0,
 		EndTimestamp:   0,
 	}
 }
+
 func newDropCollectionEventData() *dropCollectionEventData {
 	return &dropCollectionEventData{
 		StartTimestamp: 0,
 		EndTimestamp:   0,
 	}
 }
+
 func newCreatePartitionEventData() *createPartitionEventData {
 	return &createPartitionEventData{
 		StartTimestamp: 0,
 		EndTimestamp:   0,
 	}
 }
+
 func newDropPartitionEventData() *dropPartitionEventData {
 	return &dropPartitionEventData{
 		StartTimestamp: 0,
 		EndTimestamp:   0,
 	}
 }
+
 func newIndexFileEventData() *indexFileEventData {
 	return &indexFileEventData{
 		StartTimestamp: 0,

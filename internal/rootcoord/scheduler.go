@@ -1,3 +1,19 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rootcoord
 
 import (
@@ -5,14 +21,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/log"
-
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/tso"
-
 	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/tso"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 type IScheduler interface {
@@ -54,6 +68,9 @@ func newScheduler(ctx context.Context, idAllocator allocator.Interface, tsoAlloc
 func (s *scheduler) Start() {
 	s.wg.Add(1)
 	go s.taskLoop()
+
+	s.wg.Add(1)
+	go s.syncTsLoop()
 }
 
 func (s *scheduler) Stop() {
@@ -63,6 +80,7 @@ func (s *scheduler) Stop() {
 
 func (s *scheduler) execute(task task) {
 	defer s.setMinDdlTs(task.GetTs()) // we should update ts, whatever task succeeds or not.
+	task.SetInQueueDuration()
 	if err := task.Prepare(task.GetCtx()); err != nil {
 		task.NotifyDone(err)
 		return
@@ -73,7 +91,21 @@ func (s *scheduler) execute(task task) {
 
 func (s *scheduler) taskLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(Params.ProxyCfg.TimeTickInterval)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case task := <-s.taskChan:
+			s.execute(task)
+		}
+	}
+}
+
+// syncTsLoop send a base task into queue periodically, the base task will gain the latest ts which is bigger than
+// everyone in the queue. The scheduler will update the ts after the task is finished.
+func (s *scheduler) syncTsLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(Params.ProxyCfg.TimeTickInterval.GetAsDuration(time.Millisecond))
 	defer ticker.Stop()
 	for {
 		select {
@@ -81,22 +113,14 @@ func (s *scheduler) taskLoop() {
 			return
 		case <-ticker.C:
 			s.updateLatestTsoAsMinDdlTs()
-		case task := <-s.taskChan:
-			s.execute(task)
 		}
 	}
 }
 
 func (s *scheduler) updateLatestTsoAsMinDdlTs() {
-	if len(s.taskChan) > 0 {
-		return
-	}
-
-	ts, err := s.tsoAllocator.GenerateTSO(1)
-	if err != nil {
-		log.Warn("failed to generate tso, ignore to update min ddl ts", zap.Error(err))
-	} else {
-		s.setMinDdlTs(ts)
+	t := newBaseTask(context.Background(), nil)
+	if err := s.AddTask(&t); err != nil {
+		log.Warn("failed to update latest ddl ts", zap.Error(err))
 	}
 }
 

@@ -20,10 +20,13 @@ import (
 	"context"
 	"math"
 	"math/rand"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 // Flow graph basic example: count `c = pow(a) + 2`
@@ -56,12 +59,16 @@ func (m *numMsg) TimeTick() Timestamp {
 	return Timestamp(0)
 }
 
+func (m *numMsg) IsClose() bool {
+	return false
+}
+
 func (n *nodeA) Name() string {
 	return "NodeA"
 }
 
 func (n *nodeA) Operate(in []Msg) []Msg {
-	// ignore `in` because nodeA doesn't have any upstream node.
+	// ignore `in` because nodeA doesn't have any upstream node.git s
 	a := <-n.inputChan
 	var res Msg = &numMsg{
 		num: a,
@@ -131,7 +138,7 @@ func createExampleFlowGraph() (*TimeTickedFlowGraph, chan float64, chan float64,
 	fg.AddNode(b)
 	fg.AddNode(c)
 
-	var err = fg.SetEdges(a.Name(),
+	err := fg.SetEdges(a.Name(),
 		[]string{b.Name()},
 	)
 	if err != nil {
@@ -153,6 +160,12 @@ func createExampleFlowGraph() (*TimeTickedFlowGraph, chan float64, chan float64,
 	}
 
 	return fg, inputChan, outputChan, cancel, nil
+}
+
+func TestMain(m *testing.M) {
+	paramtable.Init()
+	code := m.Run()
+	os.Exit(code)
 }
 
 func TestTimeTickedFlowGraph_AddNode(t *testing.T) {

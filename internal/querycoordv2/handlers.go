@@ -18,26 +18,28 @@ package querycoordv2
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/querycoordv2/job"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/internal/util/hardware"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/hardware"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
 )
 
 // checkAnyReplicaAvailable checks if the collection has enough distinct available shards. These shards
@@ -46,7 +48,7 @@ import (
 func (s *Server) checkAnyReplicaAvailable(collectionID int64) bool {
 	for _, replica := range s.meta.ReplicaManager.GetByCollection(collectionID) {
 		isAvailable := true
-		for node := range replica.Nodes {
+		for _, node := range replica.GetNodes() {
 			if s.nodeMgr.Get(node) == nil {
 				isAvailable = false
 				break
@@ -61,8 +63,20 @@ func (s *Server) checkAnyReplicaAvailable(collectionID int64) bool {
 
 func (s *Server) getCollectionSegmentInfo(collection int64) []*querypb.SegmentInfo {
 	segments := s.dist.SegmentDistManager.GetByCollection(collection)
+	currentTargetSegmentsMap := s.targetMgr.GetHistoricalSegmentsByCollection(collection, meta.CurrentTarget)
 	infos := make(map[int64]*querypb.SegmentInfo)
 	for _, segment := range segments {
+		if _, existCurrentTarget := currentTargetSegmentsMap[segment.GetID()]; !existCurrentTarget {
+			// if one segment exists in distMap but doesn't exist in currentTargetMap
+			// in order to guarantee that get segment request launched by sdk could get
+			// consistent result, for example
+			// sdk insert three segments:A, B, D, then A + B----compact--> C
+			// In this scenario, we promise that clients see either 2 segments(C,D) or 3 segments(A, B, D)
+			// rather than 4 segments(A, B, C, D), in which query nodes are loading C but have completed loading process
+			log.Info("filtered segment being in the intermediate status",
+				zap.Int64("segmentID", segment.GetID()))
+			continue
+		}
 		info, ok := infos[segment.GetID()]
 		if !ok {
 			info = &querypb.SegmentInfo{}
@@ -80,12 +94,24 @@ func (s *Server) balanceSegments(ctx context.Context, req *querypb.LoadBalanceRe
 	srcNode := req.GetSourceNodeIDs()[0]
 	dstNodeSet := typeutil.NewUniqueSet(req.GetDstNodeIDs()...)
 	if dstNodeSet.Len() == 0 {
-		dstNodeSet.Insert(replica.GetNodes()...)
+		outboundNodes := s.meta.ResourceManager.CheckOutboundNodes(replica)
+		availableNodes := lo.Filter(replica.Replica.GetNodes(), func(node int64, _ int) bool {
+			stop, err := s.nodeMgr.IsStoppingNode(node)
+			if err != nil {
+				return false
+			}
+			return !outboundNodes.Contain(node) && !stop
+		})
+		dstNodeSet.Insert(availableNodes...)
 	}
 	dstNodeSet.Remove(srcNode)
 
 	toBalance := typeutil.NewSet[*meta.Segment]()
-	segments := s.dist.SegmentDistManager.GetByNode(srcNode)
+	// Only balance segments in targets
+	segments := s.dist.SegmentDistManager.GetByCollectionAndNode(req.GetCollectionID(), srcNode)
+	segments = lo.Filter(segments, func(segment *meta.Segment, _ int) bool {
+		return s.targetMgr.GetHistoricalSegment(segment.GetCollectionID(), segment.GetID(), meta.CurrentTarget) != nil
+	})
 	allSegments := make(map[int64]*meta.Segment)
 	for _, segment := range segments {
 		allSegments[segment.GetID()] = segment
@@ -108,40 +134,51 @@ func (s *Server) balanceSegments(ctx context.Context, req *querypb.LoadBalanceRe
 		zap.Int64("srcNodeID", srcNode),
 		zap.Int64s("destNodeIDs", dstNodeSet.Collect()),
 	)
-	plans := s.balancer.AssignSegment(toBalance.Collect(), dstNodeSet.Collect())
+	plans := s.balancer.AssignSegment(req.GetCollectionID(), toBalance.Collect(), dstNodeSet.Collect())
 	tasks := make([]task.Task, 0, len(plans))
 	for _, plan := range plans {
 		log.Info("manually balance segment...",
 			zap.Int64("destNodeID", plan.To),
 			zap.Int64("segmentID", plan.Segment.GetID()),
 		)
-		task := task.NewSegmentTask(ctx,
-			Params.QueryCoordCfg.SegmentTaskTimeout,
+		task, err := task.NewSegmentTask(ctx,
+			Params.QueryCoordCfg.SegmentTaskTimeout.GetAsDuration(time.Millisecond),
 			req.GetBase().GetMsgID(),
 			req.GetCollectionID(),
 			replica.GetID(),
-			task.NewSegmentAction(plan.To, task.ActionTypeGrow, plan.Segment.GetInsertChannel(), plan.Segment.GetID()),
-			task.NewSegmentAction(srcNode, task.ActionTypeReduce, plan.Segment.GetInsertChannel(), plan.Segment.GetID()),
+			task.NewSegmentActionWithScope(plan.To, task.ActionTypeGrow, plan.Segment.GetInsertChannel(), plan.Segment.GetID(), querypb.DataScope_Historical),
+			task.NewSegmentActionWithScope(srcNode, task.ActionTypeReduce, plan.Segment.GetInsertChannel(), plan.Segment.GetID(), querypb.DataScope_Historical),
 		)
-		err := s.taskScheduler.Add(task)
 		if err != nil {
-			task.Cancel()
+			log.Warn("create segment task for balance failed",
+				zap.Int64("collection", req.GetCollectionID()),
+				zap.Int64("replica", replica.GetID()),
+				zap.String("channel", plan.Segment.InsertChannel),
+				zap.Int64("from", srcNode),
+				zap.Int64("to", plan.To),
+				zap.Error(err),
+			)
+			continue
+		}
+		err = s.taskScheduler.Add(task)
+		if err != nil {
+			task.Cancel(err)
 			return err
 		}
 		tasks = append(tasks, task)
 	}
-	return task.Wait(ctx, Params.QueryCoordCfg.SegmentTaskTimeout, tasks...)
+	return task.Wait(ctx, Params.QueryCoordCfg.SegmentTaskTimeout.GetAsDuration(time.Millisecond), tasks...)
 }
 
 // TODO(dragondriver): add more detail metrics
 func (s *Server) getSystemInfoMetrics(
 	ctx context.Context,
-	req *milvuspb.GetMetricsRequest) (string, error) {
-
+	req *milvuspb.GetMetricsRequest,
+) (string, error) {
 	clusterTopology := metricsinfo.QueryClusterTopology{
 		Self: metricsinfo.QueryCoordInfos{
 			BaseComponentInfos: metricsinfo.BaseComponentInfos{
-				Name: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, Params.QueryCoordCfg.GetNodeID()),
+				Name: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, paramtable.GetNodeID()),
 				HardwareInfos: metricsinfo.HardwareMetrics{
 					IP:           s.session.Address,
 					CPUCoreCount: hardware.GetCPUNum(),
@@ -152,15 +189,12 @@ func (s *Server) getSystemInfoMetrics(
 					DiskUsage:    hardware.GetDiskUsage(),
 				},
 				SystemInfo:  metricsinfo.DeployMetrics{},
-				CreatedTime: Params.QueryCoordCfg.CreatedTime.String(),
-				UpdatedTime: Params.QueryCoordCfg.UpdatedTime.String(),
+				CreatedTime: paramtable.GetCreateTime().String(),
+				UpdatedTime: paramtable.GetUpdateTime().String(),
 				Type:        typeutil.QueryCoordRole,
-				ID:          s.session.ServerID,
+				ID:          paramtable.GetNodeID(),
 			},
-			SystemConfigurations: metricsinfo.QueryCoordConfiguration{
-				SearchChannelPrefix:       Params.CommonCfg.QueryCoordSearch,
-				SearchResultChannelPrefix: Params.CommonCfg.QueryCoordSearchResult,
-			},
+			SystemConfigurations: metricsinfo.QueryCoordConfiguration{},
 		},
 		ConnectedNodes: make([]metricsinfo.QueryNodeInfos, 0),
 	}
@@ -171,7 +205,7 @@ func (s *Server) getSystemInfoMetrics(
 	coordTopology := metricsinfo.QueryCoordTopology{
 		Cluster: clusterTopology,
 		Connections: metricsinfo.ConnTopology{
-			Name: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, Params.QueryCoordCfg.GetNodeID()),
+			Name: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, paramtable.GetNodeID()),
 			// TODO(dragondriver): fill ConnectedComponents if necessary
 			ConnectedComponents: []metricsinfo.ConnectionInfo{},
 		},
@@ -202,14 +236,14 @@ func (s *Server) fillMetricsWithNodes(topo *metricsinfo.QueryClusterTopology, no
 			continue
 		}
 
-		if metric.resp.Status.ErrorCode != commonpb.ErrorCode_Success {
+		if metric.resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
 			log.Warn("invalid metrics of query node was found",
-				zap.Any("error_code", metric.resp.Status.ErrorCode),
-				zap.Any("error_reason", metric.resp.Status.Reason))
+				zap.Any("error_code", metric.resp.GetStatus().GetErrorCode()),
+				zap.Any("error_reason", metric.resp.GetStatus().GetReason()))
 			topo.ConnectedNodes = append(topo.ConnectedNodes, metricsinfo.QueryNodeInfos{
 				BaseComponentInfos: metricsinfo.BaseComponentInfos{
 					HasError:    true,
-					ErrorReason: metric.resp.Status.Reason,
+					ErrorReason: metric.resp.GetStatus().GetReason(),
 					Name:        metric.resp.ComponentName,
 					ID:          int64(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()),
 				},
@@ -272,13 +306,19 @@ func (s *Server) tryGetNodesMetrics(ctx context.Context, req *milvuspb.GetMetric
 }
 
 func (s *Server) fillReplicaInfo(replica *meta.Replica, withShardNodes bool) (*milvuspb.ReplicaInfo, error) {
-	info := utils.Replica2ReplicaInfo(replica.Replica)
+	info := &milvuspb.ReplicaInfo{
+		ReplicaID:         replica.GetID(),
+		CollectionID:      replica.GetCollectionID(),
+		NodeIds:           replica.GetNodes(),
+		ResourceGroupName: replica.GetResourceGroup(),
+		NumOutboundNode:   s.meta.GetOutgoingNodeNumByReplica(replica),
+	}
 
-	channels := s.targetMgr.GetDmChannelsByCollection(replica.GetCollectionID())
+	channels := s.targetMgr.GetDmChannelsByCollection(replica.GetCollectionID(), meta.CurrentTarget)
 	if len(channels) == 0 {
 		msg := "failed to get channels, collection not loaded"
 		log.Warn(msg)
-		return nil, utils.WrapError(msg, meta.ErrCollectionNotFound)
+		return nil, merr.WrapErrCollectionNotFound(replica.GetCollectionID(), msg)
 	}
 	var segments []*meta.Segment
 	if withShardNodes {
@@ -294,7 +334,7 @@ func (s *Server) fillReplicaInfo(replica *meta.Replica, withShardNodes bool) (*m
 		if leaderInfo == nil {
 			msg := fmt.Sprintf("failed to get shard leader for shard %s, the collection not loaded or leader is offline", channel)
 			log.Warn(msg)
-			return nil, utils.WrapError(msg, session.WrapErrNodeNotFound(leader))
+			return nil, errors.Wrap(merr.WrapErrNodeNotFound(leader), msg)
 		}
 
 		shard := &milvuspb.ShardReplica{
@@ -305,21 +345,51 @@ func (s *Server) fillReplicaInfo(replica *meta.Replica, withShardNodes bool) (*m
 		}
 		if withShardNodes {
 			shardNodes := lo.FilterMap(segments, func(segment *meta.Segment, _ int) (int64, bool) {
-				if replica.Nodes.Contain(segment.Node) {
+				if replica.Contains(segment.Node) {
 					return segment.Node, true
 				}
 				return 0, false
 			})
-			shard.NodeIds = append(shard.NodeIds, shardNodes...)
+			shard.NodeIds = typeutil.NewUniqueSet(shardNodes...).Collect()
 		}
 		info.ShardReplicas = append(info.ShardReplicas, shard)
 	}
 	return info, nil
 }
 
-func errCode(err error) commonpb.ErrorCode {
-	if errors.Is(err, job.ErrLoadParameterMismatched) {
-		return commonpb.ErrorCode_IllegalArgument
+func checkNodeAvailable(nodeID int64, info *session.NodeInfo) error {
+	if info == nil {
+		return merr.WrapErrNodeOffline(nodeID)
+	} else if time.Since(info.LastHeartbeat()) > Params.QueryCoordCfg.HeartbeatAvailableInterval.GetAsDuration(time.Millisecond) {
+		return merr.WrapErrNodeOffline(nodeID, fmt.Sprintf("lastHB=%v", info.LastHeartbeat()))
 	}
-	return commonpb.ErrorCode_UnexpectedError
+	return nil
+}
+
+func filterDupLeaders(replicaManager *meta.ReplicaManager, leaders map[int64]*meta.LeaderView) map[int64]*meta.LeaderView {
+	type leaderID struct {
+		ReplicaID int64
+		Shard     string
+	}
+
+	newLeaders := make(map[leaderID]*meta.LeaderView)
+	for _, view := range leaders {
+		replica := replicaManager.GetByCollectionAndNode(view.CollectionID, view.ID)
+		if replica == nil {
+			continue
+		}
+
+		id := leaderID{replica.GetID(), view.Channel}
+		if old, ok := newLeaders[id]; ok && old.Version > view.Version {
+			continue
+		}
+
+		newLeaders[id] = view
+	}
+
+	result := make(map[int64]*meta.LeaderView)
+	for _, v := range newLeaders {
+		result[v.ID] = v
+	}
+	return result
 }

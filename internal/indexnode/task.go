@@ -19,29 +19,29 @@ package indexnode
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/metrics"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
-	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
-	"github.com/milvus-io/milvus/internal/util/indexparams"
-	"github.com/milvus-io/milvus/internal/util/logutil"
-	"github.com/milvus-io/milvus/internal/util/metautil"
-	"github.com/milvus-io/milvus/internal/util/retry"
-	"github.com/milvus-io/milvus/internal/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
+	"github.com/milvus-io/milvus/pkg/util/indexparams"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
 )
 
 var (
@@ -52,11 +52,12 @@ var (
 type Blob = storage.Blob
 
 type taskInfo struct {
-	cancel         context.CancelFunc
-	state          commonpb.IndexState
-	fileKeys       []string
-	serializedSize uint64
-	failReason     string
+	cancel              context.CancelFunc
+	state               commonpb.IndexState
+	fileKeys            []string
+	serializedSize      uint64
+	failReason          string
+	currentIndexVersion int32
 
 	// task statistics
 	statistic *indexpb.JobInfo
@@ -81,25 +82,28 @@ type indexBuildTask struct {
 	cancel context.CancelFunc
 	ctx    context.Context
 
-	cm             storage.ChunkManager
-	index          indexcgowrapper.CodecIndex
-	savePaths      []string
-	req            *indexpb.CreateJobRequest
-	BuildID        UniqueID
-	nodeID         UniqueID
-	ClusterID      string
-	collectionID   UniqueID
-	partitionID    UniqueID
-	segmentID      UniqueID
-	fieldID        UniqueID
-	fieldData      storage.FieldData
-	indexBlobs     []*storage.Blob
-	newTypeParams  map[string]string
-	newIndexParams map[string]string
-	serializedSize uint64
-	tr             *timerecord.TimeRecorder
-	statistic      indexpb.JobInfo
-	node           *IndexNode
+	cm                  storage.ChunkManager
+	index               indexcgowrapper.CodecIndex
+	savePaths           []string
+	req                 *indexpb.CreateJobRequest
+	currentIndexVersion int32
+	BuildID             UniqueID
+	nodeID              UniqueID
+	ClusterID           string
+	collectionID        UniqueID
+	partitionID         UniqueID
+	segmentID           UniqueID
+	fieldID             UniqueID
+	fieldType           schemapb.DataType
+	fieldData           storage.FieldData
+	indexBlobs          []*storage.Blob
+	newTypeParams       map[string]string
+	newIndexParams      map[string]string
+	serializedSize      uint64
+	tr                  *timerecord.TimeRecorder
+	queueDur            time.Duration
+	statistic           indexpb.JobInfo
+	node                *IndexNode
 }
 
 func (it *indexBuildTask) Reset() {
@@ -138,14 +142,18 @@ func (it *indexBuildTask) GetState() commonpb.IndexState {
 
 // OnEnqueue enqueues indexing tasks.
 func (it *indexBuildTask) OnEnqueue(ctx context.Context) error {
+	it.queueDur = 0
+	it.tr.RecordSpan()
 	it.statistic.StartTime = time.Now().UnixMicro()
 	it.statistic.PodID = it.node.GetNodeID()
-	log.Ctx(ctx).Debug("IndexNode IndexBuilderTask Enqueue")
+	log.Ctx(ctx).Info("IndexNode IndexBuilderTask Enqueue", zap.Int64("buildID", it.BuildID), zap.Int64("segmentID", it.segmentID))
 	return nil
 }
 
 func (it *indexBuildTask) Prepare(ctx context.Context) error {
-	logutil.Logger(ctx).Info("Begin to prepare indexBuildTask", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID), zap.Int64("SegmentIf", it.segmentID))
+	it.queueDur = it.tr.RecordSpan()
+	log.Ctx(ctx).Info("Begin to prepare indexBuildTask", zap.Int64("buildID", it.BuildID),
+		zap.Int64("Collection", it.collectionID), zap.Int64("SegmentID", it.segmentID))
 	typeParams := make(map[string]string)
 	indexParams := make(map[string]string)
 
@@ -164,7 +172,7 @@ func (it *indexBuildTask) Prepare(ctx context.Context) error {
 	it.newIndexParams = indexParams
 	it.statistic.IndexParams = it.req.GetIndexParams()
 	// ugly codes to get dimension
-	if dimStr, ok := typeParams["dim"]; ok {
+	if dimStr, ok := typeParams[common.DimKey]; ok {
 		var err error
 		it.statistic.Dim, err = strconv.ParseInt(dimStr, 10, 64)
 		if err != nil {
@@ -172,7 +180,8 @@ func (it *indexBuildTask) Prepare(ctx context.Context) error {
 			// ignore error
 		}
 	}
-	logutil.Logger(ctx).Info("Successfully prepare indexBuildTask", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID), zap.Int64("SegmentIf", it.segmentID))
+	log.Ctx(ctx).Info("Successfully prepare indexBuildTask", zap.Int64("buildID", it.BuildID),
+		zap.Int64("Collection", it.collectionID), zap.Int64("SegmentID", it.segmentID))
 	return nil
 }
 
@@ -219,290 +228,211 @@ func (it *indexBuildTask) LoadData(ctx context.Context) error {
 		log.Ctx(ctx).Warn("loadKey failed", zap.Error(err))
 		return err
 	}
-	loadVectorDuration := it.tr.RecordSpan().Milliseconds()
-	log.Ctx(ctx).Debug("indexnode load data success")
-	it.tr.Record("load field data done")
-	metrics.IndexNodeLoadFieldLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(loadVectorDuration))
+
+	loadFieldDataLatency := it.tr.CtxRecord(ctx, "load field data done")
+	metrics.IndexNodeLoadFieldLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(loadFieldDataLatency.Seconds())
 
 	err = it.decodeBlobs(ctx, blobs)
 	if err != nil {
-		logutil.Logger(ctx).Info("failed to decode blobs", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID), zap.Int64("SegmentIf", it.segmentID), zap.Error(err))
+		log.Ctx(ctx).Info("failed to decode blobs", zap.Int64("buildID", it.BuildID),
+			zap.Int64("Collection", it.collectionID), zap.Int64("SegmentID", it.segmentID), zap.Error(err))
 	} else {
-		logutil.Logger(ctx).Info("Successfully load data", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID), zap.Int64("SegmentIf", it.segmentID))
+		log.Ctx(ctx).Info("Successfully load data", zap.Int64("buildID", it.BuildID),
+			zap.Int64("Collection", it.collectionID), zap.Int64("SegmentID", it.segmentID))
 	}
+	blobs = nil
+	debug.FreeOSMemory()
 	return err
 }
 
 func (it *indexBuildTask) BuildIndex(ctx context.Context) error {
-	// support build diskann index
-	indexType := it.newIndexParams["index_type"]
+	err := it.parseFieldMetaFromBinlog(ctx)
+	if err != nil {
+		log.Ctx(ctx).Warn("parse field meta from binlog failed", zap.Error(err))
+		return err
+	}
+
+	indexType := it.newIndexParams[common.IndexTypeKey]
 	if indexType == indexparamcheck.IndexDISKANN {
-		return it.BuildDiskAnnIndex(ctx)
-	}
-
-	dataset := indexcgowrapper.GenDataset(it.fieldData)
-	dType := dataset.DType
-	var err error
-	if dType != schemapb.DataType_None {
-		it.index, err = indexcgowrapper.NewCgoIndex(dType, it.newTypeParams, it.newIndexParams, it.req.GetStorageConfig())
-		if err != nil {
-			log.Ctx(ctx).Error("failed to create index", zap.Error(err))
-			return err
+		// check index node support disk index
+		if !Params.IndexNodeCfg.EnableDisk.GetAsBool() {
+			log.Ctx(ctx).Warn("IndexNode don't support build disk index",
+				zap.String("index type", it.newIndexParams[common.IndexTypeKey]),
+				zap.Bool("enable disk", Params.IndexNodeCfg.EnableDisk.GetAsBool()))
+			return errors.New("index node don't support build disk index")
 		}
 
-		err = it.index.Build(dataset)
+		// check load size and size of field data
+		localUsedSize, err := indexcgowrapper.GetLocalUsedSize(paramtable.Get().LocalStorageCfg.Path.GetValue())
 		if err != nil {
-			log.Ctx(ctx).Error("failed to build index", zap.Error(err))
+			log.Ctx(ctx).Warn("IndexNode get local used size failed")
+			return err
+		}
+		fieldDataSize, err := estimateFieldDataSize(it.statistic.Dim, it.req.GetNumRows(), it.fieldType)
+		if err != nil {
+			log.Ctx(ctx).Warn("IndexNode get local used size failed")
+			return err
+		}
+		usedLocalSizeWhenBuild := int64(float64(fieldDataSize)*diskUsageRatio) + localUsedSize
+		maxUsedLocalSize := int64(Params.IndexNodeCfg.DiskCapacityLimit.GetAsFloat() * Params.IndexNodeCfg.MaxDiskUsagePercentage.GetAsFloat())
+
+		if usedLocalSizeWhenBuild > maxUsedLocalSize {
+			log.Ctx(ctx).Warn("IndexNode don't has enough disk size to build disk ann index",
+				zap.Int64("usedLocalSizeWhenBuild", usedLocalSizeWhenBuild),
+				zap.Int64("maxUsedLocalSize", maxUsedLocalSize))
+			return errors.New("index node don't has enough disk size to build disk ann index")
+		}
+
+		err = indexparams.SetDiskIndexBuildParams(it.newIndexParams, int64(fieldDataSize))
+		if err != nil {
+			log.Ctx(ctx).Warn("failed to fill disk index params", zap.Error(err))
 			return err
 		}
 	}
-	metrics.IndexNodeKnowhereBuildIndexLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(it.tr.RecordSpan().Milliseconds()))
 
-	it.tr.Record("build index done")
-	indexBlobs, err := it.index.Serialize()
+	var buildIndexInfo *indexcgowrapper.BuildIndexInfo
+	buildIndexInfo, err = indexcgowrapper.NewBuildIndexInfo(it.req.GetStorageConfig())
+	defer indexcgowrapper.DeleteBuildIndexInfo(buildIndexInfo)
 	if err != nil {
-		log.Ctx(ctx).Error("IndexNode index Serialize failed", zap.Error(err))
+		log.Ctx(ctx).Warn("create build index info failed", zap.Error(err))
 		return err
 	}
-	it.tr.Record("index serialize done")
-
-	// use serialized size before encoding
-	it.serializedSize = 0
-	for _, blob := range indexBlobs {
-		it.serializedSize += uint64(len(blob.Value))
-	}
-
-	// early release index for gc, and we can ensure that Delete is idempotent.
-	if err := it.index.Delete(); err != nil {
-		log.Ctx(ctx).Error("IndexNode indexBuildTask Execute CIndexDelete failed", zap.Error(err))
-	}
-
-	var serializedIndexBlobs []*storage.Blob
-	codec := storage.NewIndexFileBinlogCodec()
-	serializedIndexBlobs, err = codec.Serialize(
-		it.req.BuildID,
-		it.req.IndexVersion,
-		it.collectionID,
-		it.partitionID,
-		it.segmentID,
-		it.fieldID,
-		it.newIndexParams,
-		it.req.IndexName,
-		it.req.IndexID,
-		indexBlobs,
-	)
+	err = buildIndexInfo.AppendFieldMetaInfo(it.collectionID, it.partitionID, it.segmentID, it.fieldID, it.fieldType)
 	if err != nil {
+		log.Ctx(ctx).Warn("append field meta failed", zap.Error(err))
 		return err
 	}
-	encodeIndexFileDur := it.tr.Record("index codec serialize done")
-	metrics.IndexNodeEncodeIndexFileLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(encodeIndexFileDur.Milliseconds()))
-	it.indexBlobs = serializedIndexBlobs
-	logutil.Logger(ctx).Info("Successfully build index", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID), zap.Int64("SegmentID", it.segmentID))
-	return nil
-}
 
-func (it *indexBuildTask) BuildDiskAnnIndex(ctx context.Context) error {
-	// check index node support disk index
-	if !Params.IndexNodeCfg.EnableDisk {
-		log.Ctx(ctx).Error("IndexNode don't support build disk index",
-			zap.String("index type", it.newIndexParams["index_type"]),
-			zap.Bool("enable disk", Params.IndexNodeCfg.EnableDisk))
-		return errors.New("index node don't support build disk index")
-	}
-
-	// check load size and size of field data
-	localUsedSize, err := indexcgowrapper.GetLocalUsedSize()
+	err = buildIndexInfo.AppendIndexMetaInfo(it.req.IndexID, it.req.BuildID, it.req.IndexVersion)
 	if err != nil {
-		log.Ctx(ctx).Error("IndexNode get local used size failed")
-		return errors.New("index node get local used size failed")
-	}
-
-	usedLocalSizeWhenBuild := int64(float64(it.fieldData.GetMemorySize())*diskUsageRatio) + localUsedSize
-	maxUsedLocalSize := int64(float64(Params.IndexNodeCfg.DiskCapacityLimit) * Params.IndexNodeCfg.MaxDiskUsagePercentage)
-
-	if usedLocalSizeWhenBuild > maxUsedLocalSize {
-		log.Ctx(ctx).Error("IndexNode don't has enough disk size to build disk ann index",
-			zap.Int64("usedLocalSizeWhenBuild", usedLocalSizeWhenBuild),
-			zap.Int64("maxUsedLocalSize", maxUsedLocalSize))
-		return errors.New("index node don't has enough disk size to build disk ann index")
-	}
-
-	dataset := indexcgowrapper.GenDataset(it.fieldData)
-	dType := dataset.DType
-	if dType != schemapb.DataType_None {
-		// TODO:: too ugly
-		it.newIndexParams["collection_id"] = strconv.FormatInt(it.collectionID, 10)
-		it.newIndexParams["partition_id"] = strconv.FormatInt(it.partitionID, 10)
-		it.newIndexParams["segment_id"] = strconv.FormatInt(it.segmentID, 10)
-		it.newIndexParams["field_id"] = strconv.FormatInt(it.fieldID, 10)
-		it.newIndexParams["index_build_id"] = strconv.FormatInt(it.req.GetBuildID(), 10)
-		it.newIndexParams["index_id"] = strconv.FormatInt(it.req.IndexID, 10)
-		it.newIndexParams["index_version"] = strconv.FormatInt(it.req.GetIndexVersion(), 10)
-
-		err = indexparams.SetDiskIndexBuildParams(it.newIndexParams, it.statistic.NumRows)
-		if err != nil {
-			log.Ctx(ctx).Error("failed to fill disk index params", zap.Error(err))
-			return err
-		}
-		jsonIndexParams, err := json.Marshal(it.newIndexParams)
-		if err != nil {
-			log.Ctx(ctx).Error("failed to json marshal index params", zap.Error(err))
-			return err
-		}
-		log.Ctx(ctx).Info("disk index params are ready",
-			zap.Int64("buildID", it.BuildID),
-			zap.String("index params", string(jsonIndexParams)))
-
-		it.index, err = indexcgowrapper.NewCgoIndex(dType, it.newTypeParams, it.newIndexParams, it.req.GetStorageConfig())
-		if err != nil {
-			log.Ctx(ctx).Error("failed to create index", zap.Error(err))
-			return err
-		}
-
-		err = it.index.Build(dataset)
-		if err != nil {
-			if it.index.CleanLocalData() != nil {
-				log.Ctx(ctx).Error("failed to clean cached data on disk after build index failed",
-					zap.Int64("buildID", it.BuildID),
-					zap.Int64("index version", it.req.GetIndexVersion()))
-			}
-			log.Ctx(ctx).Error("failed to build index", zap.Error(err))
-			return err
-		}
-	}
-
-	metrics.IndexNodeKnowhereBuildIndexLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(it.tr.RecordSpan()))
-
-	it.tr.Record("build index done")
-
-	fileInfos, err := it.index.GetIndexFileInfo()
-	if err != nil {
-		log.Ctx(ctx).Error("IndexNode index Serialize failed", zap.Error(err))
+		log.Ctx(ctx).Warn("append index meta failed", zap.Error(err))
 		return err
 	}
-	it.tr.Record("index serialize done")
 
-	// use serialized size before encoding
-	it.serializedSize = 0
-	for _, info := range fileInfos {
-		it.serializedSize += uint64(info.FileSize)
-		it.indexBlobs = append(it.indexBlobs, &storage.Blob{
-			Key:  info.FileName,
-			Size: info.FileSize,
-		})
+	err = buildIndexInfo.AppendBuildIndexParam(it.newIndexParams)
+	if err != nil {
+		log.Ctx(ctx).Warn("append index params failed", zap.Error(err))
+		return err
 	}
 
-	// early release index for gc, and we can ensure that Delete is idempotent.
-	if err := it.index.Delete(); err != nil {
-		log.Ctx(it.ctx).Error("IndexNode indexBuildTask Execute CIndexDelete failed", zap.Error(err))
+	jsonIndexParams, err := json.Marshal(it.newIndexParams)
+	if err != nil {
+		log.Ctx(ctx).Error("failed to json marshal index params", zap.Error(err))
+		return err
 	}
 
-	encodeIndexFileDur := it.tr.Record("index codec serialize done")
-	metrics.IndexNodeEncodeIndexFileLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(encodeIndexFileDur.Milliseconds()))
+	log.Ctx(ctx).Info("index params are ready",
+		zap.Int64("buildID", it.BuildID),
+		zap.String("index params", string(jsonIndexParams)))
+
+	err = buildIndexInfo.AppendBuildTypeParam(it.newTypeParams)
+	if err != nil {
+		log.Ctx(ctx).Warn("append type params failed", zap.Error(err))
+		return err
+	}
+
+	for _, path := range it.req.GetDataPaths() {
+		err = buildIndexInfo.AppendInsertFile(path)
+		if err != nil {
+			log.Ctx(ctx).Warn("append insert binlog path failed", zap.Error(err))
+			return err
+		}
+	}
+
+	it.currentIndexVersion = getCurrentIndexVersion(it.req.GetCurrentIndexVersion())
+	if err := buildIndexInfo.AppendIndexEngineVersion(it.currentIndexVersion); err != nil {
+		log.Ctx(ctx).Warn("append index engine version failed", zap.Error(err))
+		return err
+	}
+
+	it.index, err = indexcgowrapper.CreateIndex(ctx, buildIndexInfo)
+	if err != nil {
+		if it.index != nil && it.index.CleanLocalData() != nil {
+			log.Ctx(ctx).Error("failed to clean cached data on disk after build index failed",
+				zap.Int64("buildID", it.BuildID),
+				zap.Int64("index version", it.req.GetIndexVersion()))
+		}
+		log.Ctx(ctx).Error("failed to build index", zap.Error(err))
+		return err
+	}
+
+	buildIndexLatency := it.tr.RecordSpan()
+	metrics.IndexNodeKnowhereBuildIndexLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(buildIndexLatency.Seconds())
+
+	log.Ctx(ctx).Info("Successfully build index", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID), zap.Int64("SegmentID", it.segmentID))
 	return nil
 }
 
 func (it *indexBuildTask) SaveIndexFiles(ctx context.Context) error {
-	// support build diskann index
-	indexType := it.newIndexParams["index_type"]
-	if indexType == indexparamcheck.IndexDISKANN {
-		return it.SaveDiskAnnIndexFiles(ctx)
-	}
-
-	blobCnt := len(it.indexBlobs)
-	savePaths := make([]string, blobCnt)
-	saveFileKeys := make([]string, blobCnt)
-
-	saveIndexFile := func(idx int) error {
-		blob := it.indexBlobs[idx]
-		savePath := metautil.BuildSegmentIndexFilePath(it.cm.RootPath(), it.req.BuildID,
-			it.req.IndexVersion, it.partitionID, it.segmentID, blob.Key)
-		saveFn := func() error {
-			return it.cm.Write(ctx, savePath, blob.Value)
+	gcIndex := func() {
+		if err := it.index.Delete(); err != nil {
+			log.Ctx(ctx).Error("IndexNode indexBuildTask Execute CIndexDelete failed", zap.Error(err))
 		}
-		if err := retry.Do(ctx, saveFn, retry.Attempts(5)); err != nil {
-			log.Ctx(ctx).Warn("index node save index file failed", zap.Error(err), zap.String("savePath", savePath))
-			return err
-		}
-		savePaths[idx] = savePath
-		saveFileKeys[idx] = blob.Key
-		return nil
 	}
-
-	// If an error occurs, return the error that the task state will be set to retry.
-	if err := funcutil.ProcessFuncParallel(blobCnt, runtime.NumCPU(), saveIndexFile, "saveIndexFile"); err != nil {
-		log.Ctx(ctx).Error("saveIndexFile fail")
+	indexFilePath2Size, err := it.index.UpLoad()
+	if err != nil {
+		log.Ctx(ctx).Error("failed to upload index", zap.Error(err))
+		gcIndex()
 		return err
 	}
-	it.savePaths = savePaths
+	encodeIndexFileDur := it.tr.Record("index serialize and upload done")
+	metrics.IndexNodeEncodeIndexFileLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(encodeIndexFileDur.Seconds())
+
+	// early release index for gc, and we can ensure that Delete is idempotent.
+	gcIndex()
+
+	// use serialized size before encoding
+	it.serializedSize = 0
+	saveFileKeys := make([]string, 0)
+	for filePath, fileSize := range indexFilePath2Size {
+		it.serializedSize += uint64(fileSize)
+		parts := strings.Split(filePath, "/")
+		fileKey := parts[len(parts)-1]
+		saveFileKeys = append(saveFileKeys, fileKey)
+	}
+
 	it.statistic.EndTime = time.Now().UnixMicro()
-	it.node.storeIndexFilesAndStatistic(it.ClusterID, it.BuildID, saveFileKeys, it.serializedSize, &it.statistic)
-	log.Ctx(ctx).Debug("save index files done", zap.Strings("IndexFiles", savePaths))
-	saveIndexFileDur := it.tr.Record("index file save done")
-	metrics.IndexNodeSaveIndexFileLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(saveIndexFileDur.Milliseconds()))
+	it.node.storeIndexFilesAndStatistic(it.ClusterID, it.BuildID, saveFileKeys, it.serializedSize, &it.statistic, it.currentIndexVersion)
+	log.Ctx(ctx).Debug("save index files done", zap.Strings("IndexFiles", saveFileKeys))
+	saveIndexFileDur := it.tr.RecordSpan()
+	metrics.IndexNodeSaveIndexFileLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(saveIndexFileDur.Seconds())
 	it.tr.Elapse("index building all done")
 	log.Ctx(ctx).Info("Successfully save index files", zap.Int64("buildID", it.BuildID), zap.Int64("Collection", it.collectionID),
 		zap.Int64("partition", it.partitionID), zap.Int64("SegmentId", it.segmentID))
 	return nil
 }
 
-func (it *indexBuildTask) SaveDiskAnnIndexFiles(ctx context.Context) error {
-	savePaths := make([]string, len(it.indexBlobs))
-	saveFileKeys := make([]string, len(it.indexBlobs))
-
-	for i, blob := range it.indexBlobs {
-		savePath := blob.Key
-		savePaths[i] = savePath
-
-		// TODO: unify blob key to file key instead of full path
-		parts := strings.Split(blob.Key, "/")
-		if len(parts) == 0 {
-			return fmt.Errorf("invaild blob key: %s", blob.Key)
+func (it *indexBuildTask) parseFieldMetaFromBinlog(ctx context.Context) error {
+	toLoadDataPaths := it.req.GetDataPaths()
+	if len(toLoadDataPaths) == 0 {
+		return ErrEmptyInsertPaths
+	}
+	data, err := it.cm.Read(ctx, toLoadDataPaths[0])
+	if err != nil {
+		if errors.Is(err, ErrNoSuchKey) {
+			return ErrNoSuchKey
 		}
-		fileKey := parts[len(parts)-1]
-		saveFileKeys[i] = fileKey
+		return err
 	}
 
-	// add indexparams file
-	codec := storage.NewIndexFileBinlogCodec()
-	indexParamBlob, err := codec.SerializeIndexParams(
-		it.req.GetBuildID(),
-		it.req.GetIndexVersion(),
-		it.collectionID,
-		it.partitionID,
-		it.segmentID,
-		it.fieldID,
-		it.newIndexParams,
-		it.req.IndexName,
-		it.req.IndexID,
-	)
+	var insertCodec storage.InsertCodec
+	collectionID, partitionID, segmentID, insertData, err := insertCodec.DeserializeAll([]*Blob{{Key: toLoadDataPaths[0], Value: data}})
 	if err != nil {
 		return err
 	}
-
-	indexParamPath := metautil.BuildSegmentIndexFilePath(it.cm.RootPath(), it.req.BuildID, it.req.IndexVersion,
-		it.partitionID, it.segmentID, indexParamBlob.Key)
-
-	saveFn := func() error {
-		return it.cm.Write(ctx, indexParamPath, indexParamBlob.Value)
-	}
-	if err := retry.Do(ctx, saveFn, retry.Attempts(5)); err != nil {
-		log.Ctx(ctx).Warn("index node save index param file failed", zap.Error(err), zap.String("savePath", indexParamPath))
-		return err
+	if len(insertData.Data) != 1 {
+		return errors.New("we expect only one field in deserialized insert data")
 	}
 
-	saveFileKeys = append(saveFileKeys, indexParamBlob.Key)
-	savePaths = append(savePaths, indexParamPath)
-	it.savePaths = savePaths
+	it.collectionID = collectionID
+	it.partitionID = partitionID
+	it.segmentID = segmentID
+	for fID, value := range insertData.Data {
+		it.fieldType = indexcgowrapper.GenDataset(value).DType
+		it.fieldID = fID
+		break
+	}
 
-	it.statistic.EndTime = time.Now().UnixMicro()
-	it.node.storeIndexFilesAndStatistic(it.ClusterID, it.BuildID, saveFileKeys, it.serializedSize, &it.statistic)
-	log.Ctx(ctx).Debug("save index files done", zap.Strings("IndexFiles", savePaths))
-	saveIndexFileDur := it.tr.Record("index file save done")
-	metrics.IndexNodeSaveIndexFileLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(saveIndexFileDur.Milliseconds()))
-	it.tr.Elapse("index building all done")
-	log.Ctx(ctx).Info("IndexNode CreateIndex successfully ", zap.Int64("collect", it.collectionID),
-		zap.Int64("partition", it.partitionID), zap.Int64("segment", it.segmentID))
 	return nil
 }
 
@@ -512,8 +442,7 @@ func (it *indexBuildTask) decodeBlobs(ctx context.Context, blobs []*storage.Blob
 	if err2 != nil {
 		return err2
 	}
-	decodeDuration := it.tr.RecordSpan().Milliseconds()
-	metrics.IndexNodeDecodeFieldLatency.WithLabelValues(strconv.FormatInt(Params.IndexNodeCfg.GetNodeID(), 10)).Observe(float64(decodeDuration))
+	metrics.IndexNodeDecodeFieldLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(it.tr.RecordSpan().Seconds())
 
 	if len(insertData.Data) != 1 {
 		return errors.New("we expect only one field in deserialized insert data")
@@ -522,14 +451,15 @@ func (it *indexBuildTask) decodeBlobs(ctx context.Context, blobs []*storage.Blob
 	it.partitionID = partitionID
 	it.segmentID = segmentID
 
-	log.Ctx(ctx).Debug("indexnode deserialize data success",
+	deserializeDur := it.tr.RecordSpan()
+
+	log.Ctx(ctx).Info("IndexNode deserialize data success",
 		zap.Int64("index id", it.req.IndexID),
 		zap.String("index name", it.req.IndexName),
 		zap.Int64("collectionID", it.collectionID),
 		zap.Int64("partitionID", it.partitionID),
-		zap.Int64("segmentID", it.segmentID))
-
-	it.tr.Record("deserialize vector data done")
+		zap.Int64("segmentID", it.segmentID),
+		zap.Duration("deserialize duration", deserializeDur))
 
 	// we can ensure that there blobs are in one Field
 	var data storage.FieldData

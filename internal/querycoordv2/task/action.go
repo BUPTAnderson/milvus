@@ -17,28 +17,32 @@
 package task
 
 import (
-	"errors"
-
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	. "github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	. "github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-var (
-	ErrActionCanceled  = errors.New("ActionCanceled")
-	ErrActionRPCFailed = errors.New("ActionRPCFailed")
-	ErrActionStale     = errors.New("ActionStale")
-)
-
-type ActionType = int32
+type ActionType int32
 
 const (
 	ActionTypeGrow ActionType = iota + 1
 	ActionTypeReduce
+	ActionTypeUpdate
 )
+
+var ActionTypeName = map[ActionType]string{
+	ActionTypeGrow:   "Grow",
+	ActionTypeReduce: "Reduce",
+	ActionTypeUpdate: "Update",
+}
+
+func (t ActionType) String() string {
+	return ActionTypeName[t]
+}
 
 type Action interface {
 	Node() int64
@@ -78,19 +82,20 @@ type SegmentAction struct {
 	segmentID UniqueID
 	scope     querypb.DataScope
 
-	isReleaseCommitted atomic.Bool
+	rpcReturned atomic.Bool
 }
 
 func NewSegmentAction(nodeID UniqueID, typ ActionType, shard string, segmentID UniqueID) *SegmentAction {
 	return NewSegmentActionWithScope(nodeID, typ, shard, segmentID, querypb.DataScope_All)
 }
+
 func NewSegmentActionWithScope(nodeID UniqueID, typ ActionType, shard string, segmentID UniqueID, scope querypb.DataScope) *SegmentAction {
 	base := NewBaseAction(nodeID, typ, shard)
 	return &SegmentAction{
-		BaseAction:         base,
-		segmentID:          segmentID,
-		scope:              scope,
-		isReleaseCommitted: *atomic.NewBool(false),
+		BaseAction:  base,
+		segmentID:   segmentID,
+		scope:       scope,
+		rpcReturned: *atomic.NewBool(false),
 	}
 }
 
@@ -104,17 +109,33 @@ func (action *SegmentAction) Scope() querypb.DataScope {
 
 func (action *SegmentAction) IsFinished(distMgr *meta.DistributionManager) bool {
 	if action.Type() == ActionTypeGrow {
-		nodes := distMgr.LeaderViewManager.GetSealedSegmentDist(action.SegmentID())
-		return lo.Contains(nodes, action.Node())
+		leaderSegmentDist := distMgr.LeaderViewManager.GetSealedSegmentDist(action.SegmentID())
+		nodeSegmentDist := distMgr.SegmentDistManager.GetSegmentDist(action.SegmentID())
+		return lo.Contains(leaderSegmentDist, action.Node()) &&
+			lo.Contains(nodeSegmentDist, action.Node())
+	} else if action.Type() == ActionTypeReduce {
+		// FIXME: Now shard leader's segment view is a map of segment ID to node ID,
+		// loading segment replaces the node ID with the new one,
+		// which confuses the condition of finishing,
+		// the leader should return a map of segment ID to list of nodes,
+		// now, we just always commit the release task to executor once.
+		// NOTE: DO NOT create a task containing release action and the action is not the last action
+		sealed := distMgr.SegmentDistManager.GetByNode(action.Node())
+		growing := distMgr.LeaderViewManager.GetSegmentByNode(action.Node())
+		segments := make([]int64, 0, len(sealed)+len(growing))
+		for _, segment := range sealed {
+			segments = append(segments, segment.GetID())
+		}
+		segments = append(segments, growing...)
+		if !funcutil.SliceContain(segments, action.SegmentID()) {
+			return true
+		}
+		return action.rpcReturned.Load()
+	} else if action.Type() == ActionTypeUpdate {
+		return action.rpcReturned.Load()
 	}
-	// FIXME: Now shard leader's segment view is a map of segment ID to node ID,
-	// loading segment replaces the node ID with the new one,
-	// which confuses the condition of finishing,
-	// the leader should return a map of segment ID to list of nodes,
-	// now, we just always commit the release task to executor once.
-	// NOTE: DO NOT create a task containing release action and the action is not the last action
 
-	return action.isReleaseCommitted.Load()
+	return true
 }
 
 type ChannelAction struct {

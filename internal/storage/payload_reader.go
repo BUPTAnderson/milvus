@@ -2,14 +2,15 @@ package storage
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 
 	"github.com/apache/arrow/go/v8/arrow"
 	"github.com/apache/arrow/go/v8/parquet"
 	"github.com/apache/arrow/go/v8/parquet/file"
+	"github.com/cockroachdb/errors"
+	"github.com/golang/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
 
 // PayloadReader reads data from payload
@@ -18,6 +19,8 @@ type PayloadReader struct {
 	colType schemapb.DataType
 	numRows int64
 }
+
+var _ PayloadReaderInterface = (*PayloadReader)(nil)
 
 func NewPayloadReader(colType schemapb.DataType, buf []byte) (*PayloadReader, error) {
 	if len(buf) == 0 {
@@ -32,9 +35,10 @@ func NewPayloadReader(colType schemapb.DataType, buf []byte) (*PayloadReader, er
 
 // GetDataFromPayload returns data,length from payload, returns err if failed
 // Return:
-//      `interface{}`: all types.
-//      `int`: dim, only meaningful to FLOAT/BINARY VECTOR type.
-//      `error`: error.
+//
+//	`interface{}`: all types.
+//	`int`: dim, only meaningful to FLOAT/BINARY VECTOR type.
+//	`error`: error.
 func (r *PayloadReader) GetDataFromPayload() (interface{}, int, error) {
 	switch r.colType {
 	case schemapb.DataType_Bool:
@@ -62,8 +66,16 @@ func (r *PayloadReader) GetDataFromPayload() (interface{}, int, error) {
 		return r.GetBinaryVectorFromPayload()
 	case schemapb.DataType_FloatVector:
 		return r.GetFloatVectorFromPayload()
+	case schemapb.DataType_Float16Vector:
+		return r.GetFloat16VectorFromPayload()
 	case schemapb.DataType_String, schemapb.DataType_VarChar:
 		val, err := r.GetStringFromPayload()
+		return val, 0, err
+	case schemapb.DataType_Array:
+		val, err := r.GetArrayFromPayload()
+		return val, 0, err
+	case schemapb.DataType_JSON:
+		val, err := r.GetJSONFromPayload()
 		return val, 0, err
 	default:
 		return nil, 0, errors.New("unknown type")
@@ -71,8 +83,8 @@ func (r *PayloadReader) GetDataFromPayload() (interface{}, int, error) {
 }
 
 // ReleasePayloadReader release payload reader.
-func (r *PayloadReader) ReleasePayloadReader() {
-	r.Close()
+func (r *PayloadReader) ReleasePayloadReader() error {
+	return r.Close()
 }
 
 // GetBoolFromPayload returns bool slice from payload.
@@ -236,6 +248,33 @@ func (r *PayloadReader) GetStringFromPayload() ([]string, error) {
 		return nil, fmt.Errorf("failed to get string from datatype %v", r.colType.String())
 	}
 
+	return readByteAndConvert(r, func(bytes parquet.ByteArray) string {
+		return bytes.String()
+	})
+}
+
+func (r *PayloadReader) GetArrayFromPayload() ([]*schemapb.ScalarField, error) {
+	if r.colType != schemapb.DataType_Array {
+		return nil, fmt.Errorf("failed to get string from datatype %v", r.colType.String())
+	}
+	return readByteAndConvert(r, func(bytes parquet.ByteArray) *schemapb.ScalarField {
+		v := &schemapb.ScalarField{}
+		proto.Unmarshal(bytes, v)
+		return v
+	})
+}
+
+func (r *PayloadReader) GetJSONFromPayload() ([][]byte, error) {
+	if r.colType != schemapb.DataType_JSON {
+		return nil, fmt.Errorf("failed to get string from datatype %v", r.colType.String())
+	}
+
+	return readByteAndConvert(r, func(bytes parquet.ByteArray) []byte {
+		return bytes
+	})
+}
+
+func readByteAndConvert[T any](r *PayloadReader, convert func(parquet.ByteArray) T) ([]T, error) {
 	values := make([]parquet.ByteArray, r.numRows)
 	valuesRead, err := ReadDataFromAllRowGroups[parquet.ByteArray, *file.ByteArrayColumnChunkReader](r.reader, values, 0, r.numRows)
 	if err != nil {
@@ -246,9 +285,9 @@ func (r *PayloadReader) GetStringFromPayload() ([]string, error) {
 		return nil, fmt.Errorf("expect %d rows, but got valuesRead = %d", r.numRows, valuesRead)
 	}
 
-	ret := make([]string, r.numRows)
+	ret := make([]T, r.numRows)
 	for i := 0; i < int(r.numRows); i++ {
-		ret[i] = values[i].String()
+		ret[i] = convert(values[i])
 	}
 	return ret, nil
 }
@@ -275,6 +314,29 @@ func (r *PayloadReader) GetBinaryVectorFromPayload() ([]byte, int, error) {
 		copy(ret[i*dim:(i+1)*dim], values[i])
 	}
 	return ret, dim * 8, nil
+}
+
+// GetFloat16VectorFromPayload returns vector, dimension, error
+func (r *PayloadReader) GetFloat16VectorFromPayload() ([]byte, int, error) {
+	if r.colType != schemapb.DataType_Float16Vector {
+		return nil, -1, fmt.Errorf("failed to get float vector from datatype %v", r.colType.String())
+	}
+	dim := r.reader.RowGroup(0).Column(0).Descriptor().TypeLength() / 2
+	values := make([]parquet.FixedLenByteArray, r.numRows)
+	valuesRead, err := ReadDataFromAllRowGroups[parquet.FixedLenByteArray, *file.FixedLenByteArrayColumnChunkReader](r.reader, values, 0, r.numRows)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	if valuesRead != r.numRows {
+		return nil, -1, fmt.Errorf("expect %d rows, but got valuesRead = %d", r.numRows, valuesRead)
+	}
+
+	ret := make([]byte, int64(dim*2)*r.numRows)
+	for i := 0; i < int(r.numRows); i++ {
+		copy(ret[i*dim*2:(i+1)*dim*2], values[i])
+	}
+	return ret, dim, nil
 }
 
 // GetFloatVectorFromPayload returns vector, dimension, error
@@ -306,8 +368,8 @@ func (r *PayloadReader) GetPayloadLengthFromReader() (int, error) {
 }
 
 // Close closes the payload reader
-func (r *PayloadReader) Close() {
-	r.reader.Close()
+func (r *PayloadReader) Close() error {
+	return r.reader.Close()
 }
 
 // ReadDataFromAllRowGroups iterates all row groups of file.Reader, and convert column to E.

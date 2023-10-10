@@ -10,7 +10,10 @@ type config struct {
 	createBucket      bool
 	rootPath          string
 	useIAM            bool
+	cloudProvider     string
 	iamEndpoint       string
+	useVirtualHost    bool
+	region            string
 }
 
 func newDefaultConfig() *config {
@@ -37,6 +40,7 @@ func AccessKeyID(accessKeyID string) Option {
 		c.accessKeyID = accessKeyID
 	}
 }
+
 func SecretAccessKeyID(secretAccessKeyID string) Option {
 	return func(c *config) {
 		c.secretAccessKeyID = secretAccessKeyID
@@ -67,8 +71,26 @@ func UseIAM(useIAM bool) Option {
 	}
 }
 
+func CloudProvider(cloudProvider string) Option {
+	return func(c *config) {
+		c.cloudProvider = cloudProvider
+	}
+}
+
 func IAMEndpoint(iamEndpoint string) Option {
 	return func(c *config) {
 		c.iamEndpoint = iamEndpoint
+	}
+}
+
+func UseVirtualHost(useVirtualHost bool) Option {
+	return func(c *config) {
+		c.useVirtualHost = useVirtualHost
+	}
+}
+
+func Region(region string) Option {
+	return func(c *config) {
+		c.region = region
 	}
 }

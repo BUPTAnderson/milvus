@@ -17,10 +17,11 @@
 #include <mutex>
 
 #include "ConfigKnowhere.h"
-#include "exceptions/EasyAssert.h"
-#include "easyloggingpp/easylogging++.h"
+#include "common/EasyAssert.h"
+#include "glog/logging.h"
 #include "log/Log.h"
-#include "knowhere/archive/KnowhereConfig.h"
+#include "knowhere/comp/knowhere_config.h"
+#include "knowhere/version.h"
 
 namespace milvus::config {
 
@@ -31,19 +32,17 @@ KnowhereInitImpl(const char* conf_file) {
     auto init = [&]() {
         knowhere::KnowhereConfig::SetBlasThreshold(16384);
         knowhere::KnowhereConfig::SetEarlyStopThreshold(0);
-        knowhere::KnowhereConfig::SetLogHandler();
-        knowhere::KnowhereConfig::SetStatisticsLevel(0);
+        knowhere::KnowhereConfig::ShowVersion();
+        if (!google::IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging("milvus");
+        }
 
 #ifdef EMBEDDED_MILVUS
-        // always disable all logs for embedded milvus.
-        el::Configurations el_conf;
-        el_conf.setGlobally(el::ConfigurationType::Enabled, "false");
-        el::Loggers::reconfigureAllLoggers(el_conf);
+        // always disable all logs for embedded milvus
+        google::SetCommandLineOption("minloglevel", "4");
 #else
         if (conf_file != nullptr) {
-            el::Configurations el_conf(conf_file);
-            el::Loggers::reconfigureAllLoggers(el_conf);
-            LOG_SERVER_DEBUG_ << "Config easylogging with yaml file: " << conf_file;
+            gflags::SetCommandLineOption("flagfile", conf_file);
         }
 #endif
     };
@@ -63,14 +62,39 @@ KnowhereSetSimdType(const char* value) {
     } else if (strcmp(value, "avx") == 0 || strcmp(value, "sse4_2") == 0) {
         simd_type = knowhere::KnowhereConfig::SimdType::SSE4_2;
     } else {
-        PanicInfo("invalid SIMD type: " + std::string(value));
+        PanicInfo(ConfigInvalid, "invalid SIMD type: " + std::string(value));
     }
     try {
         return knowhere::KnowhereConfig::SetSimdType(simd_type);
     } catch (std::exception& e) {
         LOG_SERVER_ERROR_ << e.what();
-        PanicInfo(e.what());
+        PanicInfo(ConfigInvalid, e.what());
     }
+}
+
+void
+KnowhereInitBuildThreadPool(const uint32_t num_threads) {
+    knowhere::KnowhereConfig::SetBuildThreadPoolSize(num_threads);
+}
+
+void
+KnowhereInitSearchThreadPool(const uint32_t num_threads) {
+    knowhere::KnowhereConfig::SetSearchThreadPoolSize(num_threads);
+    if (!knowhere::KnowhereConfig::SetAioContextPool(num_threads)) {
+        PanicInfo(ConfigInvalid,
+                  "Failed to set aio context pool with num_threads " +
+                      std::to_string(num_threads));
+    }
+}
+
+int32_t
+GetMinimalIndexVersion() {
+    return knowhere::Version::GetMinimalVersion().VersionNumber();
+}
+
+int32_t
+GetCurrentIndexVersion() {
+    return knowhere::Version::GetCurrentVersion().VersionNumber();
 }
 
 }  // namespace milvus::config

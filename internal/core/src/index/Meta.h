@@ -16,8 +16,7 @@
 
 #pragma once
 
-#include "knowhere/index/IndexType.h"
-#include "knowhere/index/vector_index/helpers/IndexParameter.h"
+#include "knowhere/comp/index_param.h"
 
 namespace milvus::index {
 constexpr const char* OPERATOR_TYPE = "operator_type";
@@ -32,7 +31,6 @@ constexpr const char* MARISA_TRIE_INDEX = "marisa_trie_index";
 constexpr const char* MARISA_STR_IDS = "marisa_trie_str_ids";
 
 constexpr const char* INDEX_TYPE = "index_type";
-constexpr const char* INDEX_MODE = "index_mode";
 constexpr const char* METRIC_TYPE = "metric_type";
 
 // scalar index type
@@ -47,15 +45,20 @@ constexpr const char* FIELD_ID = "field_id";
 constexpr const char* INDEX_BUILD_ID = "index_build_id";
 constexpr const char* INDEX_ID = "index_id";
 constexpr const char* INDEX_VERSION = "index_version";
+constexpr const char* INDEX_ENGINE_VERSION = "index_engine_version";
+
+// VecIndex file metas
+constexpr const char* DISK_ANN_PREFIX_PATH = "index_prefix";
+constexpr const char* DISK_ANN_RAW_DATA_PATH = "data_path";
 
 // DiskAnn build params
-constexpr const char* DISK_ANN_RAW_DATA_PATH = "data_path";
 constexpr const char* DISK_ANN_MAX_DEGREE = "max_degree";
 constexpr const char* DISK_ANN_SEARCH_LIST_SIZE = "search_list_size";
 constexpr const char* DISK_ANN_PQ_CODE_BUDGET = "pq_code_budget_gb";
 constexpr const char* DISK_ANN_BUILD_DRAM_BUDGET = "build_dram_budget_gb";
 constexpr const char* DISK_ANN_BUILD_THREAD_NUM = "num_build_thread";
 constexpr const char* DISK_ANN_PQ_DIMS = "disk_pq_dims";
+constexpr const char* DISK_ANN_THREADS_NUM = "num_threads";
 
 // DiskAnn prepare params
 constexpr const char* DISK_ANN_LOAD_THREAD_NUM = "num_load_thread";
@@ -66,10 +69,4 @@ constexpr const char* DISK_ANN_PREPARE_USE_BFS_CACHE = "use_bfs_cache";
 // DiskAnn query params
 constexpr const char* DISK_ANN_QUERY_LIST = "search_list";
 constexpr const char* DISK_ANN_QUERY_BEAMWIDTH = "beamwidth";
-
-// DiskAnn config name
-constexpr const char* Disk_ANN_Build_Config = "diskANN_build_config";
-constexpr const char* Disk_ANN_Prepare_Config = "diskANN_prepare_config";
-constexpr const char* Disk_ANN_Query_Config = "diskANN_query_config";
-
 }  // namespace milvus::index

@@ -23,16 +23,16 @@ set(MILVUS_TEST_FILES
         test_bool_index.cpp
         test_common.cpp
         test_concurrent_vector.cpp
-        test_conf_adapter_mgr.cpp
         test_c_api.cpp
         test_expr.cpp
+        test_float16.cpp
         test_growing.cpp
+        test_growing_index.cpp
         test_indexing.cpp
         test_index_c_api.cpp
         test_index_wrapper.cpp
         test_init.cpp
         test_parquet_c.cpp
-        test_plan_proto.cpp
         test_query.cpp
         test_reduce.cpp
         test_reduce_c.cpp
@@ -47,14 +47,22 @@ set(MILVUS_TEST_FILES
         test_timestamp_index.cpp
         test_utils.cpp
         test_data_codec.cpp
+        test_range_search_sort.cpp
+        test_tracer.cpp
+        test_local_chunk_manager.cpp
+        test_disk_file_manager_test.cpp
+        test_integer_overflow.cpp
+        test_offset_ordered_map.cpp
+        test_offset_ordered_array.cpp
+        test_always_true_expr.cpp
+        test_plan_proto.cpp
+        test_chunk_cache.cpp
         )
 
 if ( BUILD_DISK_ANN STREQUAL "ON" )
     set(MILVUS_TEST_FILES
             ${MILVUS_TEST_FILES}
             #test_minio_chunk_manager.cpp
-            #test_disk_file_manager_test.cpp
-            test_local_chunk_manager.cpp
             )
 endif()
 
@@ -63,10 +71,28 @@ if (LINUX OR APPLE)
             ${MILVUS_TEST_FILES}
             test_scalar_index_creator.cpp
             test_string_index.cpp
-            )
+            test_array.cpp test_array_expr.cpp)
+endif()
+
+if (DEFINED AZURE_BUILD_DIR)
+    set(MILVUS_TEST_FILES
+                ${MILVUS_TEST_FILES}
+                test_azure_chunk_manager.cpp
+                #need update aws-sdk-cpp, see more from https://github.com/aws/aws-sdk-cpp/issues/2119
+                #test_remote_chunk_manager.cpp
+                )
+    include_directories("${AZURE_BUILD_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include")
 endif()
 
 if (LINUX)
+    message( STATUS "Building Milvus Unit Test on Linux")
+    option(USE_ASAN "Whether to use AddressSanitizer" OFF)
+    if ( USE_ASAN )
+        message( STATUS "Building Milvus using AddressSanitizer")
+        add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+        add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+    endif()
+
     # check if memory leak exists in index builder
     set(INDEX_BUILDER_TEST_FILES
             test_index_wrapper.cpp
@@ -82,6 +108,7 @@ if (LINUX)
             gtest
             gtest_main
             milvus_segcore
+            milvus_storage
             milvus_indexbuilder
             )
     install(TARGETS index_builder_test DESTINATION unittest)
@@ -94,6 +121,7 @@ add_executable(all_tests
 target_link_libraries(all_tests
         gtest
         milvus_segcore
+        milvus_storage
         milvus_indexbuilder
         pthread
         )
@@ -103,3 +131,17 @@ install(TARGETS all_tests DESTINATION unittest)
 if (LINUX)
     add_subdirectory(bench)
 endif ()
+
+if (USE_DYNAMIC_SIMD)
+add_executable(dynamic_simd_test
+               test_simd.cpp)
+
+target_link_libraries(dynamic_simd_test
+                milvus_simd
+                milvus_log
+                gtest
+                ${CONAN_LIBS})
+
+install(TARGETS dynamic_simd_test DESTINATION unittest)
+endif()
+

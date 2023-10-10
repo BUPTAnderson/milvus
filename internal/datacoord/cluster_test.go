@@ -18,44 +18,78 @@ package datacoord
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"stathat.com/c/consistent"
+
 	"github.com/milvus-io/milvus/internal/kv"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/kv/mocks"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"stathat.com/c/consistent"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/testutils"
 )
 
 func getMetaKv(t *testing.T) kv.MetaKv {
-	Params.Init()
 	rootPath := "/etcd/test/root/" + t.Name()
-	metakv, err := etcdkv.NewMetaKvFactory(rootPath, &Params.EtcdCfg)
+	kv, err := etcdkv.NewMetaKvFactory(rootPath, &Params.EtcdCfg)
 	require.NoError(t, err)
 
-	return metakv
+	return kv
 }
 
-func TestClusterCreate(t *testing.T) {
-	kv := getMetaKv(t)
-	defer func() {
-		kv.RemoveWithPrefix("")
-		kv.Close()
-	}()
+func getWatchKV(t *testing.T) kv.WatchKV {
+	rootPath := "/etcd/test/root/" + t.Name()
+	kv, err := etcdkv.NewWatchKVFactory(rootPath, &Params.EtcdCfg)
+	require.NoError(t, err)
 
-	t.Run("startup normally", func(t *testing.T) {
+	return kv
+}
 
+type ClusterSuite struct {
+	testutils.PromMetricsSuite
+
+	kv kv.WatchKV
+}
+
+func (suite *ClusterSuite) getWatchKV() kv.WatchKV {
+	rootPath := "/etcd/test/root/" + suite.T().Name()
+	kv, err := etcdkv.NewWatchKVFactory(rootPath, &Params.EtcdCfg)
+	suite.Require().NoError(err)
+
+	return kv
+}
+
+func (suite *ClusterSuite) SetupTest() {
+	kv := getWatchKV(suite.T())
+	suite.kv = kv
+}
+
+func (suite *ClusterSuite) TearDownTest() {
+	if suite.kv != nil {
+		suite.kv.RemoveWithPrefix("")
+		suite.kv.Close()
+	}
+}
+
+func (suite *ClusterSuite) TestCreate() {
+	kv := suite.kv
+
+	suite.Run("startup_normally", func() {
 		ctx, cancel := context.WithCancel(context.TODO())
 		defer cancel()
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 		addr := "localhost:8080"
@@ -65,15 +99,15 @@ func TestClusterCreate(t *testing.T) {
 		}
 		nodes := []*NodeInfo{info}
 		err = cluster.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		dataNodes := sessionManager.GetSessions()
-		assert.EqualValues(t, 1, len(dataNodes))
-		assert.EqualValues(t, "localhost:8080", dataNodes[0].info.Address)
+		suite.EqualValues(1, len(dataNodes))
+		suite.EqualValues("localhost:8080", dataNodes[0].info.Address)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 1)
 	})
 
-	t.Run("startup with existed channel data", func(t *testing.T) {
-		defer kv.RemoveWithPrefix("")
-
+	suite.Run("startup_with_existed_channel_data", func() {
 		ctx, cancel := context.WithCancel(context.TODO())
 		defer cancel()
 
@@ -85,24 +119,24 @@ func TestClusterCreate(t *testing.T) {
 			},
 		}
 		info1Data, err := proto.Marshal(info1)
-		assert.Nil(t, err)
-		err = kv.Save(Params.DataCoordCfg.ChannelWatchSubPath+"/1/channel1", string(info1Data))
-		assert.Nil(t, err)
+		suite.NoError(err)
+		err = kv.Save(Params.CommonCfg.DataCoordWatchSubPath.GetValue()+"/1/channel1", string(info1Data))
+		suite.NoError(err)
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 
 		err = cluster.Startup(ctx, []*NodeInfo{{NodeID: 1, Address: "localhost:9999"}})
-		assert.Nil(t, err)
+		suite.NoError(err)
 
 		channels := channelManager.GetChannels()
-		assert.EqualValues(t, []*NodeChannelInfo{{1, []*channel{{Name: "channel1", CollectionID: 1}}}}, channels)
+		suite.EqualValues([]*NodeChannelInfo{{1, []*channel{{Name: "channel1", CollectionID: 1}}}}, channels)
 	})
 
-	t.Run("remove all nodes and restart with other nodes", func(t *testing.T) {
+	suite.Run("remove_all_nodes_and_restart_with_other_nodes", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
@@ -110,7 +144,7 @@ func TestClusterCreate(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 
 		addr := "localhost:8080"
@@ -120,18 +154,18 @@ func TestClusterCreate(t *testing.T) {
 		}
 		nodes := []*NodeInfo{info}
 		err = cluster.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		suite.NoError(err)
 
 		err = cluster.UnRegister(info)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		sessions := sessionManager.GetSessions()
-		assert.Empty(t, sessions)
+		suite.Empty(sessions)
 
 		cluster.Close()
 
 		sessionManager2 := NewSessionManager()
 		channelManager2, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		clusterReload := NewCluster(sessionManager2, channelManager2)
 		defer clusterReload.Close()
 
@@ -142,43 +176,30 @@ func TestClusterCreate(t *testing.T) {
 		}
 		nodes = []*NodeInfo{info}
 		err = clusterReload.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		sessions = sessionManager2.GetSessions()
-		assert.EqualValues(t, 1, len(sessions))
-		assert.EqualValues(t, 2, sessions[0].info.NodeID)
-		assert.EqualValues(t, addr, sessions[0].info.Address)
+		suite.EqualValues(1, len(sessions))
+		suite.EqualValues(2, sessions[0].info.NodeID)
+		suite.EqualValues(addr, sessions[0].info.Address)
 		channels := channelManager2.GetChannels()
-		assert.EqualValues(t, 1, len(channels))
-		assert.EqualValues(t, 2, channels[0].NodeID)
+		suite.EqualValues(1, len(channels))
+		suite.EqualValues(2, channels[0].NodeID)
 	})
 
-	t.Run("loadKv Fails", func(t *testing.T) {
+	suite.Run("loadkv_fails", func() {
 		defer kv.RemoveWithPrefix("")
 
-		fkv := &loadPrefixFailKV{MetaKv: kv}
-		_, err := NewChannelManager(fkv, newMockHandler())
-		assert.NotNil(t, err)
+		metakv := mocks.NewWatchKV(suite.T())
+		metakv.EXPECT().LoadWithPrefix(mock.Anything).Return(nil, nil, errors.New("failed"))
+		_, err := NewChannelManager(metakv, newMockHandler())
+		suite.Error(err)
 	})
 }
 
-// a mock kv that always fail when LoadWithPrefix
-type loadPrefixFailKV struct {
-	kv.MetaKv
-}
+func (suite *ClusterSuite) TestRegister() {
+	kv := suite.kv
 
-// LoadWithPrefix override behavior
-func (kv *loadPrefixFailKV) LoadWithPrefix(key string) ([]string, []string, error) {
-	return []string{}, []string{}, errors.New("mocked fail")
-}
-
-func TestRegister(t *testing.T) {
-	kv := getMetaKv(t)
-	defer func() {
-		kv.RemoveWithPrefix("")
-		kv.Close()
-	}()
-
-	t.Run("register to empty cluster", func(t *testing.T) {
+	suite.Run("register_to_empty_cluster", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
@@ -186,24 +207,26 @@ func TestRegister(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 		addr := "localhost:8080"
 		err = cluster.Startup(ctx, nil)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		info := &NodeInfo{
 			NodeID:  1,
 			Address: addr,
 		}
 		err = cluster.Register(info)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		sessions := sessionManager.GetSessions()
-		assert.EqualValues(t, 1, len(sessions))
-		assert.EqualValues(t, "localhost:8080", sessions[0].info.Address)
+		suite.EqualValues(1, len(sessions))
+		suite.EqualValues("localhost:8080", sessions[0].info.Address)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 1)
 	})
 
-	t.Run("register to empty cluster with buffer channels", func(t *testing.T) {
+	suite.Run("register_to_empty_cluster_with_buffer_channels", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
@@ -211,32 +234,34 @@ func TestRegister(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		err = channelManager.Watch(&channel{
 			Name:         "ch1",
 			CollectionID: 0,
 		})
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 		addr := "localhost:8080"
 		err = cluster.Startup(ctx, nil)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		info := &NodeInfo{
 			NodeID:  1,
 			Address: addr,
 		}
 		err = cluster.Register(info)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		bufferChannels := channelManager.GetBufferChannels()
-		assert.Empty(t, bufferChannels.Channels)
+		suite.Empty(bufferChannels.Channels)
 		nodeChannels := channelManager.GetChannels()
-		assert.EqualValues(t, 1, len(nodeChannels))
-		assert.EqualValues(t, 1, nodeChannels[0].NodeID)
-		assert.EqualValues(t, "ch1", nodeChannels[0].Channels[0].Name)
+		suite.EqualValues(1, len(nodeChannels))
+		suite.EqualValues(1, nodeChannels[0].NodeID)
+		suite.EqualValues("ch1", nodeChannels[0].Channels[0].Name)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 1)
 	})
 
-	t.Run("register and restart with no channel", func(t *testing.T) {
+	suite.Run("register_and_restart_with_no_channel", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
@@ -244,37 +269,35 @@ func TestRegister(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		addr := "localhost:8080"
 		err = cluster.Startup(ctx, nil)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		info := &NodeInfo{
 			NodeID:  1,
 			Address: addr,
 		}
 		err = cluster.Register(info)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster.Close()
 
 		sessionManager2 := NewSessionManager()
 		channelManager2, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		restartCluster := NewCluster(sessionManager2, channelManager2)
 		defer restartCluster.Close()
 		channels := channelManager2.GetChannels()
-		assert.Empty(t, channels)
+		suite.Empty(channels)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 1)
 	})
 }
 
-func TestUnregister(t *testing.T) {
-	kv := getMetaKv(t)
-	defer func() {
-		kv.RemoveWithPrefix("")
-		kv.Close()
-	}()
+func (suite *ClusterSuite) TestUnregister() {
+	kv := suite.kv
 
-	t.Run("remove node after unregister", func(t *testing.T) {
+	suite.Run("remove_node_after_unregister", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
@@ -282,7 +305,7 @@ func TestUnregister(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 		addr := "localhost:8080"
@@ -292,14 +315,16 @@ func TestUnregister(t *testing.T) {
 		}
 		nodes := []*NodeInfo{info}
 		err = cluster.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		err = cluster.UnRegister(nodes[0])
-		assert.Nil(t, err)
+		suite.NoError(err)
 		sessions := sessionManager.GetSessions()
-		assert.Empty(t, sessions)
+		suite.Empty(sessions)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 0)
 	})
 
-	t.Run("move channels to online nodes after unregister", func(t *testing.T) {
+	suite.Run("move_channel_to_online_nodes_after_unregister", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
@@ -307,7 +332,7 @@ func TestUnregister(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 
@@ -321,31 +346,33 @@ func TestUnregister(t *testing.T) {
 		}
 		nodes := []*NodeInfo{nodeInfo1, nodeInfo2}
 		err = cluster.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		err = cluster.Watch("ch1", 1)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		err = cluster.UnRegister(nodeInfo1)
-		assert.Nil(t, err)
+		suite.NoError(err)
 
 		channels := channelManager.GetChannels()
-		assert.EqualValues(t, 1, len(channels))
-		assert.EqualValues(t, 2, channels[0].NodeID)
-		assert.EqualValues(t, 1, len(channels[0].Channels))
-		assert.EqualValues(t, "ch1", channels[0].Channels[0].Name)
+		suite.EqualValues(1, len(channels))
+		suite.EqualValues(2, channels[0].NodeID)
+		suite.EqualValues(1, len(channels[0].Channels))
+		suite.EqualValues("ch1", channels[0].Channels[0].Name)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 1)
 	})
 
-	t.Run("remove all channels after unregsiter", func(t *testing.T) {
+	suite.Run("remove_all_channels_after_unregsiter", func() {
 		defer kv.RemoveWithPrefix("")
 
 		ctx, cancel := context.WithCancel(context.TODO())
 		defer cancel()
 
-		var mockSessionCreator = func(ctx context.Context, addr string) (types.DataNode, error) {
+		mockSessionCreator := func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
 			return newMockDataNodeClient(1, nil)
 		}
 		sessionManager := NewSessionManager(withSessionCreator(mockSessionCreator))
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		suite.NoError(err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 
@@ -354,22 +381,28 @@ func TestUnregister(t *testing.T) {
 			NodeID:  1,
 		}
 		err = cluster.Startup(ctx, []*NodeInfo{nodeInfo})
-		assert.Nil(t, err)
+		suite.NoError(err)
 		err = cluster.Watch("ch_1", 1)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		err = cluster.UnRegister(nodeInfo)
-		assert.Nil(t, err)
+		suite.NoError(err)
 		channels := channelManager.GetChannels()
-		assert.Empty(t, channels)
+		suite.Empty(channels)
 		channel := channelManager.GetBufferChannels()
-		assert.NotNil(t, channel)
-		assert.EqualValues(t, 1, len(channel.Channels))
-		assert.EqualValues(t, "ch_1", channel.Channels[0].Name)
+		suite.NotNil(channel)
+		suite.EqualValues(1, len(channel.Channels))
+		suite.EqualValues("ch_1", channel.Channels[0].Name)
+
+		suite.MetricsEqual(metrics.DataCoordNumDataNodes, 0)
 	})
 }
 
+func TestCluster(t *testing.T) {
+	suite.Run(t, new(ClusterSuite))
+}
+
 func TestWatchIfNeeded(t *testing.T) {
-	kv := getMetaKv(t)
+	kv := getWatchKV(t)
 	defer func() {
 		kv.RemoveWithPrefix("")
 		kv.Close()
@@ -381,12 +414,12 @@ func TestWatchIfNeeded(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.TODO())
 		defer cancel()
 
-		var mockSessionCreator = func(ctx context.Context, addr string) (types.DataNode, error) {
+		mockSessionCreator := func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
 			return newMockDataNodeClient(1, nil)
 		}
 		sessionManager := NewSessionManager(withSessionCreator(mockSessionCreator))
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 
@@ -397,9 +430,9 @@ func TestWatchIfNeeded(t *testing.T) {
 		}
 
 		err = cluster.Startup(ctx, []*NodeInfo{info})
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		err = cluster.Watch("ch1", 1)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		channels := channelManager.GetChannels()
 		assert.EqualValues(t, 1, len(channels))
 		assert.EqualValues(t, "ch1", channels[0].Channels[0].Name)
@@ -410,12 +443,12 @@ func TestWatchIfNeeded(t *testing.T) {
 
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 
 		err = cluster.Watch("ch1", 1)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		channels := channelManager.GetChannels()
 		assert.Empty(t, channels)
@@ -426,7 +459,7 @@ func TestWatchIfNeeded(t *testing.T) {
 }
 
 func TestConsistentHashPolicy(t *testing.T) {
-	kv := getMetaKv(t)
+	kv := getWatchKV(t)
 	defer func() {
 		kv.RemoveWithPrefix("")
 		kv.Close()
@@ -436,7 +469,7 @@ func TestConsistentHashPolicy(t *testing.T) {
 	chash := consistent.New()
 	factory := NewConsistentHashChannelPolicyFactory(chash)
 	channelManager, err := NewChannelManager(kv, newMockHandler(), withFactory(factory))
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	cluster := NewCluster(sessionManager, channelManager)
 	defer cluster.Close()
 
@@ -458,57 +491,57 @@ func TestConsistentHashPolicy(t *testing.T) {
 		Address: "localhost:3333",
 	}
 	err = cluster.Register(nodeInfo1)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = cluster.Register(nodeInfo2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = cluster.Register(nodeInfo3)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	channels := []string{"ch1", "ch2", "ch3"}
 	for _, c := range channels {
 		err = cluster.Watch(c, 1)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		idstr, err := hash.Get(c)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		id, err := deformatNodeID(idstr)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		match := channelManager.Match(id, c)
 		assert.True(t, match)
 	}
 
 	hash.Remove("1")
 	err = cluster.UnRegister(nodeInfo1)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	for _, c := range channels {
 		idstr, err := hash.Get(c)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		id, err := deformatNodeID(idstr)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		match := channelManager.Match(id, c)
 		assert.True(t, match)
 	}
 
 	hash.Remove("2")
 	err = cluster.UnRegister(nodeInfo2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	for _, c := range channels {
 		idstr, err := hash.Get(c)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		id, err := deformatNodeID(idstr)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		match := channelManager.Match(id, c)
 		assert.True(t, match)
 	}
 
 	hash.Remove("3")
 	err = cluster.UnRegister(nodeInfo3)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	bufferChannels := channelManager.GetBufferChannels()
 	assert.EqualValues(t, 3, len(bufferChannels.Channels))
 }
 
 func TestCluster_Flush(t *testing.T) {
-	kv := getMetaKv(t)
+	kv := getWatchKV(t)
 	defer func() {
 		kv.RemoveWithPrefix("")
 		kv.Close()
@@ -518,7 +551,7 @@ func TestCluster_Flush(t *testing.T) {
 	defer cancel()
 	sessionManager := NewSessionManager()
 	channelManager, err := NewChannelManager(kv, newMockHandler())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	cluster := NewCluster(sessionManager, channelManager)
 	defer cluster.Close()
 	addr := "localhost:8080"
@@ -528,36 +561,34 @@ func TestCluster_Flush(t *testing.T) {
 	}
 	nodes := []*NodeInfo{info}
 	err = cluster.Startup(ctx, nodes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	err = cluster.Watch("chan-1", 1)
 	assert.NoError(t, err)
 
 	// flush empty should impact nothing
 	assert.NotPanics(t, func() {
-		err := cluster.Flush(context.Background(), 1, "chan-1", []*datapb.SegmentInfo{}, []*datapb.SegmentInfo{})
+		err := cluster.Flush(context.Background(), 1, "chan-1", []*datapb.SegmentInfo{})
 		assert.NoError(t, err)
 	})
 
 	// flush not watched channel
 	assert.NotPanics(t, func() {
-		err := cluster.Flush(context.Background(), 1, "chan-2", []*datapb.SegmentInfo{{ID: 1}},
-			[]*datapb.SegmentInfo{{ID: 2}})
+		err := cluster.Flush(context.Background(), 1, "chan-2", []*datapb.SegmentInfo{{ID: 1}})
 		assert.Error(t, err)
 	})
 
 	// flush from wrong datanode
 	assert.NotPanics(t, func() {
-		err := cluster.Flush(context.Background(), 2, "chan-1", []*datapb.SegmentInfo{{ID: 1}},
-			[]*datapb.SegmentInfo{{ID: 3}})
+		err := cluster.Flush(context.Background(), 2, "chan-1", []*datapb.SegmentInfo{{ID: 1}})
 		assert.Error(t, err)
 	})
 
-	//TODO add a method to verify datanode has flush request after client injection is available
+	// TODO add a method to verify datanode has flush request after client injection is available
 }
 
 func TestCluster_Import(t *testing.T) {
-	kv := getMetaKv(t)
+	kv := getWatchKV(t)
 	defer func() {
 		kv.RemoveWithPrefix("")
 		kv.Close()
@@ -567,7 +598,7 @@ func TestCluster_Import(t *testing.T) {
 	defer cancel()
 	sessionManager := NewSessionManager()
 	channelManager, err := NewChannelManager(kv, newMockHandler())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	cluster := NewCluster(sessionManager, channelManager)
 	defer cluster.Close()
 	addr := "localhost:8080"
@@ -577,7 +608,7 @@ func TestCluster_Import(t *testing.T) {
 	}
 	nodes := []*NodeInfo{info}
 	err = cluster.Startup(ctx, nodes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	err = cluster.Watch("chan-1", 1)
 	assert.NoError(t, err)
@@ -589,7 +620,7 @@ func TestCluster_Import(t *testing.T) {
 }
 
 func TestCluster_ReCollectSegmentStats(t *testing.T) {
-	kv := getMetaKv(t)
+	kv := getWatchKV(t)
 	defer func() {
 		kv.RemoveWithPrefix("")
 		kv.Close()
@@ -598,12 +629,12 @@ func TestCluster_ReCollectSegmentStats(t *testing.T) {
 	t.Run("recollect succeed", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.TODO())
 		defer cancel()
-		var mockSessionCreator = func(ctx context.Context, addr string) (types.DataNode, error) {
+		mockSessionCreator := func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
 			return newMockDataNodeClient(1, nil)
 		}
 		sessionManager := NewSessionManager(withSessionCreator(mockSessionCreator))
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 		addr := "localhost:8080"
@@ -613,13 +644,13 @@ func TestCluster_ReCollectSegmentStats(t *testing.T) {
 		}
 		nodes := []*NodeInfo{info}
 		err = cluster.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		err = cluster.Watch("chan-1", 1)
 		assert.NoError(t, err)
 
 		assert.NotPanics(t, func() {
-			cluster.ReCollectSegmentStats(ctx, 1)
+			cluster.ReCollectSegmentStats(ctx)
 		})
 		time.Sleep(500 * time.Millisecond)
 	})
@@ -629,7 +660,7 @@ func TestCluster_ReCollectSegmentStats(t *testing.T) {
 		defer cancel()
 		sessionManager := NewSessionManager()
 		channelManager, err := NewChannelManager(kv, newMockHandler())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		cluster := NewCluster(sessionManager, channelManager)
 		defer cluster.Close()
 		addr := "localhost:8080"
@@ -639,13 +670,13 @@ func TestCluster_ReCollectSegmentStats(t *testing.T) {
 		}
 		nodes := []*NodeInfo{info}
 		err = cluster.Startup(ctx, nodes)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		err = cluster.Watch("chan-1", 1)
 		assert.NoError(t, err)
 
 		assert.NotPanics(t, func() {
-			cluster.ReCollectSegmentStats(ctx, 1)
+			cluster.ReCollectSegmentStats(ctx)
 		})
 		time.Sleep(500 * time.Millisecond)
 	})

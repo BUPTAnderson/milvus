@@ -18,77 +18,85 @@
 #include "index/VectorMemIndex.h"
 #include "index/Utils.h"
 #include "index/Meta.h"
+#include "knowhere/utils.h"
 
-#ifdef BUILD_DISK_ANN
 #include "index/VectorDiskIndex.h"
-#endif
 
 namespace milvus::index {
 
 IndexBasePtr
-IndexFactory::CreateIndex(const CreateIndexInfo& create_index_info, storage::FileManagerImplPtr file_manager) {
+IndexFactory::CreateIndex(
+    const CreateIndexInfo& create_index_info,
+    const storage::FileManagerContext& file_manager_context) {
     if (datatype_is_vector(create_index_info.field_type)) {
-        return CreateVectorIndex(create_index_info, file_manager);
+        return CreateVectorIndex(create_index_info, file_manager_context);
     }
 
-    return CreateScalarIndex(create_index_info);
+    return CreateScalarIndex(create_index_info, file_manager_context);
 }
 
 IndexBasePtr
-IndexFactory::CreateScalarIndex(const CreateIndexInfo& create_index_info) {
+IndexFactory::CreateScalarIndex(
+    const CreateIndexInfo& create_index_info,
+    const storage::FileManagerContext& file_manager_context) {
     auto data_type = create_index_info.field_type;
     auto index_type = create_index_info.index_type;
 
     switch (data_type) {
         // create scalar index
         case DataType::BOOL:
-            return CreateScalarIndex<bool>(index_type);
+            return CreateScalarIndex<bool>(index_type, file_manager_context);
         case DataType::INT8:
-            return CreateScalarIndex<int8_t>(index_type);
+            return CreateScalarIndex<int8_t>(index_type, file_manager_context);
         case DataType::INT16:
-            return CreateScalarIndex<int16_t>(index_type);
+            return CreateScalarIndex<int16_t>(index_type, file_manager_context);
         case DataType::INT32:
-            return CreateScalarIndex<int32_t>(index_type);
+            return CreateScalarIndex<int32_t>(index_type, file_manager_context);
         case DataType::INT64:
-            return CreateScalarIndex<int64_t>(index_type);
+            return CreateScalarIndex<int64_t>(index_type, file_manager_context);
         case DataType::FLOAT:
-            return CreateScalarIndex<float>(index_type);
+            return CreateScalarIndex<float>(index_type, file_manager_context);
         case DataType::DOUBLE:
-            return CreateScalarIndex<double>(index_type);
+            return CreateScalarIndex<double>(index_type, file_manager_context);
 
             // create string index
         case DataType::STRING:
         case DataType::VARCHAR:
-            return CreateScalarIndex<std::string>(index_type);
+            return CreateScalarIndex<std::string>(index_type,
+                                                  file_manager_context);
         default:
-            throw std::invalid_argument(std::string("invalid data type to build index: ") +
-                                        std::to_string(int(data_type)));
+            throw SegcoreError(
+                DataTypeInvalid,
+                fmt::format("invalid data type to build index: {}", data_type));
     }
 }
 
 IndexBasePtr
-IndexFactory::CreateVectorIndex(const CreateIndexInfo& create_index_info, storage::FileManagerImplPtr file_manager) {
-    auto data_type = create_index_info.field_type;
+IndexFactory::CreateVectorIndex(
+    const CreateIndexInfo& create_index_info,
+    const storage::FileManagerContext& file_manager_context) {
     auto index_type = create_index_info.index_type;
     auto metric_type = create_index_info.metric_type;
-    auto index_mode = create_index_info.index_mode;
-
-#ifdef BUILD_DISK_ANN
+    auto version = create_index_info.index_engine_version;
     // create disk index
-    if (is_in_disk_list(index_type)) {
+    auto data_type = create_index_info.field_type;
+    if (knowhere::UseDiskLoad(index_type, version)) {
         switch (data_type) {
             case DataType::VECTOR_FLOAT: {
-                return std::make_unique<VectorDiskAnnIndex<float>>(index_type, metric_type, index_mode, file_manager);
+                return std::make_unique<VectorDiskAnnIndex<float>>(
+                    index_type, metric_type, version, file_manager_context);
             }
             default:
-                throw std::invalid_argument(std::string("invalid data type to build disk index: ") +
-                                            std::to_string(int(data_type)));
+                throw SegcoreError(
+                    DataTypeInvalid,
+                    fmt::format("invalid data type to build disk index: {}",
+                                data_type));
         }
     }
-#endif
 
     // create mem index
-    return std::make_unique<VectorMemIndex>(index_type, metric_type, index_mode);
+    return std::make_unique<VectorMemIndex>(
+        index_type, metric_type, version, file_manager_context);
 }
 
 }  // namespace milvus::index

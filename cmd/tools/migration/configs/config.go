@@ -2,10 +2,11 @@ package configs
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/milvus-io/milvus/cmd/tools/migration/console"
-	"github.com/milvus-io/milvus/internal/util"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 const (
@@ -30,6 +31,9 @@ func newRunConfig(base *paramtable.BaseTable) *RunConfig {
 }
 
 func (c *RunConfig) String() string {
+	if c == nil {
+		return ""
+	}
 	switch c.Cmd {
 	case RunCmd:
 		return fmt.Sprintf("Cmd: %s, SourceVersion: %s, TargetVersion: %s, BackupFilePath: %s, RunWithBackup: %v",
@@ -52,19 +56,16 @@ func (c *RunConfig) show() {
 func (c *RunConfig) init(base *paramtable.BaseTable) {
 	c.base = base
 
-	c.Cmd = c.base.LoadWithDefault("cmd.type", "")
-	c.RunWithBackup = c.base.ParseBool("cmd.runWithBackup", false)
-	c.SourceVersion = c.base.LoadWithDefault("config.sourceVersion", "")
-	c.TargetVersion = c.base.LoadWithDefault("config.targetVersion", "")
-	c.BackupFilePath = c.base.LoadWithDefault("config.backupFilePath", "")
-
-	c.show()
+	c.Cmd = c.base.GetWithDefault("cmd.type", "")
+	c.RunWithBackup, _ = strconv.ParseBool(c.base.GetWithDefault("cmd.runWithBackup", "false"))
+	c.SourceVersion = c.base.GetWithDefault("config.sourceVersion", "")
+	c.TargetVersion = c.base.GetWithDefault("config.targetVersion", "")
+	c.BackupFilePath = c.base.GetWithDefault("config.backupFilePath", "")
 }
 
 type MilvusConfig struct {
 	MetaStoreCfg *paramtable.MetaStoreConfig
 	EtcdCfg      *paramtable.EtcdConfig
-	MysqlCfg     *paramtable.MetaDBConfig
 }
 
 func newMilvusConfig(base *paramtable.BaseTable) *MilvusConfig {
@@ -76,20 +77,25 @@ func newMilvusConfig(base *paramtable.BaseTable) *MilvusConfig {
 func (c *MilvusConfig) init(base *paramtable.BaseTable) {
 	c.MetaStoreCfg = &paramtable.MetaStoreConfig{}
 	c.EtcdCfg = &paramtable.EtcdConfig{}
-	c.MysqlCfg = &paramtable.MetaDBConfig{}
 
-	c.MetaStoreCfg.Base = base
-	c.MetaStoreCfg.LoadCfgToMemory()
+	c.MetaStoreCfg.Init(base)
+	c.EtcdCfg.Init(base)
+}
 
-	switch c.MetaStoreCfg.MetaStoreType {
-	case util.MetaStoreTypeMysql:
-		c.MysqlCfg.Base = base
-		c.MysqlCfg.LoadCfgToMemory()
-	default:
+func (c *MilvusConfig) String() string {
+	if c == nil {
+		return ""
 	}
+	switch c.MetaStoreCfg.MetaStoreType.GetValue() {
+	case util.MetaStoreTypeEtcd:
+		return fmt.Sprintf("Type: %s, EndPoints: %v, MetaRootPath: %s", c.MetaStoreCfg.MetaStoreType.GetValue(), c.EtcdCfg.Endpoints.GetValue(), c.EtcdCfg.MetaRootPath.GetValue())
+	default:
+		return fmt.Sprintf("unsupported meta store: %s", c.MetaStoreCfg.MetaStoreType.GetValue())
+	}
+}
 
-	c.EtcdCfg.Base = base
-	c.EtcdCfg.LoadCfgToMemory()
+func (c *MilvusConfig) show() {
+	console.Warning(c.String())
 }
 
 type Config struct {
@@ -102,6 +108,9 @@ func (c *Config) init(yamlFile string) {
 	c.base = paramtable.NewBaseTableFromYamlOnly(yamlFile)
 	c.RunConfig = newRunConfig(c.base)
 	c.MilvusConfig = newMilvusConfig(c.base)
+
+	c.RunConfig.show()
+	c.MilvusConfig.show()
 }
 
 func NewConfig(yamlFile string) *Config {

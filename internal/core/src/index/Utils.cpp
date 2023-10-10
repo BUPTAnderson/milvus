@@ -15,14 +15,26 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 #include <functional>
+#include <iostream>
 
 #include "index/Utils.h"
 #include "index/Meta.h"
 #include <google/protobuf/text_format.h>
-#include "exceptions/EasyAssert.h"
+#include <unistd.h>
+#include "common/EasyAssert.h"
+#include "knowhere/comp/index_param.h"
+#include "common/Slice.h"
+#include "storage/FieldData.h"
+#include "storage/Util.h"
+#include "common/File.h"
 
 namespace milvus::index {
 
@@ -50,18 +62,11 @@ BIN_List() {
     return ret;
 }
 
-std::vector<IndexType>
-DISK_LIST() {
-    static std::vector<IndexType> ret{
-        knowhere::IndexEnum::INDEX_DISKANN,
-    };
-    return ret;
-}
-
 std::vector<std::tuple<IndexType, MetricType>>
 unsupported_index_combinations() {
     static std::vector<std::tuple<IndexType, MetricType>> ret{
-        std::make_tuple(knowhere::IndexEnum::INDEX_FAISS_BIN_IVFFLAT, knowhere::metric::L2),
+        std::make_tuple(knowhere::IndexEnum::INDEX_FAISS_BIN_IVFFLAT,
+                        knowhere::metric::L2),
     };
     return ret;
 }
@@ -77,14 +82,10 @@ is_in_nm_list(const IndexType& index_type) {
 }
 
 bool
-is_in_disk_list(const IndexType& index_type) {
-    return is_in_list<IndexType>(index_type, DISK_LIST);
-}
-
-bool
 is_unsupported(const IndexType& index_type, const MetricType& metric_type) {
-    return is_in_list<std::tuple<IndexType, MetricType>>(std::make_tuple(index_type, metric_type),
-                                                         unsupported_index_combinations);
+    return is_in_list<std::tuple<IndexType, MetricType>>(
+        std::make_tuple(index_type, metric_type),
+        unsupported_index_combinations);
 }
 
 bool
@@ -119,23 +120,13 @@ GetIndexTypeFromConfig(const Config& config) {
     return index_type.value();
 }
 
-IndexMode
-GetIndexModeFromConfig(const Config& config) {
-    auto mode = GetValueFromConfig<std::string>(config, INDEX_MODE);
-    return mode.has_value() ? GetIndexMode(mode.value()) : knowhere::IndexMode::MODE_CPU;
-}
-
-IndexMode
-GetIndexMode(const std::string index_mode) {
-    if (index_mode.compare("CPU") != 0) {
-        return IndexMode::MODE_CPU;
-    }
-
-    if (index_mode.compare("GPU") != 0) {
-        return IndexMode::MODE_GPU;
-    }
-
-    PanicInfo("unsupported index mode");
+IndexVersion
+GetIndexEngineVersionFromConfig(const Config& config) {
+    auto index_engine_version =
+        GetValueFromConfig<std::string>(config, INDEX_ENGINE_VERSION);
+    AssertInfo(index_engine_version.has_value(),
+               "index_engine not exist in config");
+    return (std::stoi(index_engine_version.value()));
 }
 
 // TODO :: too ugly
@@ -143,22 +134,28 @@ storage::FieldDataMeta
 GetFieldDataMetaFromConfig(const Config& config) {
     storage::FieldDataMeta field_data_meta;
     // set collection id
-    auto collection_id = index::GetValueFromConfig<std::string>(config, index::COLLECTION_ID);
-    AssertInfo(collection_id.has_value(), "collection id not exist in index config");
+    auto collection_id =
+        index::GetValueFromConfig<std::string>(config, index::COLLECTION_ID);
+    AssertInfo(collection_id.has_value(),
+               "collection id not exist in index config");
     field_data_meta.collection_id = std::stol(collection_id.value());
 
     // set partition id
-    auto partition_id = index::GetValueFromConfig<std::string>(config, index::PARTITION_ID);
-    AssertInfo(partition_id.has_value(), "partition id not exist in index config");
+    auto partition_id =
+        index::GetValueFromConfig<std::string>(config, index::PARTITION_ID);
+    AssertInfo(partition_id.has_value(),
+               "partition id not exist in index config");
     field_data_meta.partition_id = std::stol(partition_id.value());
 
     // set segment id
-    auto segment_id = index::GetValueFromConfig<std::string>(config, index::SEGMENT_ID);
+    auto segment_id =
+        index::GetValueFromConfig<std::string>(config, index::SEGMENT_ID);
     AssertInfo(segment_id.has_value(), "segment id not exist in index config");
     field_data_meta.segment_id = std::stol(segment_id.value());
 
     // set field id
-    auto field_id = index::GetValueFromConfig<std::string>(config, index::FIELD_ID);
+    auto field_id =
+        index::GetValueFromConfig<std::string>(config, index::FIELD_ID);
     AssertInfo(field_id.has_value(), "field id not exist in index config");
     field_data_meta.field_id = std::stol(field_id.value());
 
@@ -169,22 +166,27 @@ storage::IndexMeta
 GetIndexMetaFromConfig(const Config& config) {
     storage::IndexMeta index_meta;
     // set segment id
-    auto segment_id = index::GetValueFromConfig<std::string>(config, index::SEGMENT_ID);
+    auto segment_id =
+        index::GetValueFromConfig<std::string>(config, index::SEGMENT_ID);
     AssertInfo(segment_id.has_value(), "segment id not exist in index config");
     index_meta.segment_id = std::stol(segment_id.value());
 
     // set field id
-    auto field_id = index::GetValueFromConfig<std::string>(config, index::FIELD_ID);
+    auto field_id =
+        index::GetValueFromConfig<std::string>(config, index::FIELD_ID);
     AssertInfo(field_id.has_value(), "field id not exist in index config");
     index_meta.field_id = std::stol(field_id.value());
 
     // set index version
-    auto index_version = index::GetValueFromConfig<std::string>(config, index::INDEX_VERSION);
-    AssertInfo(index_version.has_value(), "index_version id not exist in index config");
+    auto index_version =
+        index::GetValueFromConfig<std::string>(config, index::INDEX_VERSION);
+    AssertInfo(index_version.has_value(),
+               "index_version id not exist in index config");
     index_meta.index_version = std::stol(index_version.value());
 
     // set index id
-    auto build_id = index::GetValueFromConfig<std::string>(config, index::INDEX_BUILD_ID);
+    auto build_id =
+        index::GetValueFromConfig<std::string>(config, index::INDEX_BUILD_ID);
     AssertInfo(build_id.has_value(), "build id not exist in index config");
     index_meta.build_id = std::stol(build_id.value());
 
@@ -192,13 +194,115 @@ GetIndexMetaFromConfig(const Config& config) {
 }
 
 Config
-ParseConfigFromIndexParams(const std::map<std::string, std::string>& index_params) {
+ParseConfigFromIndexParams(
+    const std::map<std::string, std::string>& index_params) {
     Config config;
     for (auto& p : index_params) {
         config[p.first] = p.second;
     }
 
     return config;
+}
+
+void
+AssembleIndexDatas(std::map<std::string, storage::FieldDataPtr>& index_datas) {
+    if (index_datas.find(INDEX_FILE_SLICE_META) != index_datas.end()) {
+        auto slice_meta = index_datas.at(INDEX_FILE_SLICE_META);
+        Config meta_data = Config::parse(std::string(
+            static_cast<const char*>(slice_meta->Data()), slice_meta->Size()));
+
+        for (auto& item : meta_data[META]) {
+            std::string prefix = item[NAME];
+            int slice_num = item[SLICE_NUM];
+            auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
+
+            auto new_field_data =
+                storage::CreateFieldData(DataType::INT8, 1, total_len);
+
+            for (auto i = 0; i < slice_num; ++i) {
+                std::string file_name = GenSlicedFileName(prefix, i);
+                AssertInfo(index_datas.find(file_name) != index_datas.end(),
+                           "lost index slice data");
+                auto data = index_datas.at(file_name);
+                auto len = data->Size();
+                new_field_data->FillFieldData(data->Data(), len);
+                index_datas.erase(file_name);
+            }
+            AssertInfo(
+                new_field_data->IsFull(),
+                "index len is inconsistent after disassemble and assemble");
+            index_datas[prefix] = new_field_data;
+        }
+    }
+}
+
+void
+AssembleIndexDatas(
+    std::map<std::string, storage::FieldDataChannelPtr>& index_datas,
+    std::unordered_map<std::string, storage::FieldDataPtr>& result) {
+    if (auto meta_iter = index_datas.find(INDEX_FILE_SLICE_META);
+        meta_iter != index_datas.end()) {
+        auto raw_metadata_array =
+            storage::CollectFieldDataChannel(meta_iter->second);
+        auto raw_metadata = storage::MergeFieldData(raw_metadata_array);
+        result[INDEX_FILE_SLICE_META] = raw_metadata;
+        index_datas.erase(INDEX_FILE_SLICE_META);
+        Config metadata = Config::parse(
+            std::string(static_cast<const char*>(raw_metadata->Data()),
+                        raw_metadata->Size()));
+
+        for (auto& item : metadata[META]) {
+            std::string prefix = item[NAME];
+            int slice_num = item[SLICE_NUM];
+            auto total_len = static_cast<size_t>(item[TOTAL_LEN]);
+
+            auto new_field_data =
+                storage::CreateFieldData(DataType::INT8, 1, total_len);
+
+            for (auto i = 0; i < slice_num; ++i) {
+                std::string file_name = GenSlicedFileName(prefix, i);
+                auto it = index_datas.find(file_name);
+                AssertInfo(it != index_datas.end(), "lost index slice data");
+                auto& channel = it->second;
+                auto data_array = storage::CollectFieldDataChannel(channel);
+                auto data = storage::MergeFieldData(data_array);
+                auto len = data->Size();
+                new_field_data->FillFieldData(data->Data(), len);
+                index_datas.erase(file_name);
+            }
+            AssertInfo(
+                new_field_data->IsFull(),
+                "index len is inconsistent after disassemble and assemble");
+            result[prefix] = new_field_data;
+        }
+    }
+    for (auto& [key, channel] : index_datas) {
+        if (key == INDEX_FILE_SLICE_META) {
+            continue;
+        }
+
+        auto data_array = storage::CollectFieldDataChannel(channel);
+        auto data = storage::MergeFieldData(data_array);
+        result[key] = data;
+    }
+}
+
+void
+ReadDataFromFD(int fd, void* buf, size_t size, size_t chunk_size) {
+    lseek(fd, 0, SEEK_SET);
+    while (size != 0) {
+        const size_t count = (size < chunk_size) ? size : chunk_size;
+        const ssize_t size_read = read(fd, buf, count);
+        if (size_read != count) {
+            throw SegcoreError(
+                ErrorCode::UnistdError,
+                "read data from fd error, returned read size is " +
+                    std::to_string(size_read));
+        }
+
+        buf = static_cast<char*>(buf) + size_read;
+        size -= static_cast<std::size_t>(size_read);
+    }
 }
 
 }  // namespace milvus::index

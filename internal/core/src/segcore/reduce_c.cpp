@@ -11,11 +11,9 @@
 
 #include <vector>
 #include "Reduce.h"
-#include "common/CGoHelper.h"
 #include "common/QueryResult.h"
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
 #include "query/Plan.h"
-#include "segcore/ReduceStructure.h"
 #include "segcore/reduce_c.h"
 #include "segcore/Utils.h"
 
@@ -38,7 +36,8 @@ ReduceSearchResultsAndFillData(CSearchResultDataBlobs* cSearchResultDataBlobs,
             search_results[i] = static_cast<SearchResult*>(c_search_results[i]);
         }
 
-        auto reduce_helper = milvus::segcore::ReduceHelper(search_results, plan, slice_nqs, slice_topKs, num_slices);
+        auto reduce_helper = milvus::segcore::ReduceHelper(
+            search_results, plan, slice_nqs, slice_topKs, num_slices);
         reduce_helper.Reduce();
         reduce_helper.Marshal();
 
@@ -46,7 +45,7 @@ ReduceSearchResultsAndFillData(CSearchResultDataBlobs* cSearchResultDataBlobs,
         *cSearchResultDataBlobs = reduce_helper.GetSearchResultDataBlobs();
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
-        return milvus::FailureCStatus(UnexpectedError, e.what());
+        return milvus::FailureCStatus(&e);
     }
 }
 
@@ -56,15 +55,19 @@ GetSearchResultDataBlob(CProto* searchResultDataBlob,
                         int32_t blob_index) {
     try {
         auto search_result_data_blobs =
-            reinterpret_cast<milvus::segcore::SearchResultDataBlobs*>(cSearchResultDataBlobs);
-        AssertInfo(blob_index < search_result_data_blobs->blobs.size(), "blob_index out of range");
-        searchResultDataBlob->proto_blob = search_result_data_blobs->blobs[blob_index].data();
-        searchResultDataBlob->proto_size = search_result_data_blobs->blobs[blob_index].size();
+            reinterpret_cast<milvus::segcore::SearchResultDataBlobs*>(
+                cSearchResultDataBlobs);
+        AssertInfo(blob_index < search_result_data_blobs->blobs.size(),
+                   "blob_index out of range");
+        searchResultDataBlob->proto_blob =
+            search_result_data_blobs->blobs[blob_index].data();
+        searchResultDataBlob->proto_size =
+            search_result_data_blobs->blobs[blob_index].size();
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
         searchResultDataBlob->proto_blob = nullptr;
         searchResultDataBlob->proto_size = 0;
-        return milvus::FailureCStatus(UnexpectedError, e.what());
+        return milvus::FailureCStatus(&e);
     }
 }
 
@@ -73,6 +76,8 @@ DeleteSearchResultDataBlobs(CSearchResultDataBlobs cSearchResultDataBlobs) {
     if (cSearchResultDataBlobs == nullptr) {
         return;
     }
-    auto search_result_data_blobs = reinterpret_cast<milvus::segcore::SearchResultDataBlobs*>(cSearchResultDataBlobs);
+    auto search_result_data_blobs =
+        reinterpret_cast<milvus::segcore::SearchResultDataBlobs*>(
+            cSearchResultDataBlobs);
     delete search_result_data_blobs;
 }

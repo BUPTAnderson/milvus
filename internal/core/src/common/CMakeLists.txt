@@ -17,31 +17,23 @@ set(COMMON_SRC
         Slice.cpp
         binary_set_c.cpp
         init_c.cpp
-        )
+        Common.cpp
+        RangeSearchHelper.cpp
+        Tracer.cpp
+        IndexMeta.cpp
+        EasyAssert.cpp
+)
 
 add_library(milvus_common SHARED ${COMMON_SRC})
 
-if ( MSYS )
-    target_link_libraries(milvus_common
-            milvus_config
-            milvus_utils
-            milvus_log
-            yaml-cpp
-            boost_bitset_ext
-            arrow
-            parquet
-            )
-else()
-    target_link_libraries(milvus_common
-            milvus_config
-            milvus_utils
-            milvus_log
-            yaml-cpp
-            boost_bitset_ext
-            arrow
-            parquet
-            arrow_bundled
-            )
-endif()
+target_link_libraries(milvus_common
+        milvus_config
+        milvus_log
+        milvus_proto
+        yaml-cpp
+        boost_bitset_ext
+        simdjson
+        ${CONAN_LIBS}
+        )
 
 install(TARGETS milvus_common DESTINATION "${CMAKE_INSTALL_LIBDIR}")

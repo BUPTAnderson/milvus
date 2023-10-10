@@ -7,21 +7,21 @@ package indexcgowrapper
 #include "indexbuilder/index_c.h"
 */
 import "C"
+
 import (
+	"context"
 	"fmt"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"path/filepath"
 	"runtime"
 	"unsafe"
 
 	"github.com/golang/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/indexcgopb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 type Blob = storage.Blob
@@ -38,11 +38,10 @@ type CodecIndex interface {
 	Load([]*Blob) error
 	Delete() error
 	CleanLocalData() error
+	UpLoad() (map[string]int64, error)
 }
 
-var (
-	_ CodecIndex = (*CgoIndex)(nil)
-)
+var _ CodecIndex = (*CgoIndex)(nil)
 
 type CgoIndex struct {
 	indexPtr C.CIndex
@@ -50,7 +49,7 @@ type CgoIndex struct {
 }
 
 // TODO: use proto.Marshal instead of proto.MarshalTextString for better compatibility.
-func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]string, config *indexpb.StorageConfig) (*CgoIndex, error) {
+func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]string) (CodecIndex, error) {
 	protoTypeParams := &indexcgopb.TypeParams{
 		Params: make([]*commonpb.KeyValuePair, 0),
 	}
@@ -72,37 +71,9 @@ func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]str
 	defer C.free(unsafe.Pointer(typeParamsPointer))
 	defer C.free(unsafe.Pointer(indexParamsPointer))
 
-	// TODO::xige-16 support embedded milvus
-	storageType := "minio"
-	cAddress := C.CString(config.Address)
-	cBucketName := C.CString(config.GetBucketName())
-	cAccessKey := C.CString(config.GetAccessKeyID())
-	cAccessValue := C.CString(config.GetSecretAccessKey())
-	cRootPath := C.CString(config.GetRootPath())
-	cStorageType := C.CString(storageType)
-	cIamEndPoint := C.CString(config.GetIAMEndpoint())
-	defer C.free(unsafe.Pointer(cAddress))
-	defer C.free(unsafe.Pointer(cBucketName))
-	defer C.free(unsafe.Pointer(cAccessKey))
-	defer C.free(unsafe.Pointer(cAccessValue))
-	defer C.free(unsafe.Pointer(cRootPath))
-	defer C.free(unsafe.Pointer(cStorageType))
-	defer C.free(unsafe.Pointer(cIamEndPoint))
-	storageConfig := C.CStorageConfig{
-		address:          cAddress,
-		bucket_name:      cBucketName,
-		access_key_id:    cAccessKey,
-		access_key_value: cAccessValue,
-		remote_root_path: cRootPath,
-		storage_type:     cStorageType,
-		iam_endpoint:     cIamEndPoint,
-		useSSL:           C.bool(config.GetUseSSL()),
-		useIAM:           C.bool(config.GetUseIAM()),
-	}
-
 	var indexPtr C.CIndex
 	cintDType := uint32(dtype)
-	status := C.CreateIndex(cintDType, typeParamsPointer, indexParamsPointer, &indexPtr, storageConfig)
+	status := C.CreateIndex(cintDType, typeParamsPointer, indexParamsPointer, &indexPtr)
 	if err := HandleCStatus(&status, "failed to create index"); err != nil {
 		return nil, err
 	}
@@ -121,12 +92,29 @@ func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]str
 	return index, nil
 }
 
+func CreateIndex(ctx context.Context, buildIndexInfo *BuildIndexInfo) (CodecIndex, error) {
+	var indexPtr C.CIndex
+	status := C.CreateIndexV2(&indexPtr, buildIndexInfo.cBuildIndexInfo)
+	if err := HandleCStatus(&status, "failed to create index"); err != nil {
+		return nil, err
+	}
+
+	index := &CgoIndex{
+		indexPtr: indexPtr,
+		close:    false,
+	}
+
+	return index, nil
+}
+
 func (index *CgoIndex) Build(dataset *Dataset) error {
 	switch dataset.DType {
 	case schemapb.DataType_None:
 		return fmt.Errorf("build index on supported data type: %s", dataset.DType.String())
 	case schemapb.DataType_FloatVector:
 		return index.buildFloatVecIndex(dataset)
+	case schemapb.DataType_Float16Vector:
+		return fmt.Errorf("build index on supported data type: %s", dataset.DType.String())
 	case schemapb.DataType_BinaryVector:
 		return index.buildBinaryVecIndex(dataset)
 	case schemapb.DataType_Bool:
@@ -337,4 +325,39 @@ func (index *CgoIndex) Delete() error {
 func (index *CgoIndex) CleanLocalData() error {
 	status := C.CleanLocalData(index.indexPtr)
 	return HandleCStatus(&status, "failed to clean cached data on disk")
+}
+
+func (index *CgoIndex) UpLoad() (map[string]int64, error) {
+	var cBinarySet C.CBinarySet
+
+	status := C.SerializeIndexAndUpLoad(index.indexPtr, &cBinarySet)
+	defer func() {
+		if cBinarySet != nil {
+			C.DeleteBinarySet(cBinarySet)
+		}
+	}()
+	if err := HandleCStatus(&status, "failed to serialize index and upload index"); err != nil {
+		return nil, err
+	}
+
+	res := make(map[string]int64)
+	indexFilePaths, err := GetBinarySetKeys(cBinarySet)
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range indexFilePaths {
+		size, err := GetBinarySetSize(cBinarySet, path)
+		if err != nil {
+			return nil, err
+		}
+		res[path] = size
+	}
+
+	runtime.SetFinalizer(index, func(index *CgoIndex) {
+		if index != nil && !index.close {
+			log.Error("there is leakage in index object, please check.")
+		}
+	})
+
+	return res, nil
 }

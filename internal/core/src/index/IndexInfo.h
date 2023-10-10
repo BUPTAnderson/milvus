@@ -24,7 +24,7 @@ struct CreateIndexInfo {
     DataType field_type;
     IndexType index_type;
     MetricType metric_type;
-    IndexMode index_mode = IndexMode::MODE_CPU;
+    IndexVersion index_engine_version;
 };
 
 }  // namespace milvus::index

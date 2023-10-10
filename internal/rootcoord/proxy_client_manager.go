@@ -18,28 +18,38 @@ package rootcoord
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	grpcproxyclient "github.com/milvus-io/milvus/internal/distributed/proxy/client"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
 )
 
-type proxyCreator func(sess *sessionutil.Session) (types.Proxy, error)
+type proxyCreator func(ctx context.Context, addr string, nodeID int64) (types.ProxyClient, error)
+
+func DefaultProxyCreator(ctx context.Context, addr string, nodeID int64) (types.ProxyClient, error) {
+	cli, err := grpcproxyclient.NewClient(ctx, addr, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return cli, nil
+}
 
 type proxyClientManager struct {
 	creator     proxyCreator
 	lock        sync.RWMutex
-	proxyClient map[int64]types.Proxy
+	proxyClient map[int64]types.ProxyClient
 	helper      proxyClientManagerHelper
 }
 
@@ -54,7 +64,7 @@ var defaultClientManagerHelper = proxyClientManagerHelper{
 func newProxyClientManager(creator proxyCreator) *proxyClientManager {
 	return &proxyClientManager{
 		creator:     creator,
-		proxyClient: make(map[int64]types.Proxy),
+		proxyClient: make(map[int64]types.ProxyClient),
 		helper:      defaultClientManagerHelper,
 	}
 }
@@ -73,19 +83,25 @@ func (p *proxyClientManager) AddProxyClient(session *sessionutil.Session) {
 		return
 	}
 
-	go p.connect(session)
+	p.connect(session)
+	p.updateProxyNumMetric()
 }
 
-// GetProxyNumber returns number of proxy clients.
-func (p *proxyClientManager) GetProxyNumber() int {
+// GetProxyCount returns number of proxy clients.
+func (p *proxyClientManager) GetProxyCount() int {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
 	return len(p.proxyClient)
 }
 
+// mutex.Lock is required before calling this method.
+func (p *proxyClientManager) updateProxyNumMetric() {
+	metrics.RootCoordProxyCounter.WithLabelValues().Set(float64(len(p.proxyClient)))
+}
+
 func (p *proxyClientManager) connect(session *sessionutil.Session) {
-	pc, err := p.creator(session)
+	pc, err := p.creator(context.Background(), session.Address, session.ServerID)
 	if err != nil {
 		log.Warn("failed to create proxy client", zap.String("address", session.Address), zap.Int64("serverID", session.ServerID), zap.Error(err))
 		return
@@ -96,11 +112,11 @@ func (p *proxyClientManager) connect(session *sessionutil.Session) {
 
 	_, ok := p.proxyClient[session.ServerID]
 	if ok {
-		pc.Stop()
+		pc.Close()
 		return
 	}
 	p.proxyClient[session.ServerID] = pc
-	log.Debug("succeed to create proxy client", zap.String("address", session.Address), zap.Int64("serverID", session.ServerID))
+	log.Info("succeed to create proxy client", zap.String("address", session.Address), zap.Int64("serverID", session.ServerID))
 	p.helper.afterConnect()
 }
 
@@ -110,11 +126,12 @@ func (p *proxyClientManager) DelProxyClient(s *sessionutil.Session) {
 
 	cli, ok := p.proxyClient[s.ServerID]
 	if ok {
-		cli.Stop()
+		cli.Close()
 	}
 
 	delete(p.proxyClient, s.ServerID)
-	log.Debug("remove proxy client", zap.String("proxy address", s.Address), zap.Int64("proxy id", s.ServerID))
+	p.updateProxyNumMetric()
+	log.Info("remove proxy client", zap.String("proxy address", s.Address), zap.Int64("proxy id", s.ServerID))
 }
 
 func (p *proxyClientManager) InvalidateCollectionMetaCache(ctx context.Context, request *proxypb.InvalidateCollMetaCacheRequest, opts ...expireCacheOpt) error {
@@ -222,7 +239,7 @@ func (p *proxyClientManager) RefreshPolicyInfoCache(ctx context.Context, req *pr
 				return fmt.Errorf("RefreshPolicyInfoCache failed, proxyID = %d, err = %s", k, err)
 			}
 			if status.GetErrorCode() != commonpb.ErrorCode_Success {
-				return errors.New(status.GetReason())
+				return merr.Error(status)
 			}
 			return nil
 		})

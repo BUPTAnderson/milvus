@@ -19,31 +19,51 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 #include <boost/dynamic_bitset.hpp>
 
-#include "knowhere/index/VecIndex.h"
+#include "Utils.h"
+#include "knowhere/factory.h"
 #include "index/Index.h"
 #include "common/Types.h"
 #include "common/BitsetView.h"
 #include "common/QueryResult.h"
 #include "common/QueryInfo.h"
+#include "knowhere/version.h"
 
 namespace milvus::index {
 
 class VectorIndex : public IndexBase {
  public:
-    explicit VectorIndex(const IndexType& index_type, const IndexMode& index_mode, const MetricType& metric_type)
-        : index_type_(index_type), index_mode_(index_mode), metric_type_(metric_type) {
+    explicit VectorIndex(const IndexType& index_type,
+                         const MetricType& metric_type)
+        : IndexBase(index_type), metric_type_(metric_type) {
     }
 
  public:
     void
-    BuildWithRawData(size_t n, const void* values, const Config& config = {}) override {
-        PanicInfo("vector index don't support build index with raw data");
+    BuildWithRawData(size_t n,
+                     const void* values,
+                     const Config& config = {}) override {
+        PanicInfo(Unsupported,
+                  "vector index don't support build index with raw data");
     };
 
+    virtual void
+    AddWithDataset(const DatasetPtr& dataset, const Config& config) {
+        PanicInfo(Unsupported, "vector index don't support add with dataset");
+    }
+
     virtual std::unique_ptr<SearchResult>
-    Query(const DatasetPtr dataset, const SearchInfo& search_info, const BitsetView& bitset) = 0;
+    Query(const DatasetPtr dataset,
+          const SearchInfo& search_info,
+          const BitsetView& bitset) = 0;
+
+    virtual const bool
+    HasRawData() const = 0;
+
+    virtual std::vector<uint8_t>
+    GetVector(const DatasetPtr dataset) const = 0;
 
     IndexType
     GetIndexType() const {
@@ -53,11 +73,6 @@ class VectorIndex : public IndexBase {
     MetricType
     GetMetricType() const {
         return metric_type_;
-    }
-
-    IndexMode
-    GetIndexMode() const {
-        return index_mode_;
     }
 
     int64_t
@@ -74,12 +89,21 @@ class VectorIndex : public IndexBase {
     CleanLocalData() {
     }
 
+    void
+    CheckCompatible(const IndexVersion& version) {
+        std::string err_msg =
+            "version not support : " + std::to_string(version) +
+            " , knowhere current version " +
+            std::to_string(
+                knowhere::Version::GetCurrentVersion().VersionNumber());
+        AssertInfo(
+            knowhere::Version::VersionSupport(knowhere::Version(version)),
+            err_msg);
+    }
+
  private:
-    IndexType index_type_;
-    IndexMode index_mode_;
     MetricType metric_type_;
     int64_t dim_;
 };
 
-using VectorIndexPtr = std::unique_ptr<VectorIndex>;
 }  // namespace milvus::index

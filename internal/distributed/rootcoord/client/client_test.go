@@ -18,59 +18,79 @@ package grpcrootcoordclient
 
 import (
 	"context"
-	"errors"
+	"math/rand"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
+	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/proxy"
-	"github.com/milvus-io/milvus/internal/util/etcd"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
+func TestMain(m *testing.M) {
+	// init embed etcd
+	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
+	if err != nil {
+		log.Fatal("failed to start embed etcd server", zap.Error(err))
+	}
+	defer os.RemoveAll(tempDir)
+	defer embedetcdServer.Close()
+
+	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
+
+	paramtable.Init()
+	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
+
+	rand.Seed(time.Now().UnixNano())
+	os.Exit(m.Run())
+}
+
 func Test_NewClient(t *testing.T) {
-	proxy.Params.InitOnce()
-
 	ctx := context.Background()
-	etcdCli, err := etcd.GetEtcdClient(&proxy.Params.EtcdCfg)
+	etcdCli, err := etcd.GetEtcdClient(
+		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
+		Params.EtcdCfg.Endpoints.GetAsStrings(),
+		Params.EtcdCfg.EtcdTLSCert.GetValue(),
+		Params.EtcdCfg.EtcdTLSKey.GetValue(),
+		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
+		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
 	assert.NoError(t, err)
-	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath, etcdCli)
-	assert.Nil(t, err)
+	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret interface{}, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
 		{
-			r, err := client.GetComponentStates(ctx)
+			r, err := client.GetComponentStates(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
-			r, err := client.GetTimeTickChannel(ctx)
+			r, err := client.GetTimeTickChannel(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
-			r, err := client.GetStatisticsChannel(ctx)
+			r, err := client.GetStatisticsChannel(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
@@ -217,6 +237,18 @@ func Test_NewClient(t *testing.T) {
 			r, err := client.CheckHealth(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
+		{
+			r, err := client.CreateDatabase(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.DropDatabase(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.ListDatabases(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
 	}
 
 	client.grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
@@ -261,18 +293,18 @@ func Test_NewClient(t *testing.T) {
 
 	retCheck := func(ret interface{}, err error) {
 		assert.Nil(t, ret)
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	}
 	{
-		rTimeout, err := client.GetComponentStates(shortCtx)
+		rTimeout, err := client.GetComponentStates(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
-		rTimeout, err := client.GetTimeTickChannel(shortCtx)
+		rTimeout, err := client.GetTimeTickChannel(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
-		rTimeout, err := client.GetStatisticsChannel(shortCtx)
+		rTimeout, err := client.GetStatisticsChannel(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
@@ -419,7 +451,19 @@ func Test_NewClient(t *testing.T) {
 		rTimeout, err := client.CheckHealth(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
+	{
+		rTimeout, err := client.CreateDatabase(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
+	{
+		rTimeout, err := client.DropDatabase(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
+	{
+		rTimeout, err := client.ListDatabases(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
 	// clean up
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

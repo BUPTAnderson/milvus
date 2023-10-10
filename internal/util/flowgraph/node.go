@@ -21,16 +21,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/timerecord"
-
-	"github.com/milvus-io/milvus/internal/log"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
 )
 
 const (
 	// TODO: better to be configured
 	nodeCtxTtInterval = 2 * time.Minute
 	enableTtChecker   = true
+	// blockAll should wait no more than 10 seconds
+	blockAllWait = 10 * time.Second
 )
 
 // Node is the interface defines the behavior of flowgraph
@@ -38,6 +40,7 @@ type Node interface {
 	Name() string
 	MaxQueueLength() int32
 	MaxParallelism() int32
+	IsValidInMsg(in []Msg) bool
 	Operate(in []Msg) []Msg
 	IsInputNode() bool
 	Start()
@@ -73,7 +76,13 @@ func (nodeCtx *nodeCtx) Start() {
 func (nodeCtx *nodeCtx) Block() {
 	// input node operate function will be blocking
 	if !nodeCtx.node.IsInputNode() {
+		startTs := time.Now()
 		nodeCtx.blockMutex.Lock()
+		if time.Since(startTs) >= blockAllWait {
+			log.Warn("flow graph wait for long time",
+				zap.String("name", nodeCtx.node.Name()),
+				zap.Duration("wait time", time.Since(startTs)))
+		}
 	}
 }
 
@@ -85,8 +94,7 @@ func (nodeCtx *nodeCtx) Unblock() {
 
 func isCloseMsg(msgs []Msg) bool {
 	if len(msgs) == 1 {
-		msg, ok := msgs[0].(*MsgStreamMsg)
-		return ok && msg.isCloseMsg
+		return msgs[0].IsClose()
 	}
 	return false
 }
@@ -118,15 +126,14 @@ func (nodeCtx *nodeCtx) work() {
 				input = <-nodeCtx.inputChannel
 			}
 			// the input message decides whether the operate method is executed
-			if isCloseMsg(input) {
-				output = input
-			}
-			if len(output) == 0 {
-				n := nodeCtx.node
-				nodeCtx.blockMutex.RLock()
-				output = n.Operate(input)
+			n := nodeCtx.node
+			nodeCtx.blockMutex.RLock()
+			if !n.IsValidInMsg(input) {
 				nodeCtx.blockMutex.RUnlock()
+				continue
 			}
+			output = n.Operate(input)
+			nodeCtx.blockMutex.RUnlock()
 			// the output decide whether the node should be closed.
 			if isCloseMsg(output) {
 				close(nodeCtx.closeCh)
@@ -186,3 +193,29 @@ func (node *BaseNode) Start() {}
 
 // Close implementing Node, base node does nothing when stops
 func (node *BaseNode) Close() {}
+
+func (node *BaseNode) Name() string {
+	return "BaseNode"
+}
+
+func (node *BaseNode) Operate(in []Msg) []Msg {
+	return in
+}
+
+func (node *BaseNode) IsValidInMsg(in []Msg) bool {
+	if in == nil {
+		log.Info("type assertion failed because it's nil")
+		return false
+	}
+
+	if len(in) == 0 {
+		// avoid printing too many logs.
+		return false
+	}
+
+	if len(in) != 1 {
+		log.Warn("Invalid operate message input", zap.Int("input length", len(in)))
+		return false
+	}
+	return true
+}

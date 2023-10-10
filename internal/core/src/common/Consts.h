@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include "Types.h"
 
+#include "knowhere/comp/index_param.h"
+
 const int64_t INVALID_FIELD_ID = -1;
 const int64_t INVALID_SEG_OFFSET = -1;
 const milvus::PkType INVALID_PK;  // of std::monostate if not set.
@@ -36,3 +38,17 @@ const char INDEX_BUILD_ID_KEY[] = "indexBuildID";
 
 const char INDEX_ROOT_PATH[] = "index_files";
 const char RAWDATA_ROOT_PATH[] = "raw_datas";
+
+const int64_t DEFAULT_FIELD_MAX_MEMORY_LIMIT = 64 << 20;  // bytes
+const int64_t DEFAULT_HIGH_PRIORITY_THREAD_CORE_COEFFICIENT = 10;
+const int64_t DEFAULT_MIDDLE_PRIORITY_THREAD_CORE_COEFFICIENT = 5;
+const int64_t DEFAULT_LOW_PRIORITY_THREAD_CORE_COEFFICIENT = 1;
+
+const int64_t DEFAULT_INDEX_FILE_SLICE_SIZE = 4 << 20;  // bytes
+
+const int DEFAULT_CPU_NUM = 1;
+
+constexpr const char* RADIUS = knowhere::meta::RADIUS;
+constexpr const char* RANGE_FILTER = knowhere::meta::RANGE_FILTER;
+
+const int64_t DEFAULT_MAX_OUTPUT_SIZE = 67108864;  // bytes, 64MB

@@ -3,24 +3,20 @@ package migration
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/blang/semver/v4"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 
-	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
-
-	"github.com/blang/semver/v4"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/console"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/backend"
-	clientv3 "go.etcd.io/etcd/client/v3"
-
-	"github.com/milvus-io/milvus/internal/util/etcd"
+	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
+	"github.com/milvus-io/milvus/cmd/tools/migration/console"
+	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
 )
 
 type Runner struct {
@@ -50,7 +46,8 @@ func NewRunner(ctx context.Context, cfg *configs.Config) *Runner {
 func (r *Runner) watchByPrefix(prefix string) {
 	defer r.wg.Done()
 	_, revision, err := r.session.GetSessions(prefix)
-	console.AbnormalExitIf(err, r.backupFinished.Load())
+	fn := func() { r.Stop() }
+	console.AbnormalExitIf(err, r.backupFinished.Load(), console.AddCallbacks(fn))
 	eventCh := r.session.WatchServices(prefix, revision, nil)
 	for {
 		select {
@@ -58,7 +55,7 @@ func (r *Runner) watchByPrefix(prefix string) {
 			return
 		case event := <-eventCh:
 			msg := fmt.Sprintf("session up/down, exit migration, event type: %s, session: %s", event.EventType.String(), event.Session.String())
-			console.AbnormalExit(r.backupFinished.Load(), msg)
+			console.AbnormalExit(r.backupFinished.Load(), msg, console.AddCallbacks(fn))
 		}
 	}
 }
@@ -71,7 +68,14 @@ func (r *Runner) WatchSessions() {
 }
 
 func (r *Runner) initEtcdCli() {
-	cli, err := etcd.GetEtcdClient(r.cfg.EtcdCfg)
+	cli, err := etcd.GetEtcdClient(
+		r.cfg.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		r.cfg.EtcdCfg.EtcdUseSSL.GetAsBool(),
+		r.cfg.EtcdCfg.Endpoints.GetAsStrings(),
+		r.cfg.EtcdCfg.EtcdTLSCert.GetValue(),
+		r.cfg.EtcdCfg.EtcdTLSKey.GetValue(),
+		r.cfg.EtcdCfg.EtcdTLSCACert.GetValue(),
+		r.cfg.EtcdCfg.EtcdTLSMinVersion.GetValue())
 	console.AbnormalExitIf(err, r.backupFinished.Load())
 	r.etcdCli = cli
 }
@@ -79,8 +83,13 @@ func (r *Runner) initEtcdCli() {
 func (r *Runner) init() {
 	r.initEtcdCli()
 
-	r.session = sessionutil.NewSession(r.ctx, r.cfg.EtcdCfg.MetaRootPath, r.etcdCli,
-		sessionutil.WithCustomConfigEnable(), sessionutil.WithSessionTTL(60), sessionutil.WithSessionRetryTimes(30))
+	r.session = sessionutil.NewSession(
+		r.ctx,
+		r.cfg.EtcdCfg.MetaRootPath.GetValue(),
+		r.etcdCli,
+		sessionutil.WithTTL(60),
+		sessionutil.WithRetryTimes(30),
+	)
 	// address not important here.
 	address := time.Now().String()
 	r.address = address
@@ -152,7 +161,7 @@ func (r *Runner) CheckSessions() error {
 
 func (r *Runner) RegisterSession() error {
 	r.session.Register()
-	go r.session.LivenessCheck(r.ctx, func() {})
+	r.session.LivenessCheck(r.ctx, func() {})
 	return nil
 }
 
@@ -213,8 +222,28 @@ func (r *Runner) Migrate() error {
 	return target.Save(targetMetas)
 }
 
+func (r *Runner) waitUntilSessionExpired() {
+	for {
+		err := r.checkSessionsWithPrefix(Role)
+		if err == nil {
+			console.Success("migration session expired")
+			return
+		}
+
+		// TODO: better to wrap this error.
+		if !strings.Contains(err.Error(), "there are still sessions alive") {
+			console.Warning(err.Error())
+			return
+		}
+
+		// 1s may be enough to expire the lease session.
+		time.Sleep(time.Second)
+	}
+}
+
 func (r *Runner) Stop() {
 	r.session.Revoke(time.Second)
+	r.waitUntilSessionExpired()
 	r.cancel()
 	r.wg.Wait()
 }

@@ -21,18 +21,12 @@
 #include <shared_mutex>
 
 #include "common/type_c.h"
-#include "config/ConfigChunkManager.h"
 #include "index/Index.h"
 #include "index/ScalarIndex.h"
 #include "index/VectorIndex.h"
 #include "index/IndexInfo.h"
 #include "storage/Types.h"
 #include "storage/FileManager.h"
-
-#ifdef BUILD_DISK_ANN
-#include "storage/LocalChunkManager.h"
-#include "storage/MinioChunkManager.h"
-#endif
 
 namespace milvus::index {
 
@@ -53,20 +47,26 @@ class IndexFactory {
     }
 
     IndexBasePtr
-    CreateIndex(const CreateIndexInfo& create_index_info, storage::FileManagerImplPtr file_manager);
+    CreateIndex(const CreateIndexInfo& create_index_info,
+                const storage::FileManagerContext& file_manager_context);
 
     IndexBasePtr
-    CreateVectorIndex(const CreateIndexInfo& create_index_info, storage::FileManagerImplPtr file_manager);
+    CreateVectorIndex(const CreateIndexInfo& create_index_info,
+                      const storage::FileManagerContext& file_manager_context);
 
     IndexBasePtr
-    CreateScalarIndex(const CreateIndexInfo& create_index_info);
+    CreateScalarIndex(const CreateIndexInfo& create_index_info,
+                      const storage::FileManagerContext& file_manager_context =
+                          storage::FileManagerContext());
 
-    //    IndexBasePtr
-    //    CreateIndex(DataType dtype, const IndexType& index_type, const IndexMode& index_mode = IndexMode::MODE_CPU);
+    // IndexBasePtr
+    // CreateIndex(DataType dtype, const IndexType& index_type);
  private:
     template <typename T>
     ScalarIndexPtr<T>
-    CreateScalarIndex(const IndexType& index_type);
+    CreateScalarIndex(const IndexType& index_type,
+                      const storage::FileManagerContext& file_manager_context =
+                          storage::FileManagerContext());
 };
 
 }  // namespace milvus::index

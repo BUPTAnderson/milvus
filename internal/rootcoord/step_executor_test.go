@@ -1,19 +1,34 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rootcoord
 
 import (
 	"context"
-	"errors"
 	"math/rand"
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/retry"
-
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/retry"
 )
 
-type mockChildStep struct {
-}
+type mockChildStep struct{}
 
 func (m *mockChildStep) Execute(ctx context.Context) ([]nestedStep, error) {
 	return nil, nil
@@ -31,8 +46,7 @@ func newMockChildStep() *mockChildStep {
 	return &mockChildStep{}
 }
 
-type mockStepWithChild struct {
-}
+type mockStepWithChild struct{}
 
 func (m *mockStepWithChild) Execute(ctx context.Context) ([]nestedStep, error) {
 	return []nestedStep{newMockChildStep()}, nil
@@ -128,7 +142,7 @@ func Test_randomSelect(t *testing.T) {
 
 func Test_bgStepExecutor_scheduleLoop(t *testing.T) {
 	bg := newBgStepExecutor(context.Background(),
-		withSelectStepPolicy(defaultSelectPolicy()),
+		withSelectStepPolicy(randomSelectPolicy(defaultBgExecutingParallel)),
 		withBgInterval(time.Millisecond*10))
 	bg.Start()
 	n := 20
@@ -172,4 +186,44 @@ func Test_bgStepExecutor_scheduleLoop(t *testing.T) {
 		}
 	}
 	bg.Stop()
+}
+
+func Test_selectByPriorityPolicy(t *testing.T) {
+	policy := selectByPriorityPolicy(4)
+
+	t.Run("select all", func(t *testing.T) {
+		m := map[*stepStack]struct{}{
+			{steps: []nestedStep{}}: {},
+			{steps: []nestedStep{}}: {},
+		}
+		selected := policy(m)
+		assert.Equal(t, 2, len(selected))
+	})
+
+	t.Run("select by priority", func(t *testing.T) {
+		steps := []nestedStep{
+			&releaseCollectionStep{},
+			&releaseCollectionStep{},
+			&releaseCollectionStep{},
+			&releaseCollectionStep{},
+			&releaseCollectionStep{},
+		}
+		s1 := &stepStack{steps: steps[0:1]}
+		s2 := &stepStack{steps: steps[0:2]}
+		s3 := &stepStack{steps: steps[0:3]}
+		s4 := &stepStack{steps: steps[0:4]}
+		s5 := &stepStack{steps: steps[0:5]}
+		m := map[*stepStack]struct{}{
+			s1: {},
+			s2: {},
+			s3: {},
+			s4: {},
+			s5: {},
+		}
+		selected := policy(m)
+		assert.Equal(t, 4, len(selected))
+		for i := 1; i < len(selected); i++ {
+			assert.True(t, selected[i].totalPriority() <= selected[i-1].totalPriority())
+		}
+	})
 }

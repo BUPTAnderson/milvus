@@ -22,12 +22,25 @@ extern "C" {
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "common/type_c.h"
 
 void
 InitIndexSliceSize(const int64_t);
 
 void
-InitLocalRootPath(const char*);
+InitHighPriorityThreadCoreCoefficient(const int64_t);
+
+void
+InitMiddlePriorityThreadCoreCoefficient(const int64_t);
+
+void
+InitLowPriorityThreadCoreCoefficient(const int64_t);
+
+void
+InitCpuNum(const int);
+
+void
+InitTrace(CTraceConfig* config);
 
 #ifdef __cplusplus
 };

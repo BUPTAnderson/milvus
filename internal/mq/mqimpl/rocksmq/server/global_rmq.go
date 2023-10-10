@@ -17,17 +17,13 @@
 package server
 
 import (
-	"errors"
 	"os"
-	"strconv"
 	"sync"
-	"sync/atomic"
 
-	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 // Rmq is global rocksmq instance that will be initialized only once
@@ -36,22 +32,10 @@ var Rmq *rocksmq
 // once is used to init global rocksmq
 var once sync.Once
 
-// Params provide params that rocksmq needs
-var params paramtable.BaseTable
-
-// InitRmq is deprecate implementation of global rocksmq. will be removed later
-func InitRmq(rocksdbName string, idAllocator allocator.Interface) error {
-	var err error
-	params.Init()
-	Rmq, err = NewRocksMQ(params, rocksdbName, idAllocator)
-	return err
-}
-
 // InitRocksMQ init global rocksmq single instance
 func InitRocksMQ(path string) error {
 	var finalErr error
 	once.Do(func() {
-		params.Init()
 		log.Debug("initializing global rmq", zap.String("path", path))
 		var fi os.FileInfo
 		fi, finalErr = os.Stat(path)
@@ -67,18 +51,7 @@ func InitRocksMQ(path string) error {
 				return
 			}
 		}
-
-		rawRmqPageSize, err := params.Load("rocksmq.rocksmqPageSize")
-		if err == nil && rawRmqPageSize != "" {
-			rmqPageSize, err := strconv.ParseInt(rawRmqPageSize, 10, 64)
-			if err == nil {
-				atomic.StoreInt64(&RocksmqPageSize, rmqPageSize)
-			} else {
-				log.Warn("rocksmq.rocksmqPageSize is invalid, using default value 2G")
-			}
-		}
-
-		Rmq, finalErr = NewRocksMQ(params, path, nil)
+		Rmq, finalErr = NewRocksMQ(path, nil)
 	})
 	return finalErr
 }

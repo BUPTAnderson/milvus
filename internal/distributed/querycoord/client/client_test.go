@@ -18,56 +18,77 @@ package grpcquerycoordclient
 
 import (
 	"context"
-	"errors"
+	"math/rand"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
+	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proxy"
-	"github.com/milvus-io/milvus/internal/util/etcd"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-func Test_NewClient(t *testing.T) {
-	proxy.Params.InitOnce()
+func TestMain(m *testing.M) {
+	// init embed etcd
+	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
+	if err != nil {
+		log.Fatal("failed to start embed etcd server", zap.Error(err))
+	}
+	defer os.RemoveAll(tempDir)
+	defer embedetcdServer.Close()
 
+	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
+
+	paramtable.Init()
+	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
+
+	rand.Seed(time.Now().UnixNano())
+	os.Exit(m.Run())
+}
+
+func Test_NewClient(t *testing.T) {
 	ctx := context.Background()
 
-	etcdCli, err := etcd.GetEtcdClient(&proxy.Params.EtcdCfg)
+	etcdCli, err := etcd.GetEtcdClient(
+		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
+		Params.EtcdCfg.Endpoints.GetAsStrings(),
+		Params.EtcdCfg.EtcdTLSCert.GetValue(),
+		Params.EtcdCfg.EtcdTLSKey.GetValue(),
+		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
+		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
 	assert.NoError(t, err)
-	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath, etcdCli)
-	assert.Nil(t, err)
+	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret any, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetTimeTickChannel(ctx)
+		r2, err := client.GetTimeTickChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
-		r3, err := client.GetStatisticsChannel(ctx)
+		r3, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r3, err)
 
 		r4, err := client.ShowCollections(ctx, nil)
@@ -80,6 +101,9 @@ func Test_NewClient(t *testing.T) {
 		retCheck(retNotNil, r6, err)
 
 		r7, err := client.ReleasePartitions(ctx, nil)
+		retCheck(retNotNil, r7, err)
+
+		r7, err = client.SyncNewCreatedPartition(ctx, nil)
 		retCheck(retNotNil, r7, err)
 
 		r8, err := client.ShowCollections(ctx, nil)
@@ -117,6 +141,24 @@ func Test_NewClient(t *testing.T) {
 
 		r20, err := client.CheckHealth(ctx, nil)
 		retCheck(retNotNil, r20, err)
+
+		r21, err := client.CreateResourceGroup(ctx, nil)
+		retCheck(retNotNil, r21, err)
+
+		r22, err := client.DropResourceGroup(ctx, nil)
+		retCheck(retNotNil, r22, err)
+
+		r23, err := client.TransferNode(ctx, nil)
+		retCheck(retNotNil, r23, err)
+
+		r24, err := client.TransferReplica(ctx, nil)
+		retCheck(retNotNil, r24, err)
+
+		r26, err := client.ListResourceGroups(ctx, nil)
+		retCheck(retNotNil, r26, err)
+
+		r27, err := client.DescribeResourceGroup(ctx, nil)
+		retCheck(retNotNil, r27, err)
 	}
 
 	client.grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
@@ -153,6 +195,6 @@ func Test_NewClient(t *testing.T) {
 
 	checkFunc(true)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

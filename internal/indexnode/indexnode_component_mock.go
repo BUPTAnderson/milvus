@@ -4,24 +4,22 @@ import (
 	"context"
 
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type mockIndexNodeComponent struct {
-	IndexNode
+	*IndexNode
 }
 
 var _ types.IndexNodeComponent = &mockIndexNodeComponent{}
 
 func NewMockIndexNodeComponent(ctx context.Context) (types.IndexNodeComponent, error) {
-	Params.Init()
+	paramtable.Init()
 	factory := &mockFactory{
 		chunkMgr: &mockChunkmgr{},
 	}
 
-	node, err := NewIndexNode(ctx, factory)
-	if err != nil {
-		return nil, err
-	}
+	node := NewIndexNode(ctx, factory)
 
 	startEmbedEtcd()
 	etcdCli := getEtcdClient()
@@ -39,6 +37,6 @@ func NewMockIndexNodeComponent(ctx context.Context) (types.IndexNodeComponent, e
 		return nil, err
 	}
 	return &mockIndexNodeComponent{
-		IndexNode: *node,
+		IndexNode: node,
 	}, nil
 }

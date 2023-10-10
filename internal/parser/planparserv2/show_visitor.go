@@ -2,13 +2,14 @@ package planparserv2
 
 import (
 	"encoding/json"
-	"fmt"
+
+	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
-type ShowExprVisitor struct {
-}
+type ShowExprVisitor struct{}
 
 func extractColumnInfo(info *planpb.ColumnInfo) interface{} {
 	js := make(map[string]interface{})
@@ -164,5 +165,5 @@ func ShowExpr(expr *planpb.Expr) {
 	v := NewShowExprVisitor()
 	js := v.VisitExpr(expr)
 	b, _ := json.MarshalIndent(js, "", "  ")
-	fmt.Println(string(b))
+	log.Info("[ShowExpr]", zap.String("expr", string(b)))
 }

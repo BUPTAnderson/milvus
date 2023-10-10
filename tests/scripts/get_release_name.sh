@@ -31,11 +31,17 @@ function milvus_ci_release_name(){
     elif [[ "${MILVUS_SERVER_TYPE:-}" == "distributed-kafka" ]]; then
         # Distributed kafka mode
        name+="dk"
+    elif [[ "${MILVUS_SERVER_TYPE:-}" == "standalone-kafka" ]]; then
+        # Standalone kafka mode
+        name+="sk"
     elif [[ "${MILVUS_SERVER_TYPE:-}" == "distributed" ]]; then
         # Distributed mode
        name+="d"
+    elif [[ "${MILVUS_SERVER_TYPE:-}" == "standalone-authentication" ]]; then
+        # Standalone authentication mode
+       name+="a"
     else
-       # Standalone mode      
+       # Standalone mode
         name+="s"
 
     fi 
@@ -59,6 +65,10 @@ function milvus_ci_release_name(){
         name+="-pr"
 
     fi 
+
+    if [[ "${MODE:-}" == "gpu" ]]; then
+        name+="-gpu"
+    fi
 
     export MILVUS_HELM_RELEASE_NAME=${name}
     echo ${name}

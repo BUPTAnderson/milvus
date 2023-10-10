@@ -14,13 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if(MILVUS_GPU_VERSION STREQUAL "ON")
+    project(core CXX C CUDA)
+else()
+    project(core CXX C)
+endif()
+
 include_directories(${MILVUS_ENGINE_SRC})
 include_directories(${MILVUS_THIRDPARTY_SRC})
 
-set(FOUND_OPENBLAS "unknown")
 add_subdirectory( pb )
-add_subdirectory( exceptions )
-add_subdirectory( utils )
 add_subdirectory( log )
 add_subdirectory( config )
 add_subdirectory( common )
@@ -29,3 +32,6 @@ add_subdirectory( index )
 add_subdirectory( query )
 add_subdirectory( segcore )
 add_subdirectory( indexbuilder )
+if(USE_DYNAMIC_SIMD)
+    add_subdirectory( simd )
+endif()

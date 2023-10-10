@@ -24,16 +24,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 type mockDataCoord struct {
 	expireTime Timestamp
 }
 
-func (mockD *mockDataCoord) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest) (*datapb.AssignSegmentIDResponse, error) {
+func (mockD *mockDataCoord) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest, opts ...grpc.CallOption) (*datapb.AssignSegmentIDResponse, error) {
 	assigns := make([]*datapb.SegmentIDAssignment, 0, len(req.SegmentIDRequests))
 	maxPerCnt := 100
 	for _, r := range req.SegmentIDRequests {
@@ -52,19 +55,14 @@ func (mockD *mockDataCoord) AssignSegmentID(ctx context.Context, req *datapb.Ass
 				PartitionID:  r.PartitionID,
 				ExpireTime:   mockD.expireTime,
 
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-					Reason:    "",
-				},
+				Status: merr.Status(nil),
 			}
 			assigns = append(assigns, result)
 		}
 	}
 
 	return &datapb.AssignSegmentIDResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Status:           merr.Status(nil),
 		SegIDAssignments: assigns,
 	}, nil
 }
@@ -73,8 +71,7 @@ type mockDataCoord2 struct {
 	expireTime Timestamp
 }
 
-func (mockD *mockDataCoord2) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest) (*datapb.AssignSegmentIDResponse, error) {
-
+func (mockD *mockDataCoord2) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest, opts ...grpc.CallOption) (*datapb.AssignSegmentIDResponse, error) {
 	return &datapb.AssignSegmentIDResponse{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_UnexpectedError,
@@ -92,7 +89,7 @@ func TestSegmentAllocator1(t *testing.T) {
 	dataCoord := &mockDataCoord{}
 	dataCoord.expireTime = Timestamp(1000)
 	segAllocator, err := newSegIDAssigner(ctx, dataCoord, getLastTick1)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	wg := &sync.WaitGroup{}
 	segAllocator.Start()
 
@@ -107,22 +104,22 @@ func TestSegmentAllocator1(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		colName := collNames[i%2]
 		ret, err := segAllocator.GetSegmentID(1, 1, colName, 1, 1)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		total += ret[1]
 	}
 	assert.Equal(t, uint32(10), total)
 
 	ret, err := segAllocator.GetSegmentID(1, 1, "abc", segCountPerRPC-10, 999)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, uint32(segCountPerRPC-10), ret[1])
 
 	_, err = segAllocator.GetSegmentID(1, 1, "abc", 10, 1001)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	wg.Wait()
-
 }
 
 var curLastTick2 = Timestamp(200)
+
 var curLastTIck2Lock sync.Mutex
 
 func getLastTick2() Timestamp {
@@ -137,7 +134,7 @@ func TestSegmentAllocator2(t *testing.T) {
 	dataCoord := &mockDataCoord{}
 	dataCoord.expireTime = Timestamp(500)
 	segAllocator, err := newSegIDAssigner(ctx, dataCoord, getLastTick2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	wg := &sync.WaitGroup{}
 	segAllocator.Start()
 
@@ -150,15 +147,14 @@ func TestSegmentAllocator2(t *testing.T) {
 	total := uint32(0)
 	for i := 0; i < 10; i++ {
 		ret, err := segAllocator.GetSegmentID(1, 1, "abc", 1, 200)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		total += ret[1]
 	}
 	assert.Equal(t, uint32(10), total)
 	time.Sleep(50 * time.Millisecond)
 	_, err = segAllocator.GetSegmentID(1, 1, "abc", segCountPerRPC-10, getLastTick2())
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	wg.Wait()
-
 }
 
 func TestSegmentAllocator3(t *testing.T) {
@@ -166,7 +162,7 @@ func TestSegmentAllocator3(t *testing.T) {
 	dataCoord := &mockDataCoord2{}
 	dataCoord.expireTime = Timestamp(500)
 	segAllocator, err := newSegIDAssigner(ctx, dataCoord, getLastTick2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	wg := &sync.WaitGroup{}
 	segAllocator.Start()
 
@@ -178,7 +174,7 @@ func TestSegmentAllocator3(t *testing.T) {
 	}(wg)
 	time.Sleep(50 * time.Millisecond)
 	_, err = segAllocator.GetSegmentID(1, 1, "abc", 10, 100)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	wg.Wait()
 }
 
@@ -186,7 +182,7 @@ type mockDataCoord3 struct {
 	expireTime Timestamp
 }
 
-func (mockD *mockDataCoord3) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest) (*datapb.AssignSegmentIDResponse, error) {
+func (mockD *mockDataCoord3) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest, opts ...grpc.CallOption) (*datapb.AssignSegmentIDResponse, error) {
 	assigns := make([]*datapb.SegmentIDAssignment, 0, len(req.SegmentIDRequests))
 	for i, r := range req.SegmentIDRequests {
 		errCode := commonpb.ErrorCode_Success
@@ -212,9 +208,7 @@ func (mockD *mockDataCoord3) AssignSegmentID(ctx context.Context, req *datapb.As
 	}
 
 	return &datapb.AssignSegmentIDResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Status:           merr.Status(nil),
 		SegIDAssignments: assigns,
 	}, nil
 }
@@ -224,7 +218,7 @@ func TestSegmentAllocator4(t *testing.T) {
 	dataCoord := &mockDataCoord3{}
 	dataCoord.expireTime = Timestamp(500)
 	segAllocator, err := newSegIDAssigner(ctx, dataCoord, getLastTick2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	wg := &sync.WaitGroup{}
 	segAllocator.Start()
 
@@ -236,7 +230,7 @@ func TestSegmentAllocator4(t *testing.T) {
 	}(wg)
 	time.Sleep(50 * time.Millisecond)
 	_, err = segAllocator.GetSegmentID(1, 1, "abc", 10, 100)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	wg.Wait()
 }
 
@@ -244,8 +238,7 @@ type mockDataCoord5 struct {
 	expireTime Timestamp
 }
 
-func (mockD *mockDataCoord5) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest) (*datapb.AssignSegmentIDResponse, error) {
-
+func (mockD *mockDataCoord5) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest, opts ...grpc.CallOption) (*datapb.AssignSegmentIDResponse, error) {
 	return &datapb.AssignSegmentIDResponse{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_UnexpectedError,
@@ -259,7 +252,7 @@ func TestSegmentAllocator5(t *testing.T) {
 	dataCoord := &mockDataCoord5{}
 	dataCoord.expireTime = Timestamp(500)
 	segAllocator, err := newSegIDAssigner(ctx, dataCoord, getLastTick2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	wg := &sync.WaitGroup{}
 	segAllocator.Start()
 
@@ -271,7 +264,7 @@ func TestSegmentAllocator5(t *testing.T) {
 	}(wg)
 	time.Sleep(50 * time.Millisecond)
 	_, err = segAllocator.GetSegmentID(1, 1, "abc", 10, 100)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	wg.Wait()
 }
 
@@ -280,7 +273,7 @@ func TestSegmentAllocator6(t *testing.T) {
 	dataCoord := &mockDataCoord{}
 	dataCoord.expireTime = Timestamp(500)
 	segAllocator, err := newSegIDAssigner(ctx, dataCoord, getLastTick2)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	wg := &sync.WaitGroup{}
 	segAllocator.Start()
 
@@ -307,7 +300,7 @@ func TestSegmentAllocator6(t *testing.T) {
 		}
 		_, err = segAllocator.GetSegmentID(1, 1, colName, count, 100)
 		if err != nil {
-			fmt.Println(err)
+			t.Log(err)
 			success = false
 		}
 	}
@@ -318,5 +311,4 @@ func TestSegmentAllocator6(t *testing.T) {
 	}
 	wg.Wait()
 	assert.True(t, success)
-
 }

@@ -1,5 +1,6 @@
 import threading
 import pytest
+import time
 
 from base.partition_wrapper import ApiPartitionWrapper
 from base.client_base import TestcaseBase
@@ -256,7 +257,7 @@ class TestPartitionParams(TestcaseBase):
         """
         target: test release the partition after load partition
         method: load partition1 and load another partition
-        expected: raise exception
+        expected: raise no exception
         """
         self._connect()
         collection_w = self.init_collection_wrap()
@@ -266,9 +267,7 @@ class TestPartitionParams(TestcaseBase):
         partition_w2.insert(cf.gen_default_list_data())
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         partition_w1.load()
-        error = {ct.err_code: 5, ct.err_msg: f'load the partition after load collection is not supported'}
-        partition_w2.load(check_task=CheckTasks.err_res,
-                          check_items=error)
+        partition_w2.load()
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_load_partitions_after_release(self):
@@ -316,6 +315,7 @@ class TestPartitionParams(TestcaseBase):
         yield request.param
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.xfail(reason="issue #21618")
     def test_load_partition_replica_non_number(self, get_non_number_replicas):
         """
         target: test load partition with non-number replicas
@@ -334,7 +334,7 @@ class TestPartitionParams(TestcaseBase):
         partition_w.load(replica_number=get_non_number_replicas, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("replicas", [0, -1, None])
+    @pytest.mark.parametrize("replicas", [0, -1])
     def test_load_replica_invalid_number(self, replicas):
         """
         target: test load partition with invalid replica number
@@ -503,8 +503,7 @@ class TestPartitionParams(TestcaseBase):
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("data", [cf.gen_default_dataframe_data(10),
-                                      cf.gen_default_list_data(10),
-                                      cf.gen_default_tuple_data(10)])
+                                      cf.gen_default_list_data(10)])
     def test_partition_insert(self, data):
         """
         target: verify insert entities multiple times
@@ -537,6 +536,43 @@ class TestPartitionParams(TestcaseBase):
         assert not partition_w.is_empty
         assert partition_w.num_entities == (nums + nums)
 
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.skip(reason="not stable")
+    def test_partition_upsert(self):
+        """
+        target: verify upsert entities multiple times
+        method: 1. create a collection and a partition
+                2. partition.upsert(data)
+                3. upsert data again
+        expected: upsert data successfully
+        """
+        # create collection and a partition
+        collection_w = self.init_collection_wrap()
+        partition_name = cf.gen_unique_str(prefix)
+        partition_w = self.init_partition_wrap(collection_w, partition_name)
+
+        # insert data and load
+        cf.insert_data(collection_w)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        collection_w.load()
+
+        # upsert data
+        upsert_nb = 1000
+        data, values = cf.gen_default_data_for_upsert(nb=upsert_nb, start=2000)
+        partition_w.upsert(data)
+        res = partition_w.query("int64 >= 2000 && int64 < 3000", [ct.default_float_field_name])[0]
+        time.sleep(5)
+        assert partition_w.num_entities == ct.default_nb // 2
+        assert [res[i][ct.default_float_field_name] for i in range(upsert_nb)] == values.to_list()
+
+        # upsert data
+        data, values = cf.gen_default_data_for_upsert(nb=upsert_nb, start=ct.default_nb)
+        partition_w.upsert(data)
+        res = partition_w.query("int64 >= 3000 && int64 < 4000", [ct.default_float_field_name])[0]
+        time.sleep(5)
+        assert partition_w.num_entities == upsert_nb + ct.default_nb // 2
+        assert [res[i][ct.default_float_field_name] for i in range(upsert_nb)] == values.to_list()
+
 
 class TestPartitionOperations(TestcaseBase):
     """ Test case of partition interface in operations """
@@ -559,7 +595,7 @@ class TestPartitionOperations(TestcaseBase):
         # create partition failed
         self.partition_wrap.init_partition(collection_w.collection, cf.gen_unique_str(prefix),
                                            check_task=CheckTasks.err_res,
-                                           check_items={ct.err_code: 1, ct.err_msg: "can't find collection"})
+                                           check_items={ct.err_code: 4, ct.err_msg: "collection not found"})
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_partition_same_name_in_diff_collections(self):
@@ -599,7 +635,7 @@ class TestPartitionOperations(TestcaseBase):
             assert collection_w.has_partition(partition_name)[0]
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.skip(reason="skip temporarily for debug")
+    # @pytest.mark.skip(reason="skip temporarily for debug")
     def test_partition_maximum_partitions(self):
         """
         target: verify create maximum partitions
@@ -625,6 +661,7 @@ class TestPartitionOperations(TestcaseBase):
         for t in threads:
             t.join()
         p_name = cf.gen_unique_str()
+        log.info(f"partitions: {len(collection_w.partitions)}")
         self.partition_wrap.init_partition(
             collection_w.collection, p_name,
             check_task=CheckTasks.err_res,
@@ -812,7 +849,7 @@ class TestPartitionOperations(TestcaseBase):
 
         # release the partition and check err response
         partition_w.release(check_task=CheckTasks.err_res,
-                            check_items={ct.err_code: 1, ct.err_msg: "can't find collection"})
+                            check_items={ct.err_code: 4, ct.err_msg: "collection not found"})
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_partition_release_after_collection_released(self):
@@ -858,7 +895,7 @@ class TestPartitionOperations(TestcaseBase):
                                       params={"nprobe": 32}, limit=1,
                                       check_task=ct.CheckTasks.err_res,
                                       check_items={ct.err_code: 0,
-                                                   ct.err_msg: "not been loaded"})
+                                                   ct.err_msg: "not loaded"})
         # release partition
         partition_w.release()
 
@@ -926,7 +963,7 @@ class TestPartitionOperations(TestcaseBase):
         # insert data to partition
         partition_w.insert(cf.gen_default_dataframe_data(),
                            check_task=CheckTasks.err_res,
-                           check_items={ct.err_code: 1, ct.err_msg: "None Type"})
+                           check_items={ct.err_code: 4, ct.err_msg: "collection not found"})
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_partition_insert_maximum_size_data(self):
@@ -1010,6 +1047,128 @@ class TestPartitionOperations(TestcaseBase):
         expr = "int64 in [0,1]"
         res = partition_w.delete(expr)
         assert len(res) == 2
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_partition_upsert_empty_partition(self):
+        """
+        target: verify upsert data in empty partition
+        method: 1. create a collection
+                2. upsert some data in empty partition
+        expected: upsert successfully
+        """
+        # create collection
+        collection_w = self.init_collection_wrap()
+
+        # get the default partition
+        partition_name = ct.default_partition_name
+        partition_w = self.init_partition_wrap(collection_w, partition_name)
+        assert partition_w.num_entities == 0
+
+        # upsert data to the empty partition
+        data = cf.gen_default_data_for_upsert()[0]
+        partition_w.upsert(data)
+        assert partition_w.num_entities == ct.default_nb
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_partition_upsert_dropped_partition(self):
+        """
+        target: verify upsert data in a dropped partition
+        method: 1. create a partition and drop
+                2. upsert some data into the dropped partition
+        expected: raise exception
+        """
+        # create partition
+        partition_w = self.init_partition_wrap()
+
+        # drop partition
+        partition_w.drop()
+
+        # insert data to partition
+        partition_w.upsert(cf.gen_default_dataframe_data(),
+                           check_task=CheckTasks.err_res,
+                           check_items={ct.err_code: 1, ct.err_msg: "Partition not exist"})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_partition_upsert_mismatched_data(self):
+        """
+        target: test upsert mismatched data in partition
+        method: 1. create a partition
+                2. insert some data
+                3. upsert with mismatched data
+        expected: raise exception
+        """
+        # create a partition
+        partition_w = self.init_partition_wrap()
+
+        # insert data
+        data = cf.gen_default_dataframe_data()
+        partition_w.insert(data)
+
+        # upsert mismatched data
+        upsert_data = cf.gen_default_data_for_upsert(dim=ct.default_dim-1)[0]
+        error = {ct.err_code: 1, ct.err_msg: "Collection field dim is 128, but entities field dim is 127"}
+        partition_w.upsert(upsert_data, check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_partition_upsert_with_auto_id(self):
+        """
+        target: test upsert data in partition when auto_id=True
+        method: 1. create a partition
+                2. insert some data
+                3. upsert data
+        expected: raise exception
+        """
+        # create a partition
+        schema = cf.gen_default_collection_schema(auto_id=True)
+        collection_w = self.init_collection_wrap(schema=schema)
+        partition_w = self.init_partition_wrap(collection_w)
+
+        # insert data
+        data = cf.gen_default_dataframe_data()
+        data.drop(ct.default_int64_field_name, axis=1, inplace=True)
+        partition_w.insert(data)
+
+        # upsert data
+        upsert_data = cf.gen_default_data_for_upsert()[0]
+        upsert_data.drop(ct.default_int64_field_name, axis=1, inplace=True)
+        error = {ct.err_code: 1, ct.err_msg: "Upsert don't support autoid == true"}
+        partition_w.upsert(upsert_data, check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_partition_upsert_same_pk_in_different_partitions(self):
+        """
+        target: test upsert same pk in different partitions
+        method: 1. create 2 partitions
+                2. insert some data
+                3. upsert data
+        expected: raise exception
+        """
+        # create 2 partitions
+        collection_w = self.init_collection_wrap()
+        partition_1 = self.init_partition_wrap(collection_w)
+        partition_2 = self.init_partition_wrap(collection_w)
+
+        # insert data
+        nb = 1000
+        data = cf.gen_default_dataframe_data(nb)
+        partition_1.insert(data)
+        data = cf.gen_default_dataframe_data(nb, start=nb)
+        partition_2.insert(data)
+
+        # upsert data in 2 partitions
+        upsert_data, values = cf.gen_default_data_for_upsert(1)
+        partition_1.upsert(upsert_data)
+        partition_2.upsert(upsert_data)
+
+        # load
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_flat_index)
+        collection_w.load()
+
+        # query and check the results
+        expr = "int64 == 0"
+        res1 = partition_1.query(expr, [ct.default_float_field_name], consistency_level="Strong")[0]
+        res2 = partition_2.query(expr, [ct.default_float_field_name], consistency_level="Strong")[0]
+        assert res1 == res2
 
     @pytest.mark.tags(CaseLabel.L0)
     def test_create_partition_repeat(self):

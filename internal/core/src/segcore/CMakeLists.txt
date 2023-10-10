@@ -26,11 +26,14 @@ set(SEGCORE_FILES
         FieldIndexing.cpp
         InsertRecord.cpp
         Reduce.cpp
+        metrics_c.cpp
         plan_c.cpp
         reduce_c.cpp
         load_index_c.cpp
+        load_field_data_c.cpp
         SegmentInterface.cpp
         SegcoreConfig.cpp
+        IndexConfigGenerator.cpp
         segcore_init_c.cpp
         ScalarIndex.cpp
         TimestampIndex.cpp
@@ -40,16 +43,16 @@ add_library(milvus_segcore SHARED ${SEGCORE_FILES})
 
 find_library(TBB NAMES tbb)
 set(PLATFORM_LIBS dl)
+
 if (MSYS)
-set(PLATFORM_LIBS )
-endif ()
+  set(PLATFORM_LIBS )
+endif()
 
 target_link_libraries(milvus_segcore
         milvus_query
         ${PLATFORM_LIBS}
         ${TBB}
         ${OpenMP_CXX_FLAGS}
-#        gperftools
         )
 
 install(TARGETS milvus_segcore DESTINATION "${CMAKE_INSTALL_LIBDIR}")

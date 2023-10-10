@@ -22,38 +22,37 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/metrics"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-	"github.com/milvus-io/milvus/internal/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
 )
 
 // timestampAllocator implements tsoAllocator.
 type timestampAllocator struct {
-	ctx    context.Context
 	tso    timestampAllocatorInterface
 	peerID UniqueID
 }
 
 // newTimestampAllocator creates a new timestampAllocator
-func newTimestampAllocator(ctx context.Context, tso timestampAllocatorInterface, peerID UniqueID) (*timestampAllocator, error) {
+func newTimestampAllocator(tso timestampAllocatorInterface, peerID UniqueID) (*timestampAllocator, error) {
 	a := &timestampAllocator{
-		ctx:    ctx,
 		peerID: peerID,
 		tso:    tso,
 	}
 	return a, nil
 }
 
-func (ta *timestampAllocator) alloc(count uint32) ([]Timestamp, error) {
+func (ta *timestampAllocator) alloc(ctx context.Context, count uint32) ([]Timestamp, error) {
 	tr := timerecord.NewTimeRecorder("applyTimestamp")
-	ctx, cancel := context.WithTimeout(ta.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	req := &rootcoordpb.AllocTimestampRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_RequestTSO),
 			commonpbutil.WithMsgID(0),
-			commonpbutil.WithTimeStamp(0),
 			commonpbutil.WithSourceID(ta.peerID),
 		),
 		Count: count,
@@ -61,17 +60,19 @@ func (ta *timestampAllocator) alloc(count uint32) ([]Timestamp, error) {
 
 	resp, err := ta.tso.AllocTimestamp(ctx, req)
 	defer func() {
-		cancel()
-		metrics.ProxyApplyTimestampLatency.WithLabelValues(strconv.FormatInt(Params.ProxyCfg.GetNodeID(), 10)).Observe(float64(tr.ElapseSpan().Milliseconds()))
+		metrics.ProxyApplyTimestampLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	}()
 
 	if err != nil {
 		return nil, fmt.Errorf("syncTimestamp Failed:%w", err)
 	}
-	if resp.Status.ErrorCode != commonpb.ErrorCode_Success {
-		return nil, fmt.Errorf("syncTimeStamp Failed:%s", resp.Status.Reason)
+	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		return nil, fmt.Errorf("syncTimeStamp Failed:%s", resp.GetStatus().GetReason())
 	}
-	start, cnt := resp.Timestamp, resp.Count
+	if resp == nil {
+		return nil, fmt.Errorf("empty AllocTimestampResponse")
+	}
+	start, cnt := resp.GetTimestamp(), resp.GetCount()
 	ret := make([]Timestamp, cnt)
 	for i := uint32(0); i < cnt; i++ {
 		ret[i] = start + uint64(i)
@@ -81,8 +82,8 @@ func (ta *timestampAllocator) alloc(count uint32) ([]Timestamp, error) {
 }
 
 // AllocOne allocates a timestamp.
-func (ta *timestampAllocator) AllocOne() (Timestamp, error) {
-	ret, err := ta.alloc(1)
+func (ta *timestampAllocator) AllocOne(ctx context.Context) (Timestamp, error) {
+	ret, err := ta.alloc(ctx, 1)
 	if err != nil {
 		return 0, err
 	}

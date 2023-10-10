@@ -19,10 +19,11 @@ package meta
 import (
 	"testing"
 
+	"github.com/stretchr/testify/suite"
+
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	"github.com/stretchr/testify/suite"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type ChannelDistManagerSuite struct {
@@ -100,18 +101,18 @@ func (suite *ChannelDistManagerSuite) TestGetBy() {
 
 func (suite *ChannelDistManagerSuite) TestGetShardLeader() {
 	replicas := []*Replica{
-		{
-			Replica: &querypb.Replica{
+		NewReplica(
+			&querypb.Replica{
 				CollectionID: suite.collection,
 			},
-			Nodes: typeutil.NewUniqueSet(suite.nodes[0], suite.nodes[2]),
-		},
-		{
-			Replica: &querypb.Replica{
+			typeutil.NewUniqueSet(suite.nodes[0], suite.nodes[2]),
+		),
+		NewReplica(
+			&querypb.Replica{
 				CollectionID: suite.collection,
 			},
-			Nodes: typeutil.NewUniqueSet(suite.nodes[1]),
-		},
+			typeutil.NewUniqueSet(suite.nodes[1]),
+		),
 	}
 
 	// Test on replica 0
@@ -145,6 +146,47 @@ func (suite *ChannelDistManagerSuite) TestGetShardLeader() {
 	suite.Len(leaders, 2)
 	suite.Equal(leaders["dmc0"], suite.nodes[1])
 	suite.Equal(leaders["dmc1"], suite.nodes[1])
+}
+
+func (suite *ChannelDistManagerSuite) TestGetChannelDistByReplica() {
+	replica := NewReplica(
+		&querypb.Replica{
+			CollectionID: suite.collection,
+		},
+		typeutil.NewUniqueSet(11, 22, 33),
+	)
+
+	ch1 := &DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collection,
+			ChannelName:  "test-channel1",
+		},
+		Node:    11,
+		Version: 1,
+	}
+	ch2 := &DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collection,
+			ChannelName:  "test-channel1",
+		},
+		Node:    22,
+		Version: 1,
+	}
+	ch3 := &DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collection,
+			ChannelName:  "test-channel2",
+		},
+		Node:    33,
+		Version: 1,
+	}
+	suite.dist.Update(11, ch1)
+	suite.dist.Update(22, ch2)
+	suite.dist.Update(33, ch3)
+
+	dist := suite.dist.GetChannelDistByReplica(replica)
+	suite.Len(dist["test-channel1"], 2)
+	suite.Len(dist["test-channel2"], 1)
 }
 
 func (suite *ChannelDistManagerSuite) AssertNames(channels []*DmChannel, names ...string) bool {

@@ -18,24 +18,26 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
-	"github.com/milvus-io/milvus/internal/util/indexparams"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/indexparamcheck"
+	"github.com/milvus-io/milvus/pkg/util/indexparams"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 const (
@@ -51,15 +53,16 @@ const (
 
 type createIndexTask struct {
 	Condition
-	req        *milvuspb.CreateIndexRequest
-	ctx        context.Context
-	rootCoord  types.RootCoord
-	indexCoord types.IndexCoord
-	queryCoord types.QueryCoord
-	result     *commonpb.Status
+	req       *milvuspb.CreateIndexRequest
+	ctx       context.Context
+	rootCoord types.RootCoordClient
+	datacoord types.DataCoordClient
+	result    *commonpb.Status
 
 	isAutoIndex    bool
 	newIndexParams []*commonpb.KeyValuePair
+	newTypeParams  []*commonpb.KeyValuePair
+	newExtraParams []*commonpb.KeyValuePair
 
 	collectionID UniqueID
 	fieldSchema  *schemapb.FieldSchema
@@ -102,20 +105,28 @@ func (cit *createIndexTask) OnEnqueue() error {
 	return nil
 }
 
+func wrapUserIndexParams(metricType string) []*commonpb.KeyValuePair {
+	return []*commonpb.KeyValuePair{
+		{
+			Key:   common.IndexTypeKey,
+			Value: AutoIndexName,
+		},
+		{
+			Key:   common.MetricTypeKey,
+			Value: metricType,
+		},
+	}
+}
+
 func (cit *createIndexTask) parseIndexParams() error {
+	cit.newExtraParams = cit.req.GetExtraParams()
+
 	isVecIndex := typeutil.IsVectorType(cit.fieldSchema.DataType)
 	indexParamsMap := make(map[string]string)
-	if !isVecIndex {
-		if cit.fieldSchema.DataType == schemapb.DataType_VarChar {
-			indexParamsMap[common.IndexTypeKey] = DefaultStringIndexType
-		} else {
-			indexParamsMap[common.IndexTypeKey] = DefaultIndexType
-		}
-	}
 
 	for _, kv := range cit.req.GetExtraParams() {
 		if kv.Key == common.IndexParamsKey {
-			params, err := funcutil.ParseIndexParamsMap(kv.Value)
+			params, err := funcutil.JSONToMap(kv.Value)
 			if err != nil {
 				return err
 			}
@@ -126,24 +137,94 @@ func (cit *createIndexTask) parseIndexParams() error {
 			indexParamsMap[kv.Key] = kv.Value
 		}
 	}
+	if !isVecIndex {
+		specifyIndexType, exist := indexParamsMap[common.IndexTypeKey]
+		if cit.fieldSchema.DataType == schemapb.DataType_VarChar {
+			if exist && specifyIndexType != DefaultStringIndexType {
+				return merr.WrapErrParameterInvalid(DefaultStringIndexType, specifyIndexType, "index type not match")
+			}
+			indexParamsMap[common.IndexTypeKey] = DefaultStringIndexType
+		} else if typeutil.IsArithmetic(cit.fieldSchema.DataType) {
+			if exist && specifyIndexType != DefaultIndexType {
+				return merr.WrapErrParameterInvalid(DefaultIndexType, specifyIndexType, "index type not match")
+			}
+			indexParamsMap[common.IndexTypeKey] = DefaultIndexType
+		} else {
+			return merr.WrapErrParameterInvalid("supported field",
+				fmt.Sprintf("create index on %s field", cit.fieldSchema.DataType.String()),
+				"create index on json field is not supported")
+		}
+	}
 
 	if isVecIndex {
 		specifyIndexType, exist := indexParamsMap[common.IndexTypeKey]
-		if Params.AutoIndexConfig.Enable {
-			if exist {
-				if specifyIndexType != AutoIndexName {
-					return fmt.Errorf("IndexType should be %s", AutoIndexName)
-				}
-			}
-			log.Debug("create index trigger AutoIndex",
-				zap.String("type", Params.AutoIndexConfig.AutoIndexTypeName))
-			// override params
-			for k, v := range Params.AutoIndexConfig.IndexParams {
+		if Params.AutoIndexConfig.Enable.GetAsBool() { // `enable` only for cloud instance.
+			log.Info("create index trigger AutoIndex",
+				zap.String("original type", specifyIndexType),
+				zap.String("final type", Params.AutoIndexConfig.AutoIndexTypeName.GetValue()))
+
+			metricType, metricTypeExist := indexParamsMap[common.MetricTypeKey]
+
+			// override params by autoindex
+			for k, v := range Params.AutoIndexConfig.IndexParams.GetAsJSONMap() {
 				indexParamsMap[k] = v
 			}
-		} else {
+
+			if metricTypeExist {
+				// make the users' metric type first class citizen.
+				indexParamsMap[common.MetricTypeKey] = metricType
+			}
+		} else { // behavior change after 2.2.9, adapt autoindex logic here.
+			autoIndexConfig := Params.AutoIndexConfig.IndexParams.GetAsJSONMap()
+
+			useAutoIndex := func() {
+				fields := make([]zap.Field, 0, len(autoIndexConfig))
+				for k, v := range autoIndexConfig {
+					indexParamsMap[k] = v
+					fields = append(fields, zap.String(k, v))
+				}
+				log.Ctx(cit.ctx).Info("AutoIndex triggered", fields...)
+			}
+
+			handle := func(numberParams int) error {
+				// empty case.
+				if len(indexParamsMap) == numberParams {
+					// though we already know there must be metric type, how to make this safer to avoid crash?
+					metricType := autoIndexConfig[common.MetricTypeKey]
+					cit.newExtraParams = wrapUserIndexParams(metricType)
+					useAutoIndex()
+					return nil
+				}
+
+				metricType, metricTypeExist := indexParamsMap[common.MetricTypeKey]
+
+				if len(indexParamsMap) > numberParams+1 {
+					return fmt.Errorf("only metric type can be passed when use AutoIndex")
+				}
+
+				if len(indexParamsMap) == numberParams+1 {
+					if !metricTypeExist {
+						return fmt.Errorf("only metric type can be passed when use AutoIndex")
+					}
+
+					// only metric type is passed.
+					cit.newExtraParams = wrapUserIndexParams(metricType)
+					useAutoIndex()
+					// make the users' metric type first class citizen.
+					indexParamsMap[common.MetricTypeKey] = metricType
+				}
+
+				return nil
+			}
+
 			if !exist {
-				return fmt.Errorf("IndexType not specified")
+				if err := handle(0); err != nil {
+					return err
+				}
+			} else if specifyIndexType == AutoIndexName {
+				if err := handle(1); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -152,7 +233,7 @@ func (cit *createIndexTask) parseIndexParams() error {
 			return fmt.Errorf("IndexType not specified")
 		}
 		if indexType == indexparamcheck.IndexDISKANN {
-			err := indexparams.FillDiskIndexParams(&Params, indexParamsMap)
+			err := indexparams.FillDiskIndexParams(Params, indexParamsMap)
 			if err != nil {
 				return err
 			}
@@ -164,25 +245,32 @@ func (cit *createIndexTask) parseIndexParams() error {
 		}
 	}
 	typeParams := cit.fieldSchema.GetTypeParams()
-	typeParamsMap := make(map[string]interface{})
+	typeParamsMap := make(map[string]string)
 	for _, pair := range typeParams {
-		typeParamsMap[pair.Key] = struct{}{}
+		typeParamsMap[pair.Key] = pair.Value
 	}
 
 	for k, v := range indexParamsMap {
-		//Currently, it is required that type_params and index_params do not have same keys.
-		_, ok := typeParamsMap[k]
-		if ok {
+		// Currently, it is required that type_params and index_params do not have same keys.
+		if k == DimKey || k == common.MaxLengthKey {
+			delete(indexParamsMap, k)
 			continue
 		}
 		cit.newIndexParams = append(cit.newIndexParams, &commonpb.KeyValuePair{Key: k, Value: v})
+	}
+
+	for k, v := range typeParamsMap {
+		if _, ok := indexParamsMap[k]; ok {
+			continue
+		}
+		cit.newTypeParams = append(cit.newTypeParams, &commonpb.KeyValuePair{Key: k, Value: v})
 	}
 
 	return nil
 }
 
 func (cit *createIndexTask) getIndexedField(ctx context.Context) (*schemapb.FieldSchema, error) {
-	schema, err := globalMetaCache.GetCollectionSchema(ctx, cit.req.GetCollectionName())
+	schema, err := globalMetaCache.GetCollectionSchema(ctx, cit.req.GetDbName(), cit.req.GetCollectionName())
 	if err != nil {
 		log.Error("failed to get collection schema", zap.Error(err))
 		return nil, fmt.Errorf("failed to get collection schema: %s", err)
@@ -204,6 +292,7 @@ func fillDimension(field *schemapb.FieldSchema, indexParams map[string]string) e
 	vecDataTypes := []schemapb.DataType{
 		schemapb.DataType_FloatVector,
 		schemapb.DataType_BinaryVector,
+		schemapb.DataType_Float16Vector,
 	}
 	if !funcutil.SliceContain(vecDataTypes, field.GetDataType()) {
 		return nil
@@ -232,14 +321,15 @@ func checkTrain(field *schemapb.FieldSchema, indexParams map[string]string) erro
 	vecDataTypes := []schemapb.DataType{
 		schemapb.DataType_FloatVector,
 		schemapb.DataType_BinaryVector,
+		schemapb.DataType_Float16Vector,
 	}
 	if !funcutil.SliceContain(vecDataTypes, field.GetDataType()) {
 		return indexparamcheck.CheckIndexValid(field.GetDataType(), indexType, indexParams)
 	}
 
-	adapter, err := indexparamcheck.GetConfAdapterMgrInstance().GetAdapter(indexType)
+	checker, err := indexparamcheck.GetIndexCheckerMgrInstance().GetChecker(indexType)
 	if err != nil {
-		log.Warn("Failed to get conf adapter", zap.String(common.IndexTypeKey, indexType))
+		log.Warn("Failed to get index checker", zap.String(common.IndexTypeKey, indexType))
 		return fmt.Errorf("invalid index type: %s", indexType)
 	}
 
@@ -247,16 +337,14 @@ func checkTrain(field *schemapb.FieldSchema, indexParams map[string]string) erro
 		return err
 	}
 
-	ok := adapter.CheckValidDataType(field.GetDataType())
-	if !ok {
-		log.Warn("Field data type don't support the index build type", zap.String("fieldDataType", field.GetDataType().String()), zap.String("indexType", indexType))
-		return fmt.Errorf("field data type %s don't support the index build type %s", field.GetDataType().String(), indexType)
+	if err := checker.CheckValidDataType(field.GetDataType()); err != nil {
+		log.Info("create index with invalid data type", zap.Error(err), zap.String("data_type", field.GetDataType().String()))
+		return err
 	}
 
-	ok = adapter.CheckTrain(indexParams)
-	if !ok {
-		log.Warn("Create index with invalid params", zap.Any("index_params", indexParams))
-		return fmt.Errorf("invalid index params: %v", indexParams)
+	if err := checker.CheckTrain(indexParams); err != nil {
+		log.Info("create index with invalid parameters", zap.Error(err))
+		return err
 	}
 
 	return nil
@@ -264,11 +352,11 @@ func checkTrain(field *schemapb.FieldSchema, indexParams map[string]string) erro
 
 func (cit *createIndexTask) PreExecute(ctx context.Context) error {
 	cit.req.Base.MsgType = commonpb.MsgType_CreateIndex
-	cit.req.Base.SourceID = Params.ProxyCfg.GetNodeID()
+	cit.req.Base.SourceID = paramtable.GetNodeID()
 
 	collName := cit.req.GetCollectionName()
 
-	collID, err := globalMetaCache.GetCollectionID(ctx, collName)
+	collID, err := globalMetaCache.GetCollectionID(ctx, cit.req.GetDbName(), collName)
 	if err != nil {
 		return err
 	}
@@ -289,37 +377,31 @@ func (cit *createIndexTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	loaded, err := isCollectionLoaded(ctx, cit.queryCoord, collID)
-	if err != nil {
-		return err
-	}
-
-	if loaded {
-		return fmt.Errorf("create index failed, collection is loaded, please release it first")
-	}
 	return nil
 }
 
 func (cit *createIndexTask) Execute(ctx context.Context) error {
-	log.Debug("proxy create index", zap.Int64("collID", cit.collectionID), zap.Int64("fieldID", cit.fieldSchema.GetFieldID()),
+	log.Ctx(ctx).Info("proxy create index", zap.Int64("collectionID", cit.collectionID), zap.Int64("fieldID", cit.fieldSchema.GetFieldID()),
 		zap.String("indexName", cit.req.GetIndexName()), zap.Any("typeParams", cit.fieldSchema.GetTypeParams()),
-		zap.Any("indexParams", cit.req.GetExtraParams()))
+		zap.Any("indexParams", cit.req.GetExtraParams()),
+		zap.Any("newExtraParams", cit.newExtraParams),
+	)
 
 	if cit.req.GetIndexName() == "" {
-		cit.req.IndexName = Params.CommonCfg.DefaultIndexName + "_" + strconv.FormatInt(cit.fieldSchema.GetFieldID(), 10)
+		cit.req.IndexName = Params.CommonCfg.DefaultIndexName.GetValue() + "_" + strconv.FormatInt(cit.fieldSchema.GetFieldID(), 10)
 	}
 	var err error
 	req := &indexpb.CreateIndexRequest{
 		CollectionID:    cit.collectionID,
 		FieldID:         cit.fieldSchema.GetFieldID(),
 		IndexName:       cit.req.GetIndexName(),
-		TypeParams:      cit.fieldSchema.GetTypeParams(),
+		TypeParams:      cit.newTypeParams,
 		IndexParams:     cit.newIndexParams,
 		IsAutoIndex:     cit.isAutoIndex,
-		UserIndexParams: cit.req.GetExtraParams(),
+		UserIndexParams: cit.newExtraParams,
 		Timestamp:       cit.BeginTs(),
 	}
-	cit.result, err = cit.indexCoord.CreateIndex(ctx, req)
+	cit.result, err = cit.datacoord.CreateIndex(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -336,9 +418,9 @@ func (cit *createIndexTask) PostExecute(ctx context.Context) error {
 type describeIndexTask struct {
 	Condition
 	*milvuspb.DescribeIndexRequest
-	ctx        context.Context
-	indexCoord types.IndexCoord
-	result     *milvuspb.DescribeIndexResponse
+	ctx       context.Context
+	datacoord types.DataCoordClient
+	result    *milvuspb.DescribeIndexResponse
 
 	collectionID UniqueID
 }
@@ -382,13 +464,13 @@ func (dit *describeIndexTask) OnEnqueue() error {
 
 func (dit *describeIndexTask) PreExecute(ctx context.Context) error {
 	dit.Base.MsgType = commonpb.MsgType_DescribeIndex
-	dit.Base.SourceID = Params.ProxyCfg.GetNodeID()
+	dit.Base.SourceID = paramtable.GetNodeID()
 
 	if err := validateCollectionName(dit.CollectionName); err != nil {
 		return err
 	}
 
-	collID, err := globalMetaCache.GetCollectionID(ctx, dit.CollectionName)
+	collID, err := globalMetaCache.GetCollectionID(ctx, dit.GetDbName(), dit.CollectionName)
 	if err != nil {
 		return err
 	}
@@ -397,7 +479,7 @@ func (dit *describeIndexTask) PreExecute(ctx context.Context) error {
 }
 
 func (dit *describeIndexTask) Execute(ctx context.Context) error {
-	schema, err := globalMetaCache.GetCollectionSchema(ctx, dit.GetCollectionName())
+	schema, err := globalMetaCache.GetCollectionSchema(ctx, dit.GetDbName(), dit.GetCollectionName())
 	if err != nil {
 		log.Error("failed to get collection schema", zap.Error(err))
 		return fmt.Errorf("failed to get collection schema: %s", err)
@@ -408,19 +490,145 @@ func (dit *describeIndexTask) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed to parse collection schema: %s", err)
 	}
 
-	resp, err := dit.indexCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{CollectionID: dit.collectionID, IndexName: dit.IndexName})
-	if err != nil || resp == nil {
+	resp, err := dit.datacoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{CollectionID: dit.collectionID, IndexName: dit.IndexName, Timestamp: dit.Timestamp})
+	if err != nil {
 		return err
 	}
+
 	dit.result = &milvuspb.DescribeIndexResponse{}
 	dit.result.Status = resp.GetStatus()
-	if dit.result.Status.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(dit.result.Status.Reason)
+	err = merr.Error(resp.GetStatus())
+	if err != nil {
+		if errors.Is(err, merr.ErrIndexNotFound) && len(dit.GetIndexName()) == 0 {
+			err = merr.WrapErrIndexNotFoundForCollection(dit.GetCollectionName())
+			dit.result.Status = merr.Status(err)
+		}
+		return err
 	}
 	for _, indexInfo := range resp.IndexInfos {
 		field, err := schemaHelper.GetFieldFromID(indexInfo.FieldID)
 		if err != nil {
 			log.Error("failed to get collection field", zap.Error(err))
+			return fmt.Errorf("failed to get collection field: %d", indexInfo.FieldID)
+		}
+		params := indexInfo.GetUserIndexParams()
+		if params == nil {
+			metricType, err := funcutil.GetAttrByKeyFromRepeatedKV(MetricTypeKey, indexInfo.GetIndexParams())
+			if err == nil {
+				params = wrapUserIndexParams(metricType)
+			}
+		}
+		desc := &milvuspb.IndexDescription{
+			IndexName:            indexInfo.GetIndexName(),
+			IndexID:              indexInfo.GetIndexID(),
+			FieldName:            field.Name,
+			Params:               params,
+			IndexedRows:          indexInfo.GetIndexedRows(),
+			TotalRows:            indexInfo.GetTotalRows(),
+			PendingIndexRows:     indexInfo.GetPendingIndexRows(),
+			State:                indexInfo.GetState(),
+			IndexStateFailReason: indexInfo.GetIndexStateFailReason(),
+		}
+		dit.result.IndexDescriptions = append(dit.result.IndexDescriptions, desc)
+	}
+	return err
+}
+
+func (dit *describeIndexTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
+type getIndexStatisticsTask struct {
+	Condition
+	*milvuspb.GetIndexStatisticsRequest
+	ctx       context.Context
+	datacoord types.DataCoordClient
+	result    *milvuspb.GetIndexStatisticsResponse
+
+	nodeID       int64
+	collectionID UniqueID
+}
+
+func (dit *getIndexStatisticsTask) TraceCtx() context.Context {
+	return dit.ctx
+}
+
+func (dit *getIndexStatisticsTask) ID() UniqueID {
+	return dit.Base.MsgID
+}
+
+func (dit *getIndexStatisticsTask) SetID(uid UniqueID) {
+	dit.Base.MsgID = uid
+}
+
+func (dit *getIndexStatisticsTask) Name() string {
+	return DescribeIndexTaskName
+}
+
+func (dit *getIndexStatisticsTask) Type() commonpb.MsgType {
+	return dit.Base.MsgType
+}
+
+func (dit *getIndexStatisticsTask) BeginTs() Timestamp {
+	return dit.Base.Timestamp
+}
+
+func (dit *getIndexStatisticsTask) EndTs() Timestamp {
+	return dit.Base.Timestamp
+}
+
+func (dit *getIndexStatisticsTask) SetTs(ts Timestamp) {
+	dit.Base.Timestamp = ts
+}
+
+func (dit *getIndexStatisticsTask) OnEnqueue() error {
+	dit.Base = commonpbutil.NewMsgBase()
+	return nil
+}
+
+func (dit *getIndexStatisticsTask) PreExecute(ctx context.Context) error {
+	dit.Base.MsgType = commonpb.MsgType_GetIndexStatistics
+	dit.Base.SourceID = dit.nodeID
+
+	if err := validateCollectionName(dit.CollectionName); err != nil {
+		return err
+	}
+
+	collID, err := globalMetaCache.GetCollectionID(ctx, dit.GetDbName(), dit.CollectionName)
+	if err != nil {
+		return err
+	}
+	dit.collectionID = collID
+	return nil
+}
+
+func (dit *getIndexStatisticsTask) Execute(ctx context.Context) error {
+	schema, err := globalMetaCache.GetCollectionSchema(ctx, dit.GetDbName(), dit.GetCollectionName())
+	if err != nil {
+		log.Error("failed to get collection schema", zap.String("collection_name", dit.GetCollectionName()), zap.Error(err))
+		return fmt.Errorf("failed to get collection schema: %s", dit.GetCollectionName())
+	}
+	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
+	if err != nil {
+		log.Error("failed to parse collection schema", zap.String("collection_name", schema.GetName()), zap.Error(err))
+		return fmt.Errorf("failed to parse collection schema: %s", dit.GetCollectionName())
+	}
+
+	resp, err := dit.datacoord.GetIndexStatistics(ctx, &indexpb.GetIndexStatisticsRequest{
+		CollectionID: dit.collectionID, IndexName: dit.IndexName,
+	})
+	if err != nil || resp == nil {
+		return err
+	}
+	dit.result = &milvuspb.GetIndexStatisticsResponse{}
+	dit.result.Status = resp.GetStatus()
+	if dit.result.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		return merr.Error(dit.result.GetStatus())
+	}
+	for _, indexInfo := range resp.IndexInfos {
+		field, err := schemaHelper.GetFieldFromID(indexInfo.FieldID)
+		if err != nil {
+			log.Error("failed to get collection field", zap.Int64("field_id", indexInfo.FieldID), zap.Error(err))
 			return fmt.Errorf("failed to get collection field: %d", indexInfo.FieldID)
 		}
 		params := indexInfo.GetUserIndexParams()
@@ -442,7 +650,7 @@ func (dit *describeIndexTask) Execute(ctx context.Context) error {
 	return err
 }
 
-func (dit *describeIndexTask) PostExecute(ctx context.Context) error {
+func (dit *getIndexStatisticsTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
@@ -450,8 +658,8 @@ type dropIndexTask struct {
 	Condition
 	ctx context.Context
 	*milvuspb.DropIndexRequest
-	indexCoord types.IndexCoord
-	queryCoord types.QueryCoord
+	dataCoord  types.DataCoordClient
+	queryCoord types.QueryCoordClient
 	result     *commonpb.Status
 
 	collectionID UniqueID
@@ -496,7 +704,7 @@ func (dit *dropIndexTask) OnEnqueue() error {
 
 func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
 	dit.Base.MsgType = commonpb.MsgType_DropIndex
-	dit.Base.SourceID = Params.ProxyCfg.GetNodeID()
+	dit.Base.SourceID = paramtable.GetNodeID()
 
 	collName, fieldName := dit.CollectionName, dit.FieldName
 
@@ -510,7 +718,7 @@ func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
 		}
 	}
 
-	collID, err := globalMetaCache.GetCollectionID(ctx, dit.CollectionName)
+	collID, err := globalMetaCache.GetCollectionID(ctx, dit.GetDbName(), dit.CollectionName)
 	if err != nil {
 		return err
 	}
@@ -529,32 +737,12 @@ func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
 }
 
 func (dit *dropIndexTask) Execute(ctx context.Context) error {
-	resp, err := dit.indexCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
-		CollectionID: dit.collectionID,
-		IndexName:    dit.GetIndexName(),
-	})
-	if err != nil {
-		return err
-	}
-	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		if resp.GetStatus().GetErrorCode() == commonpb.ErrorCode_IndexNotExist {
-			// skip drop
-			return nil
-		}
-		return errors.New(resp.GetStatus().GetReason())
-	}
-
-	if len(resp.GetIndexInfos()) > 1 && dit.GetIndexName() == "" {
-		return ErrAmbiguousIndexName()
-	}
-
-	// if len(indexInfos) == 0, the ErrorCode must be IndexNotExist
-	dit.IndexName = resp.GetIndexInfos()[0].IndexName
-
-	dit.result, err = dit.indexCoord.DropIndex(ctx, &indexpb.DropIndexRequest{
+	var err error
+	dit.result, err = dit.dataCoord.DropIndex(ctx, &indexpb.DropIndexRequest{
 		CollectionID: dit.collectionID,
 		PartitionIDs: nil,
 		IndexName:    dit.IndexName,
+		DropAll:      false,
 	})
 	if dit.result == nil {
 		return errors.New("drop index resp is nil")
@@ -573,11 +761,10 @@ func (dit *dropIndexTask) PostExecute(ctx context.Context) error {
 type getIndexBuildProgressTask struct {
 	Condition
 	*milvuspb.GetIndexBuildProgressRequest
-	ctx        context.Context
-	indexCoord types.IndexCoord
-	rootCoord  types.RootCoord
-	dataCoord  types.DataCoord
-	result     *milvuspb.GetIndexBuildProgressResponse
+	ctx       context.Context
+	rootCoord types.RootCoordClient
+	dataCoord types.DataCoordClient
+	result    *milvuspb.GetIndexBuildProgressResponse
 
 	collectionID UniqueID
 }
@@ -621,7 +808,7 @@ func (gibpt *getIndexBuildProgressTask) OnEnqueue() error {
 
 func (gibpt *getIndexBuildProgressTask) PreExecute(ctx context.Context) error {
 	gibpt.Base.MsgType = commonpb.MsgType_GetIndexBuildProgress
-	gibpt.Base.SourceID = Params.ProxyCfg.GetNodeID()
+	gibpt.Base.SourceID = paramtable.GetNodeID()
 
 	if err := validateCollectionName(gibpt.CollectionName); err != nil {
 		return err
@@ -632,17 +819,17 @@ func (gibpt *getIndexBuildProgressTask) PreExecute(ctx context.Context) error {
 
 func (gibpt *getIndexBuildProgressTask) Execute(ctx context.Context) error {
 	collectionName := gibpt.CollectionName
-	collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+	collectionID, err := globalMetaCache.GetCollectionID(ctx, gibpt.GetDbName(), collectionName)
 	if err != nil { // err is not nil if collection not exists
 		return err
 	}
 	gibpt.collectionID = collectionID
 
 	if gibpt.IndexName == "" {
-		gibpt.IndexName = Params.CommonCfg.DefaultIndexName
+		gibpt.IndexName = Params.CommonCfg.DefaultIndexName.GetValue()
 	}
 
-	resp, err := gibpt.indexCoord.GetIndexBuildProgress(ctx, &indexpb.GetIndexBuildProgressRequest{
+	resp, err := gibpt.dataCoord.GetIndexBuildProgress(ctx, &indexpb.GetIndexBuildProgressRequest{
 		CollectionID: collectionID,
 		IndexName:    gibpt.IndexName,
 	})
@@ -667,10 +854,10 @@ func (gibpt *getIndexBuildProgressTask) PostExecute(ctx context.Context) error {
 type getIndexStateTask struct {
 	Condition
 	*milvuspb.GetIndexStateRequest
-	ctx        context.Context
-	indexCoord types.IndexCoord
-	rootCoord  types.RootCoord
-	result     *milvuspb.GetIndexStateResponse
+	ctx       context.Context
+	dataCoord types.DataCoordClient
+	rootCoord types.RootCoordClient
+	result    *milvuspb.GetIndexStateResponse
 
 	collectionID UniqueID
 }
@@ -714,7 +901,7 @@ func (gist *getIndexStateTask) OnEnqueue() error {
 
 func (gist *getIndexStateTask) PreExecute(ctx context.Context) error {
 	gist.Base.MsgType = commonpb.MsgType_GetIndexState
-	gist.Base.SourceID = Params.ProxyCfg.GetNodeID()
+	gist.Base.SourceID = paramtable.GetNodeID()
 
 	if err := validateCollectionName(gist.CollectionName); err != nil {
 		return err
@@ -724,16 +911,12 @@ func (gist *getIndexStateTask) PreExecute(ctx context.Context) error {
 }
 
 func (gist *getIndexStateTask) Execute(ctx context.Context) error {
-
-	if gist.IndexName == "" {
-		gist.IndexName = Params.CommonCfg.DefaultIndexName
-	}
-	collectionID, err := globalMetaCache.GetCollectionID(ctx, gist.CollectionName)
+	collectionID, err := globalMetaCache.GetCollectionID(ctx, gist.GetDbName(), gist.CollectionName)
 	if err != nil {
 		return err
 	}
 
-	state, err := gist.indexCoord.GetIndexState(ctx, &indexpb.GetIndexStateRequest{
+	state, err := gist.dataCoord.GetIndexState(ctx, &indexpb.GetIndexStateRequest{
 		CollectionID: collectionID,
 		IndexName:    gist.IndexName,
 	})
@@ -742,10 +925,7 @@ func (gist *getIndexStateTask) Execute(ctx context.Context) error {
 	}
 
 	gist.result = &milvuspb.GetIndexStateResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:     merr.Status(nil),
 		State:      state.GetState(),
 		FailReason: state.GetFailReason(),
 	}

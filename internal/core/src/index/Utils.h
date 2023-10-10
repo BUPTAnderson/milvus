@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include <vector>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include "common/Types.h"
 #include "index/IndexInfo.h"
 #include "storage/Types.h"
+#include "storage/FieldData.h"
 
 namespace milvus::index {
 
@@ -44,21 +46,11 @@ BIN_List();
 std::vector<std::tuple<IndexType, MetricType>>
 unsupported_index_combinations();
 
-template <typename T>
-inline bool
-is_in_list(const T& t, std::function<std::vector<T>()> list_func) {
-    auto l = list_func();
-    return std::find(l.begin(), l.end(), t) != l.end();
-}
-
 bool
 is_in_bin_list(const IndexType& index_type);
 
 bool
 is_in_nm_list(const IndexType& index_type);
-
-bool
-is_in_disk_list(const IndexType& index_type);
 
 bool
 is_unsupported(const IndexType& index_type, const MetricType& metric_type);
@@ -108,11 +100,8 @@ GetMetricTypeFromConfig(const Config& config);
 std::string
 GetIndexTypeFromConfig(const Config& config);
 
-IndexMode
-GetIndexModeFromConfig(const Config& config);
-
-IndexMode
-GetIndexMode(const std::string index_mode);
+IndexVersion
+GetIndexEngineVersionFromConfig(const Config& config);
 
 storage::FieldDataMeta
 GetFieldDataMetaFromConfig(const Config& config);
@@ -121,6 +110,19 @@ storage::IndexMeta
 GetIndexMetaFromConfig(const Config& config);
 
 Config
-ParseConfigFromIndexParams(const std::map<std::string, std::string>& index_params);
+ParseConfigFromIndexParams(
+    const std::map<std::string, std::string>& index_params);
+
+void
+AssembleIndexDatas(std::map<std::string, storage::FieldDataPtr>& index_datas);
+
+void
+AssembleIndexDatas(
+    std::map<std::string, storage::FieldDataChannelPtr>& index_datas,
+    std::unordered_map<std::string, storage::FieldDataPtr>& result);
+
+// On Linux, read() (and similar system calls) will transfer at most 0x7ffff000 (2,147,479,552) bytes once
+void
+ReadDataFromFD(int fd, void* buf, size_t size, size_t chunk_size = 0x7ffff000);
 
 }  // namespace milvus::index

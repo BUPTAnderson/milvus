@@ -21,14 +21,16 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/hardware"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/hardware"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // Mock is an alternative to IndexNode, it will return specific results based on specific parameters.
@@ -42,6 +44,7 @@ type Mock struct {
 	CallGetStatisticsChannel func(ctx context.Context) (*milvuspb.StringResponse, error)
 	CallRegister             func() error
 
+	CallSetAddress      func(address string)
 	CallSetEtcdClient   func(etcdClient *clientv3.Client)
 	CallUpdateStateCode func(stateCode commonpb.StateCode)
 
@@ -68,6 +71,8 @@ func NewIndexNodeMock() *Mock {
 		CallStop: func() error {
 			return nil
 		},
+		CallSetAddress: func(address string) {
+		},
 		CallSetEtcdClient: func(etcdClient *clientv3.Client) {
 		},
 		CallUpdateStateCode: func(stateCode commonpb.StateCode) {
@@ -76,26 +81,20 @@ func NewIndexNodeMock() *Mock {
 			return &milvuspb.ComponentStates{
 				State: &milvuspb.ComponentInfo{
 					NodeID:    1,
-					Role:      typeutil.IndexCoordRole,
+					Role:      typeutil.IndexNodeRole,
 					StateCode: commonpb.StateCode_Healthy,
 				},
 				SubcomponentStates: nil,
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
+				Status:             merr.Status(nil),
 			}, nil
 		},
 		CallGetStatisticsChannel: func(ctx context.Context) (*milvuspb.StringResponse, error) {
 			return &milvuspb.StringResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
+				Status: merr.Status(nil),
 			}, nil
 		},
 		CallCreateJob: func(ctx context.Context, req *indexpb.CreateJobRequest) (*commonpb.Status, error) {
-			return &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			}, nil
+			return merr.Status(nil), nil
 		},
 		CallQueryJobs: func(ctx context.Context, in *indexpb.QueryJobsRequest) (*indexpb.QueryJobsResponse, error) {
 			indexInfos := make([]*indexpb.IndexTaskInfo, 0)
@@ -107,23 +106,17 @@ func NewIndexNodeMock() *Mock {
 				})
 			}
 			return &indexpb.QueryJobsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
+				Status:     merr.Status(nil),
 				ClusterID:  in.ClusterID,
 				IndexInfos: indexInfos,
 			}, nil
 		},
 		CallDropJobs: func(ctx context.Context, in *indexpb.DropJobsRequest) (*commonpb.Status, error) {
-			return &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			}, nil
+			return merr.Status(nil), nil
 		},
 		CallGetJobStats: func(ctx context.Context, in *indexpb.GetJobStatsRequest) (*indexpb.GetJobStatsResponse, error) {
 			return &indexpb.GetJobStatsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
+				Status:           merr.Status(nil),
 				TotalJobNum:      1,
 				EnqueueJobNum:    0,
 				InProgressJobNum: 1,
@@ -144,9 +137,7 @@ func NewIndexNodeMock() *Mock {
 		},
 		CallShowConfigurations: func(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 			return &internalpb.ShowConfigurationsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
+				Status: merr.Status(nil),
 			}, nil
 		},
 	}
@@ -164,16 +155,24 @@ func (m *Mock) Stop() error {
 	return m.CallStop()
 }
 
-func (m *Mock) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+func (m *Mock) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return m.CallGetComponentStates(ctx)
 }
 
-func (m *Mock) GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (m *Mock) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
 	return m.CallGetStatisticsChannel(ctx)
 }
 
 func (m *Mock) Register() error {
 	return m.CallRegister()
+}
+
+func (m *Mock) SetAddress(address string) {
+	m.CallSetAddress(address)
+}
+
+func (m *Mock) GetAddress() string {
+	return ""
 }
 
 func (m *Mock) SetEtcdClient(etcdClient *clientv3.Client) {
@@ -202,7 +201,7 @@ func (m *Mock) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) 
 	return m.CallGetMetrics(ctx, req)
 }
 
-//ShowConfigurations returns the configurations of Mock indexNode matching req.Pattern
+// ShowConfigurations returns the configurations of Mock indexNode matching req.Pattern
 func (m *Mock) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	return m.CallShowConfigurations(ctx, req)
 }
@@ -215,7 +214,7 @@ func getMockSystemInfoMetrics(
 	// TODO(dragondriver): add more metrics
 	nodeInfos := metricsinfo.IndexNodeInfos{
 		BaseComponentInfos: metricsinfo.BaseComponentInfos{
-			Name: metricsinfo.ConstructComponentName(typeutil.IndexNodeRole, Params.IndexNodeCfg.GetNodeID()),
+			Name: metricsinfo.ConstructComponentName(typeutil.IndexNodeRole, paramtable.GetNodeID()),
 			HardwareInfos: metricsinfo.HardwareMetrics{
 				CPUCoreCount: hardware.GetCPUNum(),
 				CPUCoreUsage: hardware.GetCPUUsage(),
@@ -225,13 +224,13 @@ func getMockSystemInfoMetrics(
 				DiskUsage:    hardware.GetDiskUsage(),
 			},
 			SystemInfo:  metricsinfo.DeployMetrics{},
-			CreatedTime: Params.IndexNodeCfg.CreatedTime.String(),
-			UpdatedTime: Params.IndexNodeCfg.UpdatedTime.String(),
+			CreatedTime: paramtable.GetCreateTime().String(),
+			UpdatedTime: paramtable.GetUpdateTime().String(),
 			Type:        typeutil.IndexNodeRole,
 		},
 		SystemConfigurations: metricsinfo.IndexNodeConfiguration{
-			MinioBucketName: Params.MinioCfg.BucketName,
-			SimdType:        Params.CommonCfg.SimdType,
+			MinioBucketName: Params.MinioCfg.BucketName.GetValue(),
+			SimdType:        Params.CommonCfg.SimdType.GetValue(),
 		},
 	}
 
@@ -240,11 +239,8 @@ func getMockSystemInfoMetrics(
 	resp, _ := metricsinfo.MarshalComponentInfos(nodeInfos)
 
 	return &milvuspb.GetMetricsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:        merr.Status(nil),
 		Response:      resp,
-		ComponentName: metricsinfo.ConstructComponentName(typeutil.IndexNodeRole, Params.IndexNodeCfg.GetNodeID()),
+		ComponentName: metricsinfo.ConstructComponentName(typeutil.IndexNodeRole, paramtable.GetNodeID()),
 	}, nil
 }

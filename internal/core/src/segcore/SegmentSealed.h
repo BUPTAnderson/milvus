@@ -13,11 +13,13 @@
 
 #include <memory>
 #include <utility>
+#include <tuple>
 
 #include "common/LoadInfo.h"
 #include "pb/segcore.pb.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/Types.h"
+#include "mmap/Column.h"
 
 namespace milvus::segcore {
 
@@ -28,11 +30,21 @@ class SegmentSealed : public SegmentInternalInterface {
     virtual void
     LoadSegmentMeta(const milvus::proto::segcore::LoadSegmentMeta& meta) = 0;
     virtual void
-    LoadFieldData(const LoadFieldDataInfo& info) = 0;
-    virtual void
     DropIndex(const FieldId field_id) = 0;
     virtual void
     DropFieldData(const FieldId field_id) = 0;
+
+    virtual void
+    LoadFieldData(FieldId field_id, FieldDataInfo& data) = 0;
+    virtual void
+    MapFieldData(const FieldId field_id, FieldDataInfo& data) = 0;
+    virtual void
+    AddFieldDataInfoForSealed(const LoadFieldDataInfo& field_data_info) = 0;
+
+    SegmentType
+    type() const override {
+        return SegmentType::Sealed;
+    }
 };
 
 using SegmentSealedPtr = std::unique_ptr<SegmentSealed>;

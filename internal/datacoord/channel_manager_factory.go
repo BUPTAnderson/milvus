@@ -17,8 +17,9 @@
 package datacoord
 
 import (
-	"github.com/milvus-io/milvus/internal/kv"
 	"stathat.com/c/consistent"
+
+	"github.com/milvus-io/milvus/internal/kv"
 )
 
 // ChannelPolicyFactory is the abstract factory that creates policies for channel manager.
@@ -31,8 +32,8 @@ type ChannelPolicyFactory interface {
 	NewAssignPolicy() ChannelAssignPolicy
 	// NewReassignPolicy creates a new channel reassign policy.
 	NewReassignPolicy() ChannelReassignPolicy
-	// NewBgChecker creates a new background checker.
-	NewBgChecker() ChannelBGChecker
+	// NewBalancePolicy creates a new channel balance policy.
+	NewBalancePolicy() BalanceChannelPolicy
 }
 
 // ChannelPolicyFactoryV1 equal to policy batch
@@ -65,9 +66,8 @@ func (f *ChannelPolicyFactoryV1) NewReassignPolicy() ChannelReassignPolicy {
 	return AverageReassignPolicy
 }
 
-// NewBgChecker implementing ChannelPolicyFactory
-func (f *ChannelPolicyFactoryV1) NewBgChecker() ChannelBGChecker {
-	return BgCheckWithMaxWatchDuration(f.kv)
+func (f *ChannelPolicyFactoryV1) NewBalancePolicy() BalanceChannelPolicy {
+	return AvgBalanceChannelPolicy
 }
 
 // ConsistentHashChannelPolicyFactory use consistent hash to determine channel assignment
@@ -102,7 +102,7 @@ func (f *ConsistentHashChannelPolicyFactory) NewReassignPolicy() ChannelReassign
 	return EmptyReassignPolicy
 }
 
-// NewBgChecker creates a new background checker
-func (f *ConsistentHashChannelPolicyFactory) NewBgChecker() ChannelBGChecker {
-	return EmptyBgChecker
+// NewBalancePolicy creates a new balance policy
+func (f *ConsistentHashChannelPolicyFactory) NewBalancePolicy() BalanceChannelPolicy {
+	return EmptyBalancePolicy
 }

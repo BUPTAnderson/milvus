@@ -17,11 +17,12 @@
 package storage
 
 import (
-	"errors"
 	"sync/atomic"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
 )
 
 var (
@@ -62,10 +63,9 @@ type InsertBinlogIterator struct {
 // NewInsertBinlogIterator creates a new iterator
 func NewInsertBinlogIterator(blobs []*Blob, PKfieldID UniqueID, pkType schemapb.DataType) (*InsertBinlogIterator, error) {
 	// TODO: load part of file to read records other than loading all content
-	reader := NewInsertCodec(nil)
+	reader := NewInsertCodecWithSchema(nil)
 
 	_, _, serData, err := reader.Deserialize(blobs)
-
 	if err != nil {
 		return nil, err
 	}

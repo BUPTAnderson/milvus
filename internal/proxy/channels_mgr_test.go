@@ -18,15 +18,16 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func Test_removeDuplicate(t *testing.T) {
@@ -54,7 +55,7 @@ func Test_getDmlChannelsFunc(t *testing.T) {
 	t.Run("failed to describe collection", func(t *testing.T) {
 		ctx := context.Background()
 		rc := newMockRootCoord()
-		rc.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+		rc.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
 			return nil, errors.New("mock")
 		}
 		f := getDmlChannelsFunc(ctx, rc)
@@ -65,7 +66,7 @@ func Test_getDmlChannelsFunc(t *testing.T) {
 	t.Run("error code not success", func(t *testing.T) {
 		ctx := context.Background()
 		rc := newMockRootCoord()
-		rc.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+		rc.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
 			return &milvuspb.DescribeCollectionResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError}}, nil
 		}
 		f := getDmlChannelsFunc(ctx, rc)
@@ -76,11 +77,12 @@ func Test_getDmlChannelsFunc(t *testing.T) {
 	t.Run("normal case", func(t *testing.T) {
 		ctx := context.Background()
 		rc := newMockRootCoord()
-		rc.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+		rc.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
 			return &milvuspb.DescribeCollectionResponse{
 				VirtualChannelNames:  []string{"111", "222"},
 				PhysicalChannelNames: []string{"111", "111"},
-				Status:               &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}}, nil
+				Status:               &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			}, nil
 		}
 		f := getDmlChannelsFunc(ctx, rc)
 		got, err := f(100)
@@ -211,7 +213,7 @@ func Test_createStream(t *testing.T) {
 		factory.fQStream = func(ctx context.Context) (msgstream.MsgStream, error) {
 			return nil, errors.New("mock")
 		}
-		_, err := createStream(factory, dmlStreamType, nil, nil)
+		_, err := createStream(factory, nil, nil)
 		assert.Error(t, err)
 	})
 
@@ -220,7 +222,7 @@ func Test_createStream(t *testing.T) {
 		factory.f = func(ctx context.Context) (msgstream.MsgStream, error) {
 			return nil, errors.New("mock")
 		}
-		_, err := createStream(factory, dqlStreamType, nil, nil)
+		_, err := createStream(factory, nil, nil)
 		assert.Error(t, err)
 	})
 
@@ -229,7 +231,7 @@ func Test_createStream(t *testing.T) {
 		factory.f = func(ctx context.Context) (msgstream.MsgStream, error) {
 			return newMockMsgStream(), nil
 		}
-		_, err := createStream(factory, dmlStreamType, []string{"111"}, func(tsMsgs []msgstream.TsMsg, hashKeys [][]int32) (map[int32]*msgstream.MsgPack, error) {
+		_, err := createStream(factory, []string{"111"}, func(tsMsgs []msgstream.TsMsg, hashKeys [][]int32) (map[int32]*msgstream.MsgPack, error) {
 			return nil, nil
 		})
 		assert.NoError(t, err)
@@ -237,6 +239,7 @@ func Test_createStream(t *testing.T) {
 }
 
 func Test_singleTypeChannelsMgr_createMsgStream(t *testing.T) {
+	paramtable.Init()
 	t.Run("re-create", func(t *testing.T) {
 		m := &singleTypeChannelsMgr{
 			infos: map[UniqueID]streamInfos{
@@ -268,7 +271,6 @@ func Test_singleTypeChannelsMgr_createMsgStream(t *testing.T) {
 				return channelInfos{vchans: []string{"111", "222"}, pchans: []string{"111"}}, nil
 			},
 			msgStreamFactory: factory,
-			singleStreamType: dmlStreamType,
 			repackFunc:       nil,
 		}
 		_, err := m.createMsgStream(100)
@@ -286,7 +288,6 @@ func Test_singleTypeChannelsMgr_createMsgStream(t *testing.T) {
 				return channelInfos{vchans: []string{"111", "222"}, pchans: []string{"111"}}, nil
 			},
 			msgStreamFactory: factory,
-			singleStreamType: dmlStreamType,
 			repackFunc:       nil,
 		}
 		stream, err := m.createMsgStream(100)
@@ -353,7 +354,6 @@ func Test_singleTypeChannelsMgr_getStream(t *testing.T) {
 				return channelInfos{vchans: []string{"111", "222"}, pchans: []string{"111"}}, nil
 			},
 			msgStreamFactory: factory,
-			singleStreamType: dmlStreamType,
 			repackFunc:       nil,
 		}
 		stream, err := m.getOrCreateStream(100)

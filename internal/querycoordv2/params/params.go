@@ -17,29 +17,29 @@
 package params
 
 import (
-	"errors"
 	"math/rand"
 	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/paramtable"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-var Params paramtable.ComponentParam
+var Params *paramtable.ComponentParam = paramtable.Get()
 
-var (
-	ErrFailedAllocateID = errors.New("failed to allocate ID")
-)
+var ErrFailedAllocateID = errors.New("failed to allocate ID")
 
 // GenerateEtcdConfig returns a etcd config with a random root path,
 // NOTE: for test only
-func GenerateEtcdConfig() paramtable.EtcdConfig {
-	config := Params.EtcdCfg
+func GenerateEtcdConfig() *paramtable.EtcdConfig {
+	config := &Params.EtcdCfg
 	rand.Seed(time.Now().UnixNano())
 	suffix := "-test-querycoord" + strconv.FormatInt(rand.Int63(), 10)
-	config.MetaRootPath = config.MetaRootPath + suffix
-	return config
+
+	Params.Save("etcd.rootPath", config.MetaRootPath.GetValue()+suffix)
+	return &Params.EtcdCfg
 }
 
 func RandomMetaRootPath() string {

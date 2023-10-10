@@ -47,4 +47,19 @@ VerifyExprVisitor::visit(CompareExpr& expr) {
     // TODO
 }
 
+void
+VerifyExprVisitor::visit(ExistsExpr& expr) {
+    // TODO
+}
+
+void
+VerifyExprVisitor::visit(AlwaysTrueExpr& expr) {
+    // TODO
+}
+
+void
+VerifyExprVisitor::visit(JsonContainsExpr& expr) {
+    // TODO
+}
+
 }  // namespace milvus::query

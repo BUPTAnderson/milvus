@@ -18,7 +18,7 @@ package indexnode
 
 // import (
 // 	"context"
-// 	"errors"
+// 	"github.com/cockroachdb/errors"
 // 	"math/rand"
 // 	"path"
 // 	"strconv"
@@ -28,11 +28,11 @@ package indexnode
 
 // 	"github.com/golang/protobuf/proto"
 // 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
-// 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+// 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 // 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 // 	"github.com/milvus-io/milvus/internal/storage"
-// 	"github.com/milvus-io/milvus/internal/util/etcd"
-// 	"github.com/milvus-io/milvus/internal/util/timerecord"
+// 	"github.com/milvus-io/milvus/pkg/util/etcd"
+// 	"github.com/milvus-io/milvus/pkg/util/timerecord"
 // 	"github.com/stretchr/testify/assert"
 // )
 
@@ -132,10 +132,6 @@ package indexnode
 // 	kv.MetaKv
 
 // 	loadWithPrefix2 func(key string) ([]string, []string, []int64, error)
-// }
-
-// func (mk *mockETCDKV) LoadWithPrefix2(key string) ([]string, []string, []int64, error) {
-// 	return mk.loadWithPrefix2(key)
 // }
 
 // func TestIndexBuildTask_loadIndexMeta(t *testing.T) {

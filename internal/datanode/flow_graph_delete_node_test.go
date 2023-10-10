@@ -17,21 +17,24 @@
 package datanode
 
 import (
+	"container/heap"
 	"context"
 	"testing"
 	"time"
 
-	"github.com/bits-and-blooms/bloom/v3"
+	bloom "github.com/bits-and-blooms/bloom/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
-	"github.com/milvus-io/milvus/internal/util/retry"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/retry"
 )
 
 var deleteNodeTestDir = "/tmp/milvus_test/deleteNode"
@@ -48,8 +51,8 @@ func TestFlowGraphDeleteNode_newDeleteNode(te *testing.T) {
 
 	for _, test := range tests {
 		te.Run(test.description, func(t *testing.T) {
-			dn, err := newDeleteNode(test.ctx, nil, make(chan string, 1), test.config)
-			assert.Nil(t, err)
+			dn, err := newDeleteNode(test.ctx, nil, nil, make(chan string, 1), test.config)
+			assert.NoError(t, err)
 
 			assert.NotNil(t, dn)
 			assert.Equal(t, "deleteNode-"+dn.channelName, dn.Name())
@@ -59,26 +62,45 @@ func TestFlowGraphDeleteNode_newDeleteNode(te *testing.T) {
 }
 
 func genMockChannel(segIDs []int64, pks []primaryKey, chanName string) *ChannelMeta {
-	buf := make([]byte, 8)
-	filter0 := bloom.NewWithEstimates(1000000, 0.01)
+	pkStat1 := &storage.PkStatistics{
+		PkFilter: bloom.NewWithEstimates(1000000, 0.01),
+	}
+
+	pkStat2 := &storage.PkStatistics{
+		PkFilter: bloom.NewWithEstimates(1000000, 0.01),
+	}
+
 	for i := 0; i < 3; i++ {
-		switch pks[i].Type() {
-		case schemapb.DataType_Int64:
-			common.Endian.PutUint64(buf, uint64(pks[i].(*int64PrimaryKey).Value))
-			filter0.Add(buf)
-		case schemapb.DataType_VarChar:
-			filter0.AddString(pks[i].(*varCharPrimaryKey).Value)
+		pkStat1.UpdateMinMax(pks[i])
+		buf := make([]byte, 8)
+		for _, pk := range pks {
+			switch pk.Type() {
+			case schemapb.DataType_Int64:
+				int64Value := pk.(*int64PrimaryKey).Value
+				common.Endian.PutUint64(buf, uint64(int64Value))
+				pkStat1.PkFilter.Add(buf)
+			case schemapb.DataType_VarChar:
+				stringValue := pk.(*varCharPrimaryKey).Value
+				pkStat1.PkFilter.AddString(stringValue)
+			default:
+			}
 		}
 	}
 
-	filter1 := bloom.NewWithEstimates(1000000, 0.01)
 	for i := 3; i < 5; i++ {
-		switch pks[i].Type() {
-		case schemapb.DataType_Int64:
-			common.Endian.PutUint64(buf, uint64(pks[i].(*int64PrimaryKey).Value))
-			filter1.Add(buf)
-		case schemapb.DataType_VarChar:
-			filter1.AddString(pks[i].(*varCharPrimaryKey).Value)
+		pkStat2.UpdateMinMax(pks[i])
+		buf := make([]byte, 8)
+		for _, pk := range pks {
+			switch pk.Type() {
+			case schemapb.DataType_Int64:
+				int64Value := pk.(*int64PrimaryKey).Value
+				common.Endian.PutUint64(buf, uint64(int64Value))
+				pkStat2.PkFilter.Add(buf)
+			case schemapb.DataType_VarChar:
+				stringValue := pk.(*varCharPrimaryKey).Value
+				pkStat2.PkFilter.AddString(stringValue)
+			default:
+			}
 		}
 	}
 
@@ -101,9 +123,9 @@ func genMockChannel(segIDs []int64, pks []primaryKey, chanName string) *ChannelM
 		}
 		seg.setType(segTypes[i])
 		if i < 3 {
-			seg.pkStat.pkFilter = filter0
+			seg.currentStat = pkStat1
 		} else {
-			seg.pkStat.pkFilter = filter1
+			seg.currentStat = pkStat2
 		}
 		channel.segments[segIDs[i]] = &seg
 	}
@@ -118,19 +140,24 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 			in   []Msg
 			desc string
 		}{
-			{[]Msg{},
-				"Invalid input length == 0"},
-			{[]Msg{&flowGraphMsg{}, &flowGraphMsg{}, &flowGraphMsg{}},
-				"Invalid input length == 3"},
-			{[]Msg{&flowgraph.MsgStreamMsg{}},
-				"Invalid input length == 1 but input message is not flowGraphMsg"},
+			{
+				[]Msg{},
+				"Invalid input length == 0",
+			},
+			{
+				[]Msg{&flowGraphMsg{}, &flowGraphMsg{}, &flowGraphMsg{}},
+				"Invalid input length == 3",
+			},
+			{
+				[]Msg{&flowgraph.MsgStreamMsg{}},
+				"Invalid input length == 1 but input message is not flowGraphMsg",
+			},
 		}
 
 		for _, test := range invalidInTests {
 			te.Run(test.desc, func(t *testing.T) {
 				dn := deleteNode{}
-				rt := dn.Operate(test.in)
-				assert.Empty(t, rt)
+				assert.False(t, dn.IsValidInMsg(test.in))
 			})
 		}
 	})
@@ -157,19 +184,23 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 		tss = []uint64{1, 1, 1, 1, 1}
 	)
 	cm := storage.NewLocalChunkManager(storage.RootPath(deleteNodeTestDir))
-	defer cm.RemoveWithPrefix(ctx, "")
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 	t.Run("Test get segment by varChar primary keys", func(te *testing.T) {
 		channel := genMockChannel(segIDs, varCharPks, chanName)
-		fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, channel, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
+		alloc := allocator.NewMockAllocator(t)
+		fm := NewRendezvousFlushManager(alloc, cm, channel, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
 		c := &nodeConfig{
 			channel:      channel,
-			allocator:    &allocator{},
 			vChannelName: chanName,
 		}
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
 
-		dn, err := newDeleteNode(context.Background(), fm, make(chan string, 1), c)
-		assert.Nil(t, err)
+		dn, err := newDeleteNode(context.Background(), fm, delBufManager, make(chan string, 1), c)
+		assert.NoError(t, err)
 
 		segID2Pks, _ := dn.filterSegmentByPK(0, varCharPks, tss)
 		expected := map[int64][]primaryKey{
@@ -189,18 +220,24 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 	})
 
 	channel := genMockChannel(segIDs, int64Pks, chanName)
-	fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, channel, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
+	alloc := allocator.NewMockAllocator(t)
+	fm := NewRendezvousFlushManager(alloc, cm, channel, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
 	t.Run("Test get segment by int64 primary keys", func(te *testing.T) {
 		c := &nodeConfig{
 			channel:      channel,
-			allocator:    &allocator{},
 			vChannelName: chanName,
 		}
 
-		dn, err := newDeleteNode(context.Background(), fm, make(chan string, 1), c)
-		assert.Nil(t, err)
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
+
+		dn, err := newDeleteNode(context.Background(), fm, delBufManager, make(chan string, 1), c)
+		assert.NoError(t, err)
 
 		segID2Pks, _ := dn.filterSegmentByPK(0, int64Pks, tss)
+		t.Log(segID2Pks)
 		expected := map[int64][]primaryKey{
 			segIDs[0]: int64Pks[0:3],
 			segIDs[1]: int64Pks[0:3],
@@ -224,14 +261,17 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 		chanName := "datanode-test-FlowGraphDeletenode-operate"
 		testPath := "/test/datanode/root/meta"
 		assert.NoError(t, clearEtcd(testPath))
-		Params.EtcdCfg.MetaRootPath = testPath
+		Params.Save("etcd.rootPath", "/test/datanode/root")
 
 		c := &nodeConfig{
 			channel:      channel,
-			allocator:    NewAllocatorFactory(),
 			vChannelName: chanName,
 		}
-		delNode, err := newDeleteNode(ctx, fm, make(chan string, 1), c)
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
+		delNode, err := newDeleteNode(ctx, fm, delBufManager, make(chan string, 1), c)
 		assert.Nil(te, err)
 
 		msg := genFlowGraphDeleteMsg(int64Pks, chanName)
@@ -247,14 +287,17 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 		chanName := "datanode-test-FlowGraphDeletenode-operate"
 		testPath := "/test/datanode/root/meta"
 		assert.NoError(t, clearEtcd(testPath))
-		Params.EtcdCfg.MetaRootPath = testPath
+		Params.Save("etcd.rootPath", "/test/datanode/root")
 
 		c := &nodeConfig{
 			channel:      channel,
-			allocator:    NewAllocatorFactory(),
 			vChannelName: chanName,
 		}
-		delNode, err := newDeleteNode(ctx, fm, make(chan string, 1), c)
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
+		delNode, err := newDeleteNode(ctx, fm, delBufManager, make(chan string, 1), c)
 		assert.Nil(te, err)
 
 		msg := genFlowGraphDeleteMsg(int64Pks, chanName)
@@ -276,16 +319,19 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 		chanName := "datanode-test-FlowGraphDeletenode-operate"
 		testPath := "/test/datanode/root/meta"
 		assert.NoError(t, clearEtcd(testPath))
-		Params.EtcdCfg.MetaRootPath = testPath
+		Params.Save("etcd.rootPath", "/test/datanode/root")
 
 		c := &nodeConfig{
 			channel:      channel,
-			allocator:    NewAllocatorFactory(),
 			vChannelName: chanName,
 		}
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
 		sig := make(chan string, 1)
-		delNode, err := newDeleteNode(ctx, fm, sig, c)
-		assert.Nil(t, err)
+		delNode, err := newDeleteNode(ctx, fm, delBufManager, sig, c)
+		assert.NoError(t, err)
 
 		msg := genFlowGraphDeleteMsg(int64Pks, chanName)
 		msg.segmentsToSync = segIDs
@@ -296,44 +342,11 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 			fm.startDropping()
 			delNode.Operate([]flowgraph.Msg{&msg})
 		})
-		timer := time.NewTimer(time.Millisecond)
 		select {
-		case <-timer.C:
+		case <-time.After(time.Millisecond):
 			t.FailNow()
 		case <-sig:
 		}
-	})
-
-	t.Run("Test deleteNode Operate flushDelData failed", func(te *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-
-		chanName := "datanode-test-FlowGraphDeletenode-operate"
-		testPath := "/test/datanode/root/meta"
-		assert.NoError(t, clearEtcd(testPath))
-		Params.EtcdCfg.MetaRootPath = testPath
-
-		c := &nodeConfig{
-			channel:      nil,
-			allocator:    NewAllocatorFactory(),
-			vChannelName: chanName,
-		}
-		delNode, err := newDeleteNode(ctx, fm, make(chan string, 1), c)
-		assert.Nil(te, err)
-
-		msg := genFlowGraphDeleteMsg(int64Pks, chanName)
-		msg.segmentsToSync = []UniqueID{-1}
-		delNode.delBuf.Store(UniqueID(-1), &DelDataBuf{})
-		delNode.flushManager = &mockFlushManager{
-			returnError: true,
-		}
-
-		var fgMsg flowgraph.Msg = &msg
-
-		setFlowGraphRetryOpt(retry.Attempts(1))
-		assert.Panics(te, func() {
-			delNode.Operate([]flowgraph.Msg{fgMsg})
-		})
 	})
 
 	t.Run("Test issue#18565", func(t *testing.T) {
@@ -343,7 +356,6 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 		chanName := "datanode-test-FlowGraphDeletenode-issue18565"
 		testPath := "/test/datanode/root/meta"
 		assert.NoError(t, clearEtcd(testPath))
-		Params.EtcdCfg.MetaRootPath = testPath
 
 		channel := &ChannelMeta{
 			segments: make(map[UniqueID]*Segment),
@@ -351,11 +363,14 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 
 		c := &nodeConfig{
 			channel:      channel,
-			allocator:    NewAllocatorFactory(),
 			vChannelName: chanName,
 		}
-		delNode, err := newDeleteNode(ctx, fm, make(chan string, 1), c)
-		assert.Nil(t, err)
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
+		delNode, err := newDeleteNode(ctx, fm, delBufManager, make(chan string, 1), c)
+		assert.NoError(t, err)
 
 		compactedSegment := UniqueID(10020987)
 		seg := Segment{
@@ -369,8 +384,13 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 		msg.deleteMessages = []*msgstream.DeleteMsg{}
 		msg.segmentsToSync = []UniqueID{compactedSegment}
 
-		delNode.delBuf.Store(compactedSegment, &DelDataBuf{delData: &DeleteData{}})
-		delNode.flushManager = NewRendezvousFlushManager(&allocator{}, cm, channel, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
+		bufItem := &Item{memorySize: 0}
+		delNode.delBufferManager.updateMeta(compactedSegment,
+			&DelDataBuf{delData: &DeleteData{}, item: bufItem})
+		heap.Push(delNode.delBufferManager.delBufHeap, bufItem)
+
+		delNode.flushManager = NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, channel,
+			func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
 
 		var fgMsg flowgraph.Msg = &msg
 		setFlowGraphRetryOpt(retry.Attempts(1))
@@ -378,10 +398,106 @@ func TestFlowGraphDeleteNode_Operate(t *testing.T) {
 			delNode.Operate([]flowgraph.Msg{fgMsg})
 		})
 
-		_, ok := delNode.delBuf.Load(100)
+		_, ok := delNode.delBufferManager.Load(100)
 		assert.False(t, ok)
-		_, ok = delNode.delBuf.Load(compactedSegment)
+		_, ok = delNode.delBufferManager.Load(compactedSegment)
 		assert.False(t, ok)
+	})
+
+	t.Run("Test deleteNode auto flush function", func(t *testing.T) {
+		// for issue
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		chanName := "datanode-test-FlowGraphDeletenode-autoflush"
+		testPath := "/test/datanode/root/meta"
+		assert.NoError(t, clearEtcd(testPath))
+		Params.Save("etcd.rootPath", "/test/datanode/root")
+
+		c := &nodeConfig{
+			channel:      channel,
+			vChannelName: chanName,
+		}
+		delBufManager := &DeltaBufferManager{
+			channel:    channel,
+			delBufHeap: &PriorityQueue{},
+		}
+		mockFlushManager := &mockFlushManager{
+			recordFlushedSeg: true,
+		}
+		delNode, err := newDeleteNode(ctx, mockFlushManager, delBufManager, make(chan string, 1), c)
+		assert.NoError(t, err)
+
+		// 2. here we set flushing segments inside fgmsg to empty
+		// in order to verify the validity of auto flush function
+		msg := genFlowGraphDeleteMsg(int64Pks, chanName)
+
+		// delete has to match segment partition ID
+		for _, msg := range msg.deleteMessages {
+			msg.PartitionID = 0
+		}
+		msg.segmentsToSync = []UniqueID{}
+
+		var fgMsg flowgraph.Msg = &msg
+		// 1. here we set buffer bytes to a relatively high level
+		// and the sum of memory consumption in this case is 208
+		// so no segments will be flushed
+		paramtable.Get().Save(Params.DataNodeCfg.FlushDeleteBufferBytes.Key, "300")
+		fgMsg.(*flowGraphMsg).segmentsToSync = delNode.delBufferManager.ShouldFlushSegments()
+		delNode.Operate([]flowgraph.Msg{fgMsg})
+		assert.Equal(t, 0, len(mockFlushManager.flushedSegIDs))
+		assert.Equal(t, int64(208), delNode.delBufferManager.usedMemory.Load())
+		assert.Equal(t, 5, delNode.delBufferManager.delBufHeap.Len())
+
+		// 3. note that the whole memory size used by 5 segments will be 208
+		// so when setting delete buffer size equal to 200
+		// there will only be one segment to be flushed then the
+		// memory consumption will be reduced to 160(under 200)
+		msg.deleteMessages = []*msgstream.DeleteMsg{}
+		msg.segmentsToSync = []UniqueID{}
+		paramtable.Get().Save(Params.DataNodeCfg.FlushDeleteBufferBytes.Key, "200")
+		fgMsg.(*flowGraphMsg).segmentsToSync = delNode.delBufferManager.ShouldFlushSegments()
+		delNode.Operate([]flowgraph.Msg{fgMsg})
+		assert.Equal(t, 1, len(mockFlushManager.flushedSegIDs))
+		assert.Equal(t, int64(160), delNode.delBufferManager.usedMemory.Load())
+		assert.Equal(t, 4, delNode.delBufferManager.delBufHeap.Len())
+
+		// 4. there is no new delete msg and delBufferSize is still 200
+		// we expect there will not be any auto flush del
+		fgMsg.(*flowGraphMsg).segmentsToSync = delNode.delBufferManager.ShouldFlushSegments()
+		delNode.Operate([]flowgraph.Msg{fgMsg})
+		assert.Equal(t, 1, len(mockFlushManager.flushedSegIDs))
+		assert.Equal(t, int64(160), delNode.delBufferManager.usedMemory.Load())
+		assert.Equal(t, 4, delNode.delBufferManager.delBufHeap.Len())
+
+		// 5. we reset buffer bytes to 150, then we expect there would be one more
+		// segment which is 48 in size to be flushed, so the remained del memory size
+		// will be 112
+		paramtable.Get().Save(Params.DataNodeCfg.FlushDeleteBufferBytes.Key, "150")
+		fgMsg.(*flowGraphMsg).segmentsToSync = delNode.delBufferManager.ShouldFlushSegments()
+		delNode.Operate([]flowgraph.Msg{fgMsg})
+		assert.Equal(t, 2, len(mockFlushManager.flushedSegIDs))
+		assert.Equal(t, int64(112), delNode.delBufferManager.usedMemory.Load())
+		assert.Equal(t, 3, delNode.delBufferManager.delBufHeap.Len())
+
+		// 6. we reset buffer bytes to 60, then most of the segments will be flushed
+		// except for the smallest entry with size equaling to 32
+		paramtable.Get().Save(Params.DataNodeCfg.FlushDeleteBufferBytes.Key, "60")
+		fgMsg.(*flowGraphMsg).segmentsToSync = delNode.delBufferManager.ShouldFlushSegments()
+		delNode.Operate([]flowgraph.Msg{fgMsg})
+		assert.Equal(t, 4, len(mockFlushManager.flushedSegIDs))
+		assert.Equal(t, int64(32), delNode.delBufferManager.usedMemory.Load())
+		assert.Equal(t, 1, delNode.delBufferManager.delBufHeap.Len())
+
+		// 7. we reset buffer bytes to 20, then as all segment-memory consumption
+		// is more than 20, so all five segments will be flushed and the remained
+		// del memory will be lowered to zero
+		paramtable.Get().Save(Params.DataNodeCfg.FlushDeleteBufferBytes.Key, "20")
+		fgMsg.(*flowGraphMsg).segmentsToSync = delNode.delBufferManager.ShouldFlushSegments()
+		delNode.Operate([]flowgraph.Msg{fgMsg})
+		assert.Equal(t, 5, len(mockFlushManager.flushedSegIDs))
+		assert.Equal(t, int64(0), delNode.delBufferManager.usedMemory.Load())
+		assert.Equal(t, 0, delNode.delBufferManager.delBufHeap.Len())
 	})
 }
 
@@ -390,21 +506,27 @@ func TestFlowGraphDeleteNode_showDelBuf(t *testing.T) {
 	defer cancel()
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(deleteNodeTestDir))
-	defer cm.RemoveWithPrefix(ctx, "")
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
-	fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, nil, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
+	fm := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, nil, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
 
 	chanName := "datanode-test-FlowGraphDeletenode-showDelBuf"
 	testPath := "/test/datanode/root/meta"
 	assert.NoError(t, clearEtcd(testPath))
-	Params.EtcdCfg.MetaRootPath = testPath
+	Params.Save("etcd.rootPath", "/test/datanode/root")
 
+	channel := &ChannelMeta{
+		segments: make(map[UniqueID]*Segment),
+	}
 	c := &nodeConfig{
-		channel:      nil,
-		allocator:    NewAllocatorFactory(),
+		channel:      channel,
 		vChannelName: chanName,
 	}
-	delNode, err := newDeleteNode(ctx, fm, make(chan string, 1), c)
+	delBufManager := &DeltaBufferManager{
+		channel:    channel,
+		delBufHeap: &PriorityQueue{},
+	}
+	delNode, err := newDeleteNode(ctx, fm, delBufManager, make(chan string, 1), c)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -417,107 +539,11 @@ func TestFlowGraphDeleteNode_showDelBuf(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		delBuf := newDelDataBuf()
-		delBuf.updateSize(test.numRows)
-		delNode.delBuf.Store(test.seg, delBuf)
+		delBuf := newDelDataBuf(test.seg)
+		delBuf.accumulateEntriesNum(test.numRows)
+		delNode.delBufferManager.updateMeta(test.seg, delBuf)
+		heap.Push(delNode.delBufferManager.delBufHeap, delBuf.item)
 	}
 
 	delNode.showDelBuf([]UniqueID{111, 112, 113}, 100)
-}
-
-func TestFlowGraphDeleteNode_updateCompactedSegments(t *testing.T) {
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cm := storage.NewLocalChunkManager(storage.RootPath(deleteNodeTestDir))
-	defer cm.RemoveWithPrefix(ctx, "")
-
-	fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, nil, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
-
-	chanName := "datanode-test-FlowGraphDeletenode-showDelBuf"
-	testPath := "/test/datanode/root/meta"
-	assert.NoError(t, clearEtcd(testPath))
-	Params.EtcdCfg.MetaRootPath = testPath
-
-	channel := ChannelMeta{
-		segments: make(map[UniqueID]*Segment),
-	}
-
-	c := &nodeConfig{
-		channel:      &channel,
-		allocator:    NewAllocatorFactory(),
-		vChannelName: chanName,
-	}
-	delNode, err := newDeleteNode(ctx, fm, make(chan string, 1), c)
-	require.NoError(t, err)
-
-	tests := []struct {
-		description    string
-		compactToExist bool
-		segIDsInBuffer []UniqueID
-
-		compactedToIDs   []UniqueID
-		compactedFromIDs []UniqueID
-
-		expectedSegsRemain []UniqueID
-	}{
-		{"zero segments", false,
-			[]UniqueID{}, []UniqueID{}, []UniqueID{}, []UniqueID{}},
-		{"segment no compaction", false,
-			[]UniqueID{100, 101}, []UniqueID{}, []UniqueID{}, []UniqueID{100, 101}},
-		{"segment compacted not in buffer", true,
-			[]UniqueID{100, 101}, []UniqueID{200}, []UniqueID{103}, []UniqueID{100, 101}},
-		{"segment compacted in buffer 100>201", true,
-			[]UniqueID{100, 101}, []UniqueID{201}, []UniqueID{100}, []UniqueID{101, 201}},
-		{"segment compacted in buffer 100+101>201", true,
-			[]UniqueID{100, 101}, []UniqueID{201, 201}, []UniqueID{100, 101}, []UniqueID{201}},
-		{"segment compacted in buffer 100>201, 101>202", true,
-			[]UniqueID{100, 101}, []UniqueID{201, 202}, []UniqueID{100, 101}, []UniqueID{201, 202}},
-		// false
-		{"segment compacted in buffer 100>201", false,
-			[]UniqueID{100, 101}, []UniqueID{201}, []UniqueID{100}, []UniqueID{101}},
-		{"segment compacted in buffer 100+101>201", false,
-			[]UniqueID{100, 101}, []UniqueID{201, 201}, []UniqueID{100, 101}, []UniqueID{}},
-		{"segment compacted in buffer 100>201, 101>202", false,
-			[]UniqueID{100, 101}, []UniqueID{201, 202}, []UniqueID{100, 101}, []UniqueID{}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) {
-			for _, seg := range test.segIDsInBuffer {
-				delBuf := newDelDataBuf()
-				delBuf.updateSize(100)
-				delNode.delBuf.Store(seg, delBuf)
-			}
-
-			if test.compactToExist {
-				for _, segID := range test.compactedToIDs {
-					seg := Segment{
-						segmentID: segID,
-						numRows:   10,
-					}
-					seg.setType(datapb.SegmentType_Flushed)
-					channel.segments[segID] = &seg
-				}
-			} else { // clear all segments in channel
-				channel.segments = make(map[UniqueID]*Segment)
-			}
-
-			for i, segID := range test.compactedFromIDs {
-				seg := Segment{
-					segmentID:   segID,
-					compactedTo: test.compactedToIDs[i],
-				}
-				seg.setType(datapb.SegmentType_Compacted)
-				channel.segments[segID] = &seg
-			}
-
-			delNode.updateCompactedSegments()
-
-			for _, remain := range test.expectedSegsRemain {
-				_, ok := delNode.delBuf.Load(remain)
-				assert.True(t, ok)
-			}
-		})
-	}
 }

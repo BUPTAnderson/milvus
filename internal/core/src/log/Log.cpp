@@ -47,16 +47,16 @@ LogOut(const char* pattern, ...) {
     vsnprintf(str_p.get(), len, pattern, vl);  // NOLINT
     va_end(vl);
 
-    return std::string(str_p.get());
+    return {str_p.get()};
 }
 
 void
-SetThreadName(const std::string& name) {
+SetThreadName(const std::string_view name) {
     // Note: the name cannot exceed 16 bytes
 #ifdef __APPLE__
-    pthread_setname_np(name.c_str());
+    pthread_setname_np(name.data());
 #elif defined(__linux__) || defined(__MINGW64__)
-    pthread_setname_np(pthread_self(), name.c_str());
+    pthread_setname_np(pthread_self(), name.data());
 #else
 #error "Unsupported SetThreadName";
 #endif
@@ -64,7 +64,7 @@ SetThreadName(const std::string& name) {
 
 std::string
 GetThreadName() {
-    std::string thread_name = "unamed";
+    std::string thread_name = "unnamed";
     char name[16];
     size_t len = 16;
     auto err = pthread_getname_np(pthread_self(), name, len);
@@ -84,22 +84,10 @@ get_now_timestamp() {
 #ifndef WIN32
 
 int64_t
-get_system_boottime() {
-    FILE* uptime = fopen("/proc/uptime", "r");
-    float since_sys_boot, _;
-    auto ret = fscanf(uptime, "%f %f", &since_sys_boot, &_);
-    fclose(uptime);
-    if (ret != 2) {
-        throw std::runtime_error("read /proc/uptime failed.");
-    }
-    return static_cast<int64_t>(since_sys_boot);
-}
-
-int64_t
 get_thread_starttime() {
 #ifdef __APPLE__
     uint64_t tid;
-    pthread_threadid_np(NULL, &tid);
+    pthread_threadid_np(nullptr, &tid);
 #elif __linux__
     int64_t tid = gettid();
 #else
@@ -108,12 +96,17 @@ get_thread_starttime() {
 
     int64_t pid = getpid();
     char filename[256];
-    snprintf(filename, sizeof(filename), "/proc/%lld/task/%lld/stat", (long long)pid, (long long)tid);  // NOLINT
+    snprintf(filename,
+             sizeof(filename),
+             "/proc/%lld/task/%lld/stat",
+             (long long)pid,   // NOLINT, TODO: How to solve this?
+             (long long)tid);  // NOLINT
 
     int64_t val = 0;
     char comm[16], state;
     FILE* thread_stat = fopen(filename, "r");
-    auto ret = fscanf(thread_stat, "%lld %s %s ", (long long*)&val, comm, &state);  // NOLINT
+    auto ret = fscanf(
+        thread_stat, "%lld %s %s ", (long long*)&val, comm, &state);  // NOLINT
 
     for (auto i = 4; i < 23; i++) {
         ret = fscanf(thread_stat, "%lld ", (long long*)&val);  // NOLINT
@@ -128,32 +121,10 @@ get_thread_starttime() {
     return val / sysconf(_SC_CLK_TCK);
 }
 
-int64_t
-get_thread_start_timestamp() {
-    try {
-        return get_now_timestamp() - get_system_boottime() + get_thread_starttime();
-    } catch (...) {
-        return 0;
-    }
-}
-
 #else
 
 #define WINDOWS_TICK 10000000
 #define SEC_TO_UNIX_EPOCH 11644473600LL
-
-int64_t
-get_thread_start_timestamp() {
-    FILETIME dummy;
-    FILETIME ret;
-
-    if (GetThreadTimes(GetCurrentThread(), &ret, &dummy, &dummy, &dummy)) {
-        auto ticks = Int64ShllMod32(ret.dwHighDateTime, 32) | ret.dwLowDateTime;
-        auto thread_started = ticks / WINDOWS_TICK - SEC_TO_UNIX_EPOCH;
-        return get_now_timestamp() - thread_started;
-    }
-    return 0;
-}
 
 #endif
 

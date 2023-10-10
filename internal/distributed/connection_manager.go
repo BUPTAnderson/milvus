@@ -18,28 +18,29 @@ package distributed
 
 import (
 	"context"
-	"errors"
 	"os"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
-	"github.com/milvus-io/milvus/internal/log"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/retry"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/trace"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-
-	"go.uber.org/zap"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // ConnectionManager handles connection to other components of the system
@@ -54,8 +55,6 @@ type ConnectionManager struct {
 	queryCoordMu sync.RWMutex
 	dataCoord    datapb.DataCoordClient
 	dataCoordMu  sync.RWMutex
-	indexCoord   indexpb.IndexCoordClient
-	indexCoordMu sync.RWMutex
 	queryNodes   map[int64]querypb.QueryNodeClient
 	queryNodesMu sync.RWMutex
 	dataNodes    map[int64]datapb.DataNodeClient
@@ -123,6 +122,7 @@ func (cm *ConnectionManager) AddDependency(roleName string) error {
 
 	return nil
 }
+
 func (cm *ConnectionManager) Start() {
 	go cm.receiveFinishTask()
 }
@@ -161,18 +161,6 @@ func (cm *ConnectionManager) GetDataCoordClient() (datapb.DataCoordClient, bool)
 	}
 
 	return cm.dataCoord, true
-}
-
-func (cm *ConnectionManager) GetIndexCoordClient() (indexpb.IndexCoordClient, bool) {
-	cm.indexCoordMu.RLock()
-	defer cm.indexCoordMu.RUnlock()
-	_, ok := cm.dependencies[typeutil.IndexCoordRole]
-	if !ok {
-		log.Error("IndeCoord dependency has not been added yet")
-		return nil, false
-	}
-
-	return cm.indexCoord, true
 }
 
 func (cm *ConnectionManager) GetQueryNodeClients() (map[int64]querypb.QueryNodeClient, bool) {
@@ -221,10 +209,11 @@ func (cm *ConnectionManager) Stop() {
 	}
 }
 
-//go:norace
 // fix datarace in unittest
 // startWatchService will only be invoked at start procedure
 // otherwise, remove the annotation and add atomic protection
+//
+//go:norace
 func (cm *ConnectionManager) processEvent(channel <-chan *sessionutil.SessionEvent) {
 	for {
 		select {
@@ -291,10 +280,6 @@ func (cm *ConnectionManager) buildClients(session *sessionutil.Session, connecti
 		cm.dataCoordMu.Lock()
 		defer cm.dataCoordMu.Unlock()
 		cm.dataCoord = datapb.NewDataCoordClient(connection)
-	case typeutil.IndexCoordRole:
-		cm.indexCoordMu.Lock()
-		defer cm.indexCoordMu.Unlock()
-		cm.indexCoord = indexpb.NewIndexCoordClient(connection)
 	case typeutil.QueryCoordRole:
 		cm.queryCoordMu.Lock()
 		defer cm.queryCoordMu.Unlock()
@@ -384,7 +369,6 @@ func newBuildClientTask(session *sessionutil.Session, notify chan int64, retryOp
 
 		notify: notify,
 	}
-
 }
 
 func (bct *buildClientTask) Run() {
@@ -392,10 +376,13 @@ func (bct *buildClientTask) Run() {
 	go func() {
 		defer bct.finish()
 		connectGrpcFunc := func() error {
-			opts := trace.GetInterceptorOpts()
-			log.Debug("Grpc connect ", zap.String("Address", bct.sess.Address))
-			conn, err := grpc.DialContext(bct.ctx, bct.sess.Address,
-				grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(30*time.Second),
+			opts := tracer.GetInterceptorOpts()
+			log.Debug("Grpc connect", zap.String("Address", bct.sess.Address))
+			ctx, cancel := context.WithTimeout(bct.ctx, 30*time.Second)
+			defer cancel()
+			conn, err := grpc.DialContext(ctx, bct.sess.Address,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithBlock(),
 				grpc.WithDisableRetry(),
 				grpc.WithUnaryInterceptor(
 					grpc_middleware.ChainUnaryClient(
@@ -403,7 +390,7 @@ func (bct *buildClientTask) Run() {
 							grpc_retry.WithMax(3),
 							grpc_retry.WithCodes(codes.Aborted, codes.Unavailable),
 						),
-						grpc_opentracing.UnaryClientInterceptor(opts...),
+						otelgrpc.UnaryClientInterceptor(opts...),
 					)),
 				grpc.WithStreamInterceptor(
 					grpc_middleware.ChainStreamClient(
@@ -411,7 +398,7 @@ func (bct *buildClientTask) Run() {
 							grpc_retry.WithMax(3),
 							grpc_retry.WithCodes(codes.Aborted, codes.Unavailable),
 						),
-						grpc_opentracing.StreamClientInterceptor(opts...),
+						otelgrpc.StreamClientInterceptor(opts...),
 					)),
 			)
 			if err != nil {
@@ -432,6 +419,7 @@ func (bct *buildClientTask) Run() {
 		}
 	}()
 }
+
 func (bct *buildClientTask) Stop() {
 	bct.cancel()
 }
@@ -445,7 +433,6 @@ var roles = map[string]struct{}{
 	typeutil.RootCoordRole:  {},
 	typeutil.QueryCoordRole: {},
 	typeutil.DataCoordRole:  {},
-	typeutil.IndexCoordRole: {},
 	typeutil.QueryNodeRole:  {},
 	typeutil.DataNodeRole:   {},
 	typeutil.IndexNodeRole:  {},

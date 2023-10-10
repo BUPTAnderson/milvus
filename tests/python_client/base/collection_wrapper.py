@@ -13,7 +13,7 @@ from utils.util_log import test_log as log
 from pymilvus.orm.types import CONSISTENCY_STRONG
 from common.common_func import param_info
 
-TIMEOUT = 20
+TIMEOUT = 180
 INDEX_NAME = ""
 
 
@@ -27,7 +27,7 @@ class ApiCollectionWrapper:
     def __init__(self, active_trace=False):
         self.active_trace = active_trace
 
-    def init_collection(self, name, schema=None, using="default", shards_num=2, check_task=None, check_items=None,
+    def init_collection(self, name, schema=None, using="default", check_task=None, check_items=None,
                         active_trace=False, **kwargs):
         self.active_trace = active_trace
         consistency_level = kwargs.get("consistency_level", CONSISTENCY_STRONG)
@@ -35,10 +35,10 @@ class ApiCollectionWrapper:
 
         """ In order to distinguish the same name of collection """
         func_name = sys._getframe().f_code.co_name
-        res, is_succ = api_request([Collection, name, schema, using, shards_num], **kwargs)
+        res, is_succ = api_request([Collection, name, schema, using], **kwargs)
         self.collection = res if is_succ else None
         check_result = ResponseChecker(res, func_name, check_task, check_items, is_succ,
-                                       name=name, schema=schema, using=using, shards_num=shards_num, **kwargs).run()
+                                       name=name, schema=schema, using=using, **kwargs).run()
         return res, check_result
 
     @property
@@ -64,12 +64,20 @@ class ApiCollectionWrapper:
         return self.collection.num_entities
 
     @property
+    def num_entities_without_flush(self):
+        return self.collection.num_entities
+
+    @property
     def primary_field(self):
         return self.collection.primary_field
 
     @property
-    def _shards_num(self):
-        return self.collection._shards_num
+    def shards_num(self):
+        return self.collection.shards_num
+
+    @property
+    def aliases(self):
+        return self.collection.aliases
 
     @trace()
     def construct_from_dataframe(self, name, dataframe, check_task=None, check_items=None, **kwargs):
@@ -120,7 +128,7 @@ class ApiCollectionWrapper:
         func_name = sys._getframe().f_code.co_name
         res, check = api_request([self.collection.insert, data, partition_name], **kwargs)
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
-                                       dat=data, partition_name=partition_name,
+                                       data=data, partition_name=partition_name,
                                        **kwargs).run()
         return res, check_result
 
@@ -169,16 +177,47 @@ class ApiCollectionWrapper:
         return res, check_result
 
     @trace()
+    def search_iterator(self, data, anns_field, param, batch_size, limit=-1, expr=None,
+                        partition_names=None, output_fields=None, timeout=None, round_decimal=-1,
+                        check_task=None, check_items=None, **kwargs):
+        timeout = TIMEOUT if timeout is None else timeout
+
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([self.collection.search_iterator, data, anns_field, param, batch_size, limit,
+                                  expr, partition_names, output_fields, timeout, round_decimal], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check,
+                                       data=data, anns_field=anns_field, param=param, limit=limit,
+                                       expr=expr, partition_names=partition_names,
+                                       output_fields=output_fields,
+                                       timeout=timeout, **kwargs).run()
+        return res, check_result
+
+    @trace()
     def query(self, expr, output_fields=None, partition_names=None, timeout=None, check_task=None, check_items=None,
               **kwargs):
         # time.sleep(5)
         timeout = TIMEOUT if timeout is None else timeout
 
         func_name = sys._getframe().f_code.co_name
-        res, check = api_request([self.collection.query, expr, output_fields, partition_names, timeout])
+        res, check = api_request([self.collection.query, expr, output_fields, partition_names, timeout], **kwargs)
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        expression=expr, partition_names=partition_names,
                                        output_fields=output_fields,
+                                       timeout=timeout, **kwargs).run()
+        return res, check_result
+
+    @trace()
+    def query_iterator(self, batch_size=1000, limit=-1, expr=None, output_fields=None, partition_names=None, timeout=None,
+                       check_task=None, check_items=None, **kwargs):
+        # time.sleep(5)
+        timeout = TIMEOUT if timeout is None else timeout
+
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([self.collection.query_iterator, batch_size, limit, expr, output_fields, partition_names,
+                                  timeout], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check,
+                                       batch_size=batch_size, limit=limit, expression=expr,
+                                       output_fields=output_fields, partition_names=partition_names,
                                        timeout=timeout, **kwargs).run()
         return res, check_result
 
@@ -233,15 +272,14 @@ class ApiCollectionWrapper:
         return res, check_result
 
     @trace()
-    def create_index(self, field_name, index_params, index_name=None, check_task=None, check_items=None, **kwargs):
-        timeout = kwargs.get("timeout", TIMEOUT * 2)
+    def create_index(self, field_name, index_params=None, index_name=None, timeout=None, check_task=None, check_items=None, **kwargs):
+        timeout = 1200 if timeout is None else timeout
         index_name = INDEX_NAME if index_name is None else index_name
         index_name = kwargs.get("index_name", index_name)
-        kwargs.update({"timeout": timeout, "index_name": index_name})
+        kwargs.update({"index_name": index_name})
         func_name = sys._getframe().f_code.co_name
-        res, check = api_request([self.collection.create_index, field_name, index_params], **kwargs)
-        check_result = ResponseChecker(res, func_name, check_task, check_items, check,
-                                       field_name=field_name, index_params=index_params, **kwargs).run()
+        res, check = api_request([self.collection.create_index, field_name, index_params, timeout], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check, **kwargs).run()
         return res, check_result
 
     @trace()
@@ -306,6 +344,14 @@ class ApiCollectionWrapper:
         return res, check_result
 
     @trace()
+    def upsert(self, data, partition_name=None, timeout=None, check_task=None, check_items=None, **kwargs):
+        timeout = TIMEOUT if timeout is None else timeout
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([self.collection.upsert, data, partition_name, timeout], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check, **kwargs).run()
+        return res, check_result
+
+    @trace()
     def compact(self, timeout=None, check_task=None, check_items=None, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
         func_name = sys._getframe().f_code.co_name
@@ -313,6 +359,7 @@ class ApiCollectionWrapper:
         check_result = ResponseChecker(res, func_name, check_task, check_items, check, **kwargs).run()
         return res, check_result
 
+    @trace()
     def get_compaction_state(self, timeout=None, check_task=None, check_items=None, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
         func_name = sys._getframe().f_code.co_name
@@ -320,6 +367,7 @@ class ApiCollectionWrapper:
         check_result = ResponseChecker(res, func_name, check_task, check_items, check, **kwargs).run()
         return res, check_result
 
+    @trace()
     def get_compaction_plans(self, timeout=None, check_task=None, check_items={}, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
         func_name = sys._getframe().f_code.co_name
@@ -333,9 +381,20 @@ class ApiCollectionWrapper:
         # log.debug(res)
         return res
 
+    @trace()
     def get_replicas(self, timeout=None, check_task=None, check_items=None, **kwargs):
         timeout = TIMEOUT if timeout is None else timeout
         func_name = sys._getframe().f_code.co_name
         res, check = api_request([self.collection.get_replicas, timeout], **kwargs)
         check_result = ResponseChecker(res, func_name, check_task, check_items, check, **kwargs).run()
         return res, check_result
+
+    @trace()
+    def describe(self, timeout=None, check_task=None, check_items=None):
+        timeout = TIMEOUT if timeout is None else timeout
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([self.collection.describe, timeout])
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check).run()
+        return res, check_result
+
+

@@ -14,25 +14,73 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <memory>
 #include <mutex>
 
 #include "common/init_c.h"
 
 #include <string>
-#include "config/ConfigChunkManager.h"
 #include "common/Slice.h"
+#include "common/Common.h"
+#include "common/Tracer.h"
+#include "log/Log.h"
 
-std::once_flag flag1, flag2;
-
-void
-InitLocalRootPath(const char* root_path) {
-    std::string local_path_root(root_path);
-    std::call_once(
-        flag1, [](std::string path) { milvus::ChunkMangerConfig::SetLocalRootPath(path); }, local_path_root);
-}
+std::once_flag flag1, flag2, flag3, flag4, flag5;
+std::once_flag traceFlag;
 
 void
 InitIndexSliceSize(const int64_t size) {
     std::call_once(
-        flag2, [](int64_t size) { milvus::SetIndexSliceSize(size); }, size);
+        flag1, [](int64_t size) { milvus::SetIndexSliceSize(size); }, size);
+}
+
+void
+InitHighPriorityThreadCoreCoefficient(const int64_t value) {
+    std::call_once(
+        flag2,
+        [](int64_t value) {
+            milvus::SetHighPriorityThreadCoreCoefficient(value);
+        },
+        value);
+}
+
+void
+InitMiddlePriorityThreadCoreCoefficient(const int64_t value) {
+    std::call_once(
+        flag4,
+        [](int64_t value) {
+            milvus::SetMiddlePriorityThreadCoreCoefficient(value);
+        },
+        value);
+}
+
+void
+InitLowPriorityThreadCoreCoefficient(const int64_t value) {
+    std::call_once(
+        flag5,
+        [](int64_t value) {
+            milvus::SetLowPriorityThreadCoreCoefficient(value);
+        },
+        value);
+}
+
+void
+InitCpuNum(const int value) {
+    std::call_once(
+        flag3, [](int value) { milvus::SetCpuNum(value); }, value);
+}
+
+void
+InitTrace(CTraceConfig* config) {
+    auto traceConfig = milvus::tracer::TraceConfig{config->exporter,
+                                                   config->sampleFraction,
+                                                   config->jaegerURL,
+                                                   config->otlpEndpoint,
+                                                   config->nodeID};
+    std::call_once(
+        traceFlag,
+        [](milvus::tracer::TraceConfig* c) {
+            milvus::tracer::initTelementry(c);
+        },
+        &traceConfig);
 }

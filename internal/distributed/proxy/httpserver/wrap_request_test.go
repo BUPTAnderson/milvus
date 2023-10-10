@@ -4,16 +4,17 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
 
 func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("varchar_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_VarChar,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -23,7 +24,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("varchar_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_VarChar,
-			Field: []interface{}{1, 2, 3},
+			Field: []byte("[1, 2, 3]"),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -33,7 +34,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("bool_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Bool,
-			Field: []interface{}{true, true, false},
+			Field: []byte("[true, true, false]"),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -43,7 +44,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("bool_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Bool,
-			Field: []interface{}{1, 2, 3},
+			Field: []byte("[1, 2, 3]"),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -54,7 +55,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("int8_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Int8,
-			Field: []interface{}{1, 2, 3},
+			Field: []byte("[1, 2, 3]"),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -64,7 +65,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("int8_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Int8,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -74,7 +75,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("int32_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Int32,
-			Field: []interface{}{1, 2, 3},
+			Field: []byte("[1, 2, 3]"),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -84,7 +85,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("int32_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Int32,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -94,7 +95,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("int64_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Int64,
-			Field: []interface{}{1, 2, 3},
+			Field: []byte("[1, 2, 3]"),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -104,7 +105,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("int64_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Int64,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -114,7 +115,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("float_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Float,
-			Field: []interface{}{1.1, 2.1, 3.1},
+			Field: []byte(`[1.1, 2.1, 3.1]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -124,7 +125,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("float_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Float,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -134,7 +135,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("double_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Double,
-			Field: []interface{}{1.1, 2.1, 3.1},
+			Field: []byte(`[1.1, 2.1, 3.1]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -144,7 +145,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("double_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Double,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -154,7 +155,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("string_not_support", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_String,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -167,11 +168,11 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("floatvector_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type: schemapb.DataType_FloatVector,
-			Field: []interface{}{
-				[]float32{1.1, 2.2, 3.1},
-				[]float32{1.1, 2.2, 3.1},
-				[]float32{1.1, 2.2, 3.1},
-			},
+			Field: []byte(`[
+				[1.1, 2.2, 3.1],
+				[1.1, 2.2, 3.1],
+				[1.1, 2.2, 3.1]
+			]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -181,7 +182,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("floatvector_empty_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_FloatVector,
-			Field: []interface{}{},
+			Field: []byte(""),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -190,10 +191,8 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	})
 	t.Run("floatvector_dim=0_error", func(t *testing.T) {
 		fieldData := FieldData{
-			Type: schemapb.DataType_FloatVector,
-			Field: []interface{}{
-				[]float32{},
-			},
+			Type:  schemapb.DataType_FloatVector,
+			Field: []byte(`[]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -202,10 +201,8 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	})
 	t.Run("floatvector_vectorTypeError_error", func(t *testing.T) {
 		fieldData := FieldData{
-			Type: schemapb.DataType_FloatVector,
-			Field: []interface{}{
-				[]string{"1"},
-			},
+			Type:  schemapb.DataType_FloatVector,
+			Field: []byte(`["1"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
@@ -215,7 +212,7 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	t.Run("floatvector_error", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_FloatVector,
-			Field: []interface{}{"a", "b", "c"},
+			Field: []byte(`["a", "b", "c"]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)

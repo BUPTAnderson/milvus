@@ -2,15 +2,16 @@ package httpserver
 
 import (
 	"encoding/binary"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"math"
-	"reflect"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
 
 // We wrap original protobuf structure for 2 reasons:
@@ -51,35 +52,46 @@ type WrappedInsertRequest struct {
 	NumRows        uint32            `json:"num_rows,omitempty"`
 }
 
+func (w *WrappedInsertRequest) AsInsertRequest() (*milvuspb.InsertRequest, error) {
+	fieldData, err := convertFieldDataArray(w.FieldsData)
+	if err != nil {
+		return nil, fmt.Errorf("%w: convert field data failed: %v", errBadRequest, err)
+	}
+	return &milvuspb.InsertRequest{
+		Base:           w.Base,
+		DbName:         w.DbName,
+		CollectionName: w.CollectionName,
+		PartitionName:  w.PartitionName,
+		FieldsData:     fieldData,
+		HashKeys:       w.HashKeys,
+		NumRows:        w.NumRows,
+	}, nil
+}
+
 // FieldData is the field data in RESTful request that can be convertd to schemapb.FieldData
 type FieldData struct {
 	Type      schemapb.DataType `json:"type,omitempty"`
 	FieldName string            `json:"field_name,omitempty"`
-	Field     []interface{}     `json:"field,omitempty"`
+	Field     json.RawMessage   `json:"field,omitempty"` // we use postpone the unmarshal until we know the type
 	FieldID   int64             `json:"field_id,omitempty"`
 }
 
 // AsSchemapb converts the FieldData to schemapb.FieldData
-func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
+func (f *FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 	// is scarlar
 	ret := schemapb.FieldData{
 		Type:      f.Type,
 		FieldName: f.FieldName,
 		FieldId:   f.FieldID,
 	}
+
 	raw := f.Field
 	switch f.Type {
 	case schemapb.DataType_Bool:
-		// its an array in definition, so we only need to check the type of first element
-		if len(raw) > 0 {
-			_, ok := raw[0].(bool)
-			if !ok {
-				return nil, newTypeError(raw[0])
-			}
-		}
-		data := make([]bool, len(raw))
-		for i, v := range raw {
-			data[i] = v.(bool)
+		data := []bool{}
+		err := json.Unmarshal(raw, &data)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
 		}
 		ret.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
@@ -91,15 +103,10 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 			},
 		}
 	case schemapb.DataType_VarChar:
-		if len(raw) > 0 {
-			_, ok := raw[0].(string)
-			if !ok {
-				return nil, newTypeError(raw[0])
-			}
-		}
-		data := make([]string, len(raw))
-		for i, v := range raw {
-			data[i] = v.(string)
+		data := []string{}
+		err := json.Unmarshal(raw, &data)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
 		}
 		ret.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
@@ -111,15 +118,10 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 			},
 		}
 	case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
-		if len(raw) > 0 {
-			_, ok := raw[0].(float64)
-			if !ok {
-				return nil, newTypeError(raw[0])
-			}
-		}
-		data := make([]int32, len(raw))
-		for i, v := range raw {
-			data[i] = int32(v.(float64))
+		data := []int32{}
+		err := json.Unmarshal(raw, &data)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
 		}
 		ret.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
@@ -131,15 +133,10 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 			},
 		}
 	case schemapb.DataType_Int64:
-		if len(raw) > 0 {
-			_, ok := raw[0].(float64)
-			if !ok {
-				return nil, newTypeError(raw[0])
-			}
-		}
-		data := make([]int64, len(raw))
-		for i, v := range raw {
-			data[i] = int64(v.(float64))
+		data := []int64{}
+		err := json.Unmarshal(raw, &data)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
 		}
 		ret.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
@@ -151,15 +148,10 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 			},
 		}
 	case schemapb.DataType_Float:
-		if len(raw) > 0 {
-			_, ok := raw[0].(float64)
-			if !ok {
-				return nil, newTypeError(raw[0])
-			}
-		}
-		data := make([]float32, len(raw))
-		for i, v := range raw {
-			data[i] = float32(v.(float64))
+		data := []float32{}
+		err := json.Unmarshal(raw, &data)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
 		}
 		ret.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
@@ -172,15 +164,10 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 		}
 
 	case schemapb.DataType_Double:
-		if len(raw) > 0 {
-			_, ok := raw[0].(float64)
-			if !ok {
-				return nil, newTypeError(raw[0])
-			}
-		}
-		data := make([]float64, len(raw))
-		for i, v := range raw {
-			data[i] = v.(float64)
+		data := []float64{}
+		err := json.Unmarshal(raw, &data)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
 		}
 		ret.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
@@ -193,28 +180,25 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 		}
 
 	case schemapb.DataType_FloatVector:
-		if len(raw) < 1 {
+		wrappedData := [][]float32{}
+		err := json.Unmarshal(raw, &wrappedData)
+		if err != nil {
+			return nil, newFieldDataError(f.FieldName, err)
+		}
+		if len(wrappedData) < 1 {
 			return nil, errors.New("at least one row for insert")
 		}
-		rawArray0, ok := raw[0].([]interface{})
-		if !ok {
-			return nil, newTypeError(raw[0])
-		}
-		dim := len(rawArray0)
+		array0 := wrappedData[0]
+		dim := len(array0)
 		if dim < 1 {
 			return nil, errors.New("dim must >= 1")
 		}
-		_, ok = rawArray0[0].(float64)
-		if !ok {
-			return nil, newTypeError(rawArray0[0])
-		}
-
-		data := make([]float32, len(raw)*dim)
+		data := make([]float32, len(wrappedData)*dim)
 
 		var i int
-		for _, rawArray := range raw {
-			for _, v := range rawArray.([]interface{}) {
-				data[i] = float32(v.(float64))
+		for _, dataArray := range wrappedData {
+			for _, v := range dataArray {
+				data[i] = v
 				i++
 			}
 		}
@@ -234,8 +218,8 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 	return &ret, nil
 }
 
-func newTypeError(t interface{}) error {
-	return fmt.Errorf("field type[%s] error", reflect.TypeOf(t).String())
+func newFieldDataError(field string, err error) error {
+	return fmt.Errorf("parse field[%s]: %s", field, err.Error())
 }
 
 func convertFieldDataArray(input []*FieldData) ([]*schemapb.FieldData, error) {
@@ -335,16 +319,16 @@ type VectorsArray struct {
 	IDs *VectorIDs `json:"ids,omitempty"`
 }
 
-func (v VectorsArray) isIDs() bool {
+func (v *VectorsArray) isIDs() bool {
 	return v.IDs != nil
 }
 
-func (v VectorsArray) isBinaryVector() bool {
+func (v *VectorsArray) isBinaryVector() bool {
 	return v.IDs == nil && len(v.BinaryVectors) > 0
 }
 
 // AsPbVectorArray convert as milvuspb.VectorArray
-func (v VectorsArray) AsPbVectorArray() *milvuspb.VectorsArray {
+func (v *VectorsArray) AsPbVectorArray() *milvuspb.VectorsArray {
 	ret := &milvuspb.VectorsArray{}
 	switch {
 	case v.isIDs():

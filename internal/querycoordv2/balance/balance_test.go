@@ -19,11 +19,12 @@ package balance
 import (
 	"testing"
 
+	"github.com/stretchr/testify/suite"
+
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
-	"github.com/stretchr/testify/suite"
 )
 
 type BalanceTestSuite struct {
@@ -43,15 +44,17 @@ func (suite *BalanceTestSuite) TestAssignBalance() {
 		name        string
 		nodeIDs     []int64
 		segmentCnts []int
+		states      []session.State
 		deltaCnts   []int
 		assignments []*meta.Segment
 		expectPlans []SegmentAssignPlan
 	}{
 		{
 			name:        "normal assignment",
-			nodeIDs:     []int64{1, 2},
-			segmentCnts: []int{100, 200},
-			deltaCnts:   []int{0, -200},
+			nodeIDs:     []int64{1, 2, 3},
+			states:      []session.State{session.NodeStateNormal, session.NodeStateNormal, session.NodeStateStopping},
+			segmentCnts: []int{100, 200, 0},
+			deltaCnts:   []int{0, -200, 0},
 			assignments: []*meta.Segment{
 				{SegmentInfo: &datapb.SegmentInfo{ID: 1}},
 				{SegmentInfo: &datapb.SegmentInfo{ID: 2}},
@@ -67,6 +70,7 @@ func (suite *BalanceTestSuite) TestAssignBalance() {
 			name:        "empty assignment",
 			nodeIDs:     []int64{},
 			segmentCnts: []int{},
+			states:      []session.State{},
 			deltaCnts:   []int{},
 			assignments: []*meta.Segment{
 				{SegmentInfo: &datapb.SegmentInfo{ID: 1}},
@@ -83,10 +87,13 @@ func (suite *BalanceTestSuite) TestAssignBalance() {
 			for i := range c.nodeIDs {
 				nodeInfo := session.NewNodeInfo(c.nodeIDs[i], "127.0.0.1:0")
 				nodeInfo.UpdateStats(session.WithSegmentCnt(c.segmentCnts[i]))
+				nodeInfo.SetState(c.states[i])
 				suite.roundRobinBalancer.nodeManager.Add(nodeInfo)
-				suite.mockScheduler.EXPECT().GetNodeSegmentDelta(c.nodeIDs[i]).Return(c.deltaCnts[i])
+				if !nodeInfo.IsStoppingState() {
+					suite.mockScheduler.EXPECT().GetNodeSegmentDelta(c.nodeIDs[i]).Return(c.deltaCnts[i])
+				}
 			}
-			plans := suite.roundRobinBalancer.AssignSegment(c.assignments, c.nodeIDs)
+			plans := suite.roundRobinBalancer.AssignSegment(0, c.assignments, c.nodeIDs)
 			suite.ElementsMatch(c.expectPlans, plans)
 		})
 	}
@@ -97,15 +104,17 @@ func (suite *BalanceTestSuite) TestAssignChannel() {
 		name        string
 		nodeIDs     []int64
 		channelCnts []int
+		states      []session.State
 		deltaCnts   []int
 		assignments []*meta.DmChannel
 		expectPlans []ChannelAssignPlan
 	}{
 		{
 			name:        "normal assignment",
-			nodeIDs:     []int64{1, 2},
-			channelCnts: []int{100, 200},
-			deltaCnts:   []int{0, -200},
+			nodeIDs:     []int64{1, 2, 3},
+			channelCnts: []int{100, 200, 0},
+			states:      []session.State{session.NodeStateNormal, session.NodeStateNormal, session.NodeStateStopping},
+			deltaCnts:   []int{0, -200, 0},
 			assignments: []*meta.DmChannel{
 				{VchannelInfo: &datapb.VchannelInfo{ChannelName: "channel-1"}},
 				{VchannelInfo: &datapb.VchannelInfo{ChannelName: "channel-2"}},
@@ -121,6 +130,7 @@ func (suite *BalanceTestSuite) TestAssignChannel() {
 			name:        "empty assignment",
 			nodeIDs:     []int64{},
 			channelCnts: []int{},
+			states:      []session.State{},
 			deltaCnts:   []int{},
 			assignments: []*meta.DmChannel{
 				{VchannelInfo: &datapb.VchannelInfo{ChannelName: "channel-1"}},
@@ -137,8 +147,11 @@ func (suite *BalanceTestSuite) TestAssignChannel() {
 			for i := range c.nodeIDs {
 				nodeInfo := session.NewNodeInfo(c.nodeIDs[i], "127.0.0.1:0")
 				nodeInfo.UpdateStats(session.WithChannelCnt(c.channelCnts[i]))
+				nodeInfo.SetState(c.states[i])
 				suite.roundRobinBalancer.nodeManager.Add(nodeInfo)
-				suite.mockScheduler.EXPECT().GetNodeChannelDelta(c.nodeIDs[i]).Return(c.deltaCnts[i])
+				if !nodeInfo.IsStoppingState() {
+					suite.mockScheduler.EXPECT().GetNodeChannelDelta(c.nodeIDs[i]).Return(c.deltaCnts[i])
+				}
 			}
 			plans := suite.roundRobinBalancer.AssignChannel(c.assignments, c.nodeIDs)
 			suite.ElementsMatch(c.expectPlans, plans)

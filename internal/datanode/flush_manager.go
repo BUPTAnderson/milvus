@@ -18,36 +18,43 @@ package datanode
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"strconv"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/metrics"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-	"github.com/milvus-io/milvus/internal/util/metautil"
-	"github.com/milvus-io/milvus/internal/util/retry"
-	"github.com/milvus-io/milvus/internal/util/timerecord"
-	"github.com/samber/lo"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metautil"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // flushManager defines a flush manager signature
 type flushManager interface {
 	// notify flush manager insert buffer data
-	flushBufferData(data *BufferData, segStats []byte, segmentID UniqueID, flushed bool, dropped bool, pos *internalpb.MsgPosition) error
+	flushBufferData(data *BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) (*storage.PrimaryKeyStats, error)
 	// notify flush manager del buffer data
-	flushDelData(data *DelDataBuf, segmentID UniqueID, pos *internalpb.MsgPosition) error
+	flushDelData(data *DelDataBuf, segmentID UniqueID, pos *msgpb.MsgPosition) error
+	// isFull return true if the task pool is full
+	isFull() bool
 	// injectFlush injects compaction or other blocking task before flush sync
 	injectFlush(injection *taskInjection, segments ...UniqueID)
 	// startDropping changes flush manager into dropping mode
@@ -64,7 +71,7 @@ type segmentFlushPack struct {
 	insertLogs map[UniqueID]*datapb.Binlog
 	statsLogs  map[UniqueID]*datapb.Binlog
 	deltaLogs  []*datapb.Binlog
-	pos        *internalpb.MsgPosition
+	pos        *msgpb.MsgPosition
 	flushed    bool
 	dropped    bool
 	err        error // task execution error, if not nil, notify func should stop datanode
@@ -92,7 +99,7 @@ type orderFlushQueue struct {
 	injectCh  chan *taskInjection
 
 	// MsgID => flushTask
-	working    sync.Map
+	working    *typeutil.ConcurrentMap[string, *flushTaskRunner]
 	notifyFunc notifyMetaFunc
 
 	tailMut sync.Mutex
@@ -109,6 +116,7 @@ func newOrderFlushQueue(segID UniqueID, f notifyMetaFunc) *orderFlushQueue {
 		segmentID:  segID,
 		notifyFunc: f,
 		injectCh:   make(chan *taskInjection, 100),
+		working:    typeutil.NewConcurrentMap[string, *flushTaskRunner](),
 	}
 	return q
 }
@@ -122,9 +130,8 @@ func (q *orderFlushQueue) init() {
 	})
 }
 
-func (q *orderFlushQueue) getFlushTaskRunner(pos *internalpb.MsgPosition) *flushTaskRunner {
-	actual, loaded := q.working.LoadOrStore(string(pos.GetMsgID()), newFlushTaskRunner(q.segmentID, q.injectCh))
-	t := actual.(*flushTaskRunner)
+func (q *orderFlushQueue) getFlushTaskRunner(pos *msgpb.MsgPosition) *flushTaskRunner {
+	t, loaded := q.working.GetOrInsert(getSyncTaskID(pos), newFlushTaskRunner(q.segmentID, q.injectCh))
 	// not loaded means the task runner is new, do initializtion
 	if !loaded {
 		// take over injection if task queue is handling it
@@ -137,7 +144,7 @@ func (q *orderFlushQueue) getFlushTaskRunner(pos *internalpb.MsgPosition) *flush
 		q.tailCh = t.finishSignal
 		q.tailMut.Unlock()
 		log.Info("new flush task runner created and initialized",
-			zap.Int64("segment ID", q.segmentID),
+			zap.Int64("segmentID", q.segmentID),
 			zap.String("pos message ID", string(pos.GetMsgID())),
 		)
 	}
@@ -147,7 +154,7 @@ func (q *orderFlushQueue) getFlushTaskRunner(pos *internalpb.MsgPosition) *flush
 // postTask handles clean up work after a task is done
 func (q *orderFlushQueue) postTask(pack *segmentFlushPack, postInjection postInjectionFunc) {
 	// delete task from working map
-	q.working.Delete(string(pack.pos.MsgID))
+	q.working.GetAndRemove(getSyncTaskID(pack.pos))
 	// after descreasing working count, check whether flush queue is empty
 	q.injectMut.Lock()
 	q.runningTasks--
@@ -172,12 +179,12 @@ func (q *orderFlushQueue) postTask(pack *segmentFlushPack, postInjection postInj
 }
 
 // enqueueInsertBuffer put insert buffer data into queue
-func (q *orderFlushQueue) enqueueInsertFlush(task flushInsertTask, binlogs, statslogs map[UniqueID]*datapb.Binlog, flushed bool, dropped bool, pos *internalpb.MsgPosition) {
+func (q *orderFlushQueue) enqueueInsertFlush(task flushInsertTask, binlogs, statslogs map[UniqueID]*datapb.Binlog, flushed bool, dropped bool, pos *msgpb.MsgPosition) {
 	q.getFlushTaskRunner(pos).runFlushInsert(task, binlogs, statslogs, flushed, dropped, pos)
 }
 
 // enqueueDelBuffer put delete buffer data into queue
-func (q *orderFlushQueue) enqueueDelFlush(task flushDeleteTask, deltaLogs *DelDataBuf, pos *internalpb.MsgPosition) {
+func (q *orderFlushQueue) enqueueDelFlush(task flushDeleteTask, deltaLogs *DelDataBuf, pos *msgpb.MsgPosition) {
 	q.getFlushTaskRunner(pos).runFlushDel(task, deltaLogs)
 }
 
@@ -261,12 +268,12 @@ type dropHandler struct {
 
 // rendezvousFlushManager makes sure insert & del buf all flushed
 type rendezvousFlushManager struct {
-	allocatorInterface
+	allocator.Allocator
 	storage.ChunkManager
 	Channel
 
 	// segment id => flush queue
-	dispatcher sync.Map
+	dispatcher *typeutil.ConcurrentMap[int64, *orderFlushQueue]
 	notifyFunc notifyMetaFunc
 
 	dropping    atomic.Bool
@@ -276,16 +283,14 @@ type rendezvousFlushManager struct {
 // getFlushQueue gets or creates an orderFlushQueue for segment id if not found
 func (m *rendezvousFlushManager) getFlushQueue(segmentID UniqueID) *orderFlushQueue {
 	newQueue := newOrderFlushQueue(segmentID, m.notifyFunc)
-	actual, _ := m.dispatcher.LoadOrStore(segmentID, newQueue)
-	// all operation on dispatcher is private, assertion ok guaranteed
-	queue := actual.(*orderFlushQueue)
+	queue, _ := m.dispatcher.GetOrInsert(segmentID, newQueue)
 	queue.init()
 	return queue
 }
 
-func (m *rendezvousFlushManager) handleInsertTask(segmentID UniqueID, task flushInsertTask, binlogs, statslogs map[UniqueID]*datapb.Binlog, flushed bool, dropped bool, pos *internalpb.MsgPosition) {
+func (m *rendezvousFlushManager) handleInsertTask(segmentID UniqueID, task flushInsertTask, binlogs, statslogs map[UniqueID]*datapb.Binlog, flushed bool, dropped bool, pos *msgpb.MsgPosition) {
 	log.Info("handling insert task",
-		zap.Int64("segment ID", segmentID),
+		zap.Int64("segmentID", segmentID),
 		zap.Bool("flushed", flushed),
 		zap.Bool("dropped", dropped),
 		zap.Any("position", pos),
@@ -310,12 +315,13 @@ func (m *rendezvousFlushManager) handleInsertTask(segmentID UniqueID, task flush
 	m.getFlushQueue(segmentID).enqueueInsertFlush(task, binlogs, statslogs, flushed, dropped, pos)
 }
 
-func (m *rendezvousFlushManager) handleDeleteTask(segmentID UniqueID, task flushDeleteTask, deltaLogs *DelDataBuf, pos *internalpb.MsgPosition) {
+func (m *rendezvousFlushManager) handleDeleteTask(segmentID UniqueID, task flushDeleteTask, deltaLogs *DelDataBuf, pos *msgpb.MsgPosition) {
+	log.Info("handling delete task", zap.Int64("segmentID", segmentID))
 	// in dropping mode
 	if m.dropping.Load() {
 		// preventing separate delete, check position exists in queue first
 		q := m.getFlushQueue(segmentID)
-		_, ok := q.working.Load(string(pos.MsgID))
+		_, ok := q.working.Get(getSyncTaskID(pos))
 		// if ok, means position insert data already in queue, just handle task in normal mode
 		// if not ok, means the insert buf should be handle in drop mode
 		if !ok {
@@ -337,59 +343,139 @@ func (m *rendezvousFlushManager) handleDeleteTask(segmentID UniqueID, task flush
 	m.getFlushQueue(segmentID).enqueueDelFlush(task, deltaLogs, pos)
 }
 
-// flushBufferData notifies flush manager insert buffer data.
-// This method will be retired on errors. Final errors will be propagated upstream and logged.
-func (m *rendezvousFlushManager) flushBufferData(data *BufferData, segStats []byte, segmentID UniqueID, flushed bool,
-	dropped bool, pos *internalpb.MsgPosition) error {
-	tr := timerecord.NewTimeRecorder("flushDuration")
-	// empty flush
+func (m *rendezvousFlushManager) serializeBinLog(segmentID, partID int64, data *BufferData, inCodec *storage.InsertCodec) ([]*Blob, map[int64]int, error) {
+	fieldMemorySize := make(map[int64]int)
+
 	if data == nil || data.buffer == nil {
-		//m.getFlushQueue(segmentID).enqueueInsertFlush(&flushBufferInsertTask{},
-		//	map[UniqueID]string{}, map[UniqueID]string{}, flushed, dropped, pos)
-		m.handleInsertTask(segmentID, &flushBufferInsertTask{}, map[UniqueID]*datapb.Binlog{}, map[UniqueID]*datapb.Binlog{},
-			flushed, dropped, pos)
-		return nil
+		return []*Blob{}, fieldMemorySize, nil
 	}
 
-	collID, partID, meta, err := m.getSegmentMeta(segmentID, pos)
-	if err != nil {
-		return err
-	}
 	// get memory size of buffer data
-	fieldMemorySize := make(map[int64]int)
 	for fieldID, fieldData := range data.buffer.Data {
 		fieldMemorySize[fieldID] = fieldData.GetMemorySize()
 	}
 
 	// encode data and convert output data
-	inCodec := storage.NewInsertCodec(meta)
-
-	binLogs, _, err := inCodec.Serialize(partID, segmentID, data.buffer)
+	blobs, err := inCodec.Serialize(partID, segmentID, data.buffer)
 	if err != nil {
-		return err
+		return nil, nil, err
+	}
+	return blobs, fieldMemorySize, nil
+}
+
+func (m *rendezvousFlushManager) serializePkStatsLog(segmentID int64, flushed bool, data *BufferData, inCodec *storage.InsertCodec) (*Blob, *storage.PrimaryKeyStats, error) {
+	var err error
+	var stats *storage.PrimaryKeyStats
+
+	pkField := getPKField(inCodec.Schema)
+	if pkField == nil {
+		log.Error("No pk field in schema", zap.Int64("segmentID", segmentID), zap.Int64("collectionID", inCodec.Schema.GetID()))
+		return nil, nil, fmt.Errorf("no primary key in meta")
 	}
 
-	// binlogs + 1 statslog
-	start, _, err := m.allocIDBatch(uint32(len(binLogs) + 1))
-	if err != nil {
-		return err
+	var insertData storage.FieldData
+	rowNum := int64(0)
+	if data != nil && data.buffer != nil {
+		insertData = data.buffer.Data[pkField.FieldID]
+		rowNum = int64(insertData.RowNum())
+		if insertData.RowNum() > 0 {
+			// gen stats of buffer insert data
+			stats = storage.NewPrimaryKeyStats(pkField.FieldID, int64(pkField.DataType), rowNum)
+			stats.UpdateByMsgs(insertData)
+		}
 	}
 
-	field2Insert := make(map[UniqueID]*datapb.Binlog, len(binLogs))
-	kvs := make(map[string][]byte, len(binLogs))
-	field2Logidx := make(map[UniqueID]UniqueID, len(binLogs))
-	for idx, blob := range binLogs {
+	// get all stats log as a list, serialize to blob
+	// if flushed
+	if flushed {
+		seg := m.getSegment(segmentID)
+		if seg == nil {
+			return nil, nil, merr.WrapErrSegmentNotFound(segmentID)
+		}
+
+		statsList, oldRowNum := seg.getHistoricalStats(pkField)
+		if stats != nil {
+			statsList = append(statsList, stats)
+		}
+
+		blob, err := inCodec.SerializePkStatsList(statsList, oldRowNum+rowNum)
+		if err != nil {
+			return nil, nil, err
+		}
+		return blob, stats, nil
+	}
+
+	if rowNum == 0 {
+		return nil, nil, nil
+	}
+
+	// only serialize stats gen from new insert data
+	// if not flush
+	blob, err := inCodec.SerializePkStats(stats, rowNum)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return blob, stats, nil
+}
+
+// isFull return true if the task pool is full
+func (m *rendezvousFlushManager) isFull() bool {
+	var num int
+	m.dispatcher.Range(func(_ int64, queue *orderFlushQueue) bool {
+		num += queue.working.Len()
+		return true
+	})
+	return num >= Params.DataNodeCfg.MaxParallelSyncTaskNum.GetAsInt()
+}
+
+// flushBufferData notifies flush manager insert buffer data.
+// This method will be retired on errors. Final errors will be propagated upstream and logged.
+func (m *rendezvousFlushManager) flushBufferData(data *BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) (*storage.PrimaryKeyStats, error) {
+	field2Insert := make(map[UniqueID]*datapb.Binlog)
+	field2Stats := make(map[UniqueID]*datapb.Binlog)
+	kvs := make(map[string][]byte)
+
+	tr := timerecord.NewTimeRecorder("flushDuration")
+	// get segment info
+	collID, partID, meta, err := m.getSegmentMeta(segmentID, pos)
+	if err != nil {
+		return nil, err
+	}
+	inCodec := storage.NewInsertCodecWithSchema(meta)
+	// build bin log blob
+	binLogBlobs, fieldMemorySize, err := m.serializeBinLog(segmentID, partID, data, inCodec)
+	if err != nil {
+		return nil, err
+	}
+
+	// build stats log blob
+	pkStatsBlob, stats, err := m.serializePkStatsLog(segmentID, flushed, data, inCodec)
+	if err != nil {
+		return nil, err
+	}
+
+	// allocate
+	// alloc for stats log if have new stats log and not flushing
+	var logidx int64
+	allocNum := uint32(len(binLogBlobs) + boolToInt(!flushed && pkStatsBlob != nil))
+	if allocNum != 0 {
+		logidx, _, err = m.Alloc(allocNum)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// binlogs
+	for _, blob := range binLogBlobs {
+		defer func() { logidx++ }()
 		fieldID, err := strconv.ParseInt(blob.GetKey(), 10, 64)
 		if err != nil {
 			log.Error("Flush failed ... cannot parse string to fieldID ..", zap.Error(err))
-			return err
+			return nil, err
 		}
 
-		logidx := start + int64(idx)
-
-		// no error raise if alloc=false
 		k := metautil.JoinIDPath(collID, partID, segmentID, fieldID, logidx)
-
 		// [rootPath]/[insert_log]/key
 		key := path.Join(m.ChunkManager.RootPath(), common.SegmentInsertLogPath, k)
 		kvs[key] = blob.Value[:]
@@ -400,29 +486,34 @@ func (m *rendezvousFlushManager) flushBufferData(data *BufferData, segStats []by
 			LogPath:       key,
 			LogSize:       int64(fieldMemorySize[fieldID]),
 		}
-		field2Logidx[fieldID] = logidx
 	}
 
-	field2Stats := make(map[UniqueID]*datapb.Binlog)
-	// write stats binlog
-
-	// if segStats content is not nil, means segment stats changed
-	if len(segStats) > 0 {
-		pkID := getPKID(meta)
-		if pkID == common.InvalidFieldID {
-			return fmt.Errorf("failed to get pk id for segment %d", segmentID)
+	// pk stats binlog
+	if pkStatsBlob != nil {
+		fieldID, err := strconv.ParseInt(pkStatsBlob.GetKey(), 10, 64)
+		if err != nil {
+			log.Error("Flush failed ... cannot parse string to fieldID ..", zap.Error(err))
+			return nil, err
 		}
 
-		logidx := start + int64(len(binLogs))
-		k := metautil.JoinIDPath(collID, partID, segmentID, pkID, logidx)
-		key := path.Join(m.ChunkManager.RootPath(), common.SegmentStatslogPath, k)
-		kvs[key] = segStats
-		field2Stats[pkID] = &datapb.Binlog{
+		// use storage.FlushedStatsLogIdx as logidx if flushed
+		// else use last idx we allocated
+		var key string
+		if flushed {
+			k := metautil.JoinIDPath(collID, partID, segmentID, fieldID)
+			key = path.Join(m.ChunkManager.RootPath(), common.SegmentStatslogPath, k, storage.CompoundStatsType.LogIdx())
+		} else {
+			k := metautil.JoinIDPath(collID, partID, segmentID, fieldID, logidx)
+			key = path.Join(m.ChunkManager.RootPath(), common.SegmentStatslogPath, k)
+		}
+
+		kvs[key] = pkStatsBlob.Value
+		field2Stats[fieldID] = &datapb.Binlog{
 			EntriesNum:    0,
-			TimestampFrom: 0, //TODO
-			TimestampTo:   0, //TODO,
+			TimestampFrom: 0, // TODO
+			TimestampTo:   0, // TODO,
 			LogPath:       key,
-			LogSize:       int64(len(segStats)),
+			LogSize:       int64(len(pkStatsBlob.Value)),
 		}
 	}
 
@@ -431,14 +522,14 @@ func (m *rendezvousFlushManager) flushBufferData(data *BufferData, segStats []by
 		data:         kvs,
 	}, field2Insert, field2Stats, flushed, dropped, pos)
 
-	metrics.DataNodeEncodeBufferLatency.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID())).Observe(float64(tr.ElapseSpan().Milliseconds()))
-	return nil
+	metrics.DataNodeEncodeBufferLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	return stats, nil
 }
 
 // notify flush manager del buffer data
 func (m *rendezvousFlushManager) flushDelData(data *DelDataBuf, segmentID UniqueID,
-	pos *internalpb.MsgPosition) error {
-
+	pos *msgpb.MsgPosition,
+) error {
 	// del signal with empty data
 	if data == nil || data.delData == nil {
 		m.handleDeleteTask(segmentID, &flushBufferDeleteTask{}, nil, pos)
@@ -457,7 +548,7 @@ func (m *rendezvousFlushManager) flushDelData(data *DelDataBuf, segmentID Unique
 		return err
 	}
 
-	logID, err := m.allocID()
+	logID, err := m.AllocOne()
 	if err != nil {
 		log.Error("failed to alloc ID", zap.Error(err))
 		return err
@@ -485,9 +576,9 @@ func (m *rendezvousFlushManager) injectFlush(injection *taskInjection, segments 
 }
 
 // fetch meta info for segment
-func (m *rendezvousFlushManager) getSegmentMeta(segmentID UniqueID, pos *internalpb.MsgPosition) (UniqueID, UniqueID, *etcdpb.CollectionMeta, error) {
+func (m *rendezvousFlushManager) getSegmentMeta(segmentID UniqueID, pos *msgpb.MsgPosition) (UniqueID, UniqueID, *etcdpb.CollectionMeta, error) {
 	if !m.hasSegment(segmentID, true) {
-		return -1, -1, nil, fmt.Errorf("no such segment %d in the channel", segmentID)
+		return -1, -1, nil, merr.WrapErrSegmentNotFound(segmentID, "segment not found during flush")
 	}
 
 	// fetch meta information of segment
@@ -510,8 +601,7 @@ func (m *rendezvousFlushManager) getSegmentMeta(segmentID UniqueID, pos *interna
 // waitForAllTaskQueue waits for all flush queues in dispatcher become empty
 func (m *rendezvousFlushManager) waitForAllFlushQueue() {
 	var wg sync.WaitGroup
-	m.dispatcher.Range(func(k, v interface{}) bool {
-		queue := v.(*orderFlushQueue)
+	m.dispatcher.Range(func(segmentID int64, queue *orderFlushQueue) bool {
 		wg.Add(1)
 		go func() {
 			<-queue.tailCh
@@ -550,11 +640,15 @@ func (m *rendezvousFlushManager) notifyAllFlushed() {
 	close(m.dropHandler.allFlushed)
 }
 
+func getSyncTaskID(pos *msgpb.MsgPosition) string {
+	// use msgID & timestamp to generate unique taskID, see also #20926
+	return fmt.Sprintf("%s%d", string(pos.GetMsgID()), pos.GetTimestamp())
+}
+
 // close cleans up all the left members
 func (m *rendezvousFlushManager) close() {
-	m.dispatcher.Range(func(k, v interface{}) bool {
-		//assertion ok
-		queue := v.(*orderFlushQueue)
+	m.dispatcher.Range(func(segmentID int64, queue *orderFlushQueue) bool {
+		// assertion ok
 		queue.injectMut.Lock()
 		for i := 0; i < len(queue.injectCh); i++ {
 			go queue.handleInject(<-queue.injectCh)
@@ -562,6 +656,8 @@ func (m *rendezvousFlushManager) close() {
 		queue.injectMut.Unlock()
 		return true
 	})
+	m.waitForAllFlushQueue()
+	log.Ctx(context.Background()).Info("flush manager closed", zap.Int64("collectionID", m.Channel.getCollectionID()))
 }
 
 type flushBufferInsertTask struct {
@@ -575,11 +671,19 @@ func (t *flushBufferInsertTask) flushInsertData() error {
 	defer cancel()
 	if t.ChunkManager != nil && len(t.data) > 0 {
 		tr := timerecord.NewTimeRecorder("insertData")
-		err := t.MultiWrite(ctx, t.data)
-		metrics.DataNodeSave2StorageLatency.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.InsertLabel).Observe(float64(tr.ElapseSpan().Milliseconds()))
+		group, ctx := errgroup.WithContext(ctx)
+		for key, data := range t.data {
+			key := key
+			data := data
+			group.Go(func() error {
+				return t.Write(ctx, key, data)
+			})
+		}
+		err := group.Wait()
+		metrics.DataNodeSave2StorageLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		if err == nil {
 			for _, d := range t.data {
-				metrics.DataNodeFlushedSize.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.InsertLabel).Add(float64(len(d)))
+				metrics.DataNodeFlushedSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Add(float64(len(d)))
 			}
 		}
 		return err
@@ -599,10 +703,10 @@ func (t *flushBufferDeleteTask) flushDeleteData() error {
 	if len(t.data) > 0 && t.ChunkManager != nil {
 		tr := timerecord.NewTimeRecorder("deleteData")
 		err := t.MultiWrite(ctx, t.data)
-		metrics.DataNodeSave2StorageLatency.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.DeleteLabel).Observe(float64(tr.ElapseSpan().Milliseconds()))
+		metrics.DataNodeSave2StorageLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		if err == nil {
 			for _, d := range t.data {
-				metrics.DataNodeFlushedSize.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.DeleteLabel).Add(float64(len(d)))
+				metrics.DataNodeFlushedSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Add(float64(len(d)))
 			}
 		}
 		return err
@@ -611,15 +715,16 @@ func (t *flushBufferDeleteTask) flushDeleteData() error {
 }
 
 // NewRendezvousFlushManager create rendezvousFlushManager with provided allocator and kv
-func NewRendezvousFlushManager(allocator allocatorInterface, cm storage.ChunkManager, channel Channel, f notifyMetaFunc, drop flushAndDropFunc) *rendezvousFlushManager {
+func NewRendezvousFlushManager(allocator allocator.Allocator, cm storage.ChunkManager, channel Channel, f notifyMetaFunc, drop flushAndDropFunc) *rendezvousFlushManager {
 	fm := &rendezvousFlushManager{
-		allocatorInterface: allocator,
-		ChunkManager:       cm,
-		notifyFunc:         f,
-		Channel:            channel,
+		Allocator:    allocator,
+		ChunkManager: cm,
+		notifyFunc:   f,
+		Channel:      channel,
 		dropHandler: dropHandler{
 			flushAndDrop: drop,
 		},
+		dispatcher: typeutil.NewConcurrentMap[int64, *orderFlushQueue](),
 	}
 	// start with normal mode
 	fm.dropping.Store(false)
@@ -639,10 +744,9 @@ func dropVirtualChannelFunc(dsService *dataSyncService, opts ...retry.Option) fl
 	return func(packs []*segmentFlushPack) {
 		req := &datapb.DropVirtualChannelRequest{
 			Base: commonpbutil.NewMsgBase(
-				commonpbutil.WithMsgType(0),   //TODO msg type
-				commonpbutil.WithMsgID(0),     //TODO msg id
-				commonpbutil.WithTimeStamp(0), //TODO time stamp
-				commonpbutil.WithSourceID(Params.DataNodeCfg.GetNodeID()),
+				commonpbutil.WithMsgType(0), // TODO msg type
+				commonpbutil.WithMsgID(0),   // TODO msg id
+				commonpbutil.WithSourceID(dsService.serverID),
 			),
 			ChannelName: dsService.vchannelName,
 		}
@@ -774,6 +878,7 @@ func flushNotifyFunc(dsService *dataSyncService, opts ...retry.Option) notifyMet
 		updates, _ := dsService.channel.getSegmentStatisticsUpdates(pack.segmentID)
 		checkPoints = append(checkPoints, &datapb.CheckPoint{
 			SegmentID: pack.segmentID,
+			// this shouldn't be used because we are not sure this is aligned
 			NumOfRows: updates.GetNumRows(),
 			Position:  pack.pos,
 		})
@@ -784,6 +889,7 @@ func flushNotifyFunc(dsService *dataSyncService, opts ...retry.Option) notifyMet
 			zap.Int64("SegmentID", pack.segmentID),
 			zap.Int64("CollectionID", dsService.collectionID),
 			zap.Any("startPos", startPos),
+			zap.Any("checkPoints", checkPoints),
 			zap.Int("Length of Field2BinlogPaths", len(fieldInsert)),
 			zap.Int("Length of Field2Stats", len(fieldStats)),
 			zap.Int("Length of Field2Deltalogs", len(deltaInfos[0].GetBinlogs())),
@@ -794,8 +900,7 @@ func flushNotifyFunc(dsService *dataSyncService, opts ...retry.Option) notifyMet
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithMsgType(0),
 				commonpbutil.WithMsgID(0),
-				commonpbutil.WithTimeStamp(0),
-				commonpbutil.WithSourceID(Params.DataNodeCfg.GetNodeID()),
+				commonpbutil.WithSourceID(paramtable.GetNodeID()),
 			),
 			SegmentID:           pack.segmentID,
 			CollectionID:        dsService.collectionID,
@@ -808,32 +913,35 @@ func flushNotifyFunc(dsService *dataSyncService, opts ...retry.Option) notifyMet
 			StartPositions: startPos,
 			Flushed:        pack.flushed,
 			Dropped:        pack.dropped,
+			Channel:        dsService.vchannelName,
 		}
 		err := retry.Do(context.Background(), func() error {
 			rsp, err := dsService.dataCoord.SaveBinlogPaths(context.Background(), req)
 			// should be network issue, return error and retry
 			if err != nil {
-				return fmt.Errorf(err.Error())
+				return err
 			}
+
+			err = merr.Error(rsp)
 
 			// Segment not found during stale segment flush. Segment might get compacted already.
 			// Stop retry and still proceed to the end, ignoring this error.
-			if !pack.flushed && rsp.GetErrorCode() == commonpb.ErrorCode_SegmentNotFound {
+			if !pack.flushed && errors.Is(err, merr.ErrSegmentNotFound) {
 				log.Warn("stale segment not found, could be compacted",
-					zap.Int64("segment ID", pack.segmentID))
+					zap.Int64("segmentID", pack.segmentID))
 				log.Warn("failed to SaveBinlogPaths",
-					zap.Int64("segment ID", pack.segmentID),
-					zap.Error(errors.New(rsp.GetReason())))
+					zap.Int64("segmentID", pack.segmentID),
+					zap.Error(err))
 				return nil
 			}
 			// meta error, datanode handles a virtual channel does not belong here
-			if rsp.GetErrorCode() == commonpb.ErrorCode_MetaFailed {
+			if errors.IsAny(err, merr.ErrSegmentNotFound, merr.ErrChannelNotFound) {
 				log.Warn("meta error found, skip sync and start to drop virtual channel", zap.String("channel", dsService.vchannelName))
 				return nil
 			}
 
-			if rsp.ErrorCode != commonpb.ErrorCode_Success {
-				return fmt.Errorf("data service save bin log path failed, reason = %s", rsp.Reason)
+			if err != nil {
+				return err
 			}
 
 			dsService.channel.transferNewSegments(lo.Map(startPos, func(pos *datapb.SegmentStartPosition, _ int) UniqueID {
@@ -843,14 +951,26 @@ func flushNotifyFunc(dsService *dataSyncService, opts ...retry.Option) notifyMet
 		}, opts...)
 		if err != nil {
 			log.Warn("failed to SaveBinlogPaths",
-				zap.Int64("segment ID", pack.segmentID),
+				zap.Int64("segmentID", pack.segmentID),
 				zap.Error(err))
 			// TODO change to graceful stop
 			panic(err)
 		}
-		if pack.flushed || pack.dropped {
+		if pack.dropped {
+			dsService.channel.removeSegments(pack.segmentID)
+		} else if pack.flushed {
 			dsService.channel.segmentFlushed(pack.segmentID)
 		}
+
+		if dsService.flushListener != nil {
+			dsService.flushListener <- pack
+		}
 		dsService.flushingSegCache.Remove(req.GetSegmentID())
+		dsService.channel.evictHistoryInsertBuffer(req.GetSegmentID(), pack.pos)
+		dsService.channel.evictHistoryDeleteBuffer(req.GetSegmentID(), pack.pos)
+		segment := dsService.channel.getSegment(req.GetSegmentID())
+		dsService.channel.updateSingleSegmentMemorySize(req.GetSegmentID())
+		segment.setSyncing(false)
+		// dsService.channel.saveBinlogPath(fieldStats)
 	}
 }

@@ -21,8 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/client"
-
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 // Consumer is a client that used to consume messages from rocksmq
@@ -57,7 +56,11 @@ func (rc *Consumer) Chan() <-chan mqwrapper.Message {
 						}
 						skip := atomic.LoadInt32(&rc.skip)
 						if skip != 1 {
-							rc.msgChannel <- &rmqMessage{msg: msg}
+							select {
+							case rc.msgChannel <- &rmqMessage{msg: msg}:
+							case <-rc.closeCh:
+								// if consumer closed, enter close branch below
+							}
 						} else {
 							atomic.StoreInt32(&rc.skip, 0)
 						}
@@ -96,4 +99,8 @@ func (rc *Consumer) Close() {
 func (rc *Consumer) GetLatestMsgID() (mqwrapper.MessageID, error) {
 	msgID, err := rc.c.GetLatestMsgID()
 	return &rmqID{messageID: msgID}, err
+}
+
+func (rc *Consumer) CheckTopicValid(topic string) error {
+	return rc.c.CheckTopicValid(topic)
 }

@@ -1,13 +1,31 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rootcoord
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/retry"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/retry"
 )
 
 const (
@@ -25,15 +43,27 @@ type stepStack struct {
 	steps []nestedStep
 }
 
+func (s *stepStack) totalPriority() int {
+	total := 0
+	for _, step := range s.steps {
+		total += int(step.Weight())
+	}
+	return total
+}
+
 func (s *stepStack) Execute(ctx context.Context) *stepStack {
 	steps := s.steps
 	for len(steps) > 0 {
 		l := len(steps)
 		todo := steps[l-1]
 		childSteps, err := todo.Execute(ctx)
+
 		// TODO: maybe a interface `step.LogOnError` is better.
-		_, skipLog := todo.(*waitForTsSyncedStep)
-		if retry.IsUnRecoverable(err) {
+		_, isWaitForTsSyncedStep := todo.(*waitForTsSyncedStep)
+		_, isConfirmGCStep := todo.(*confirmGCStep)
+		skipLog := isWaitForTsSyncedStep || isConfirmGCStep
+
+		if !retry.IsRecoverable(err) {
 			if !skipLog {
 				log.Warn("failed to execute step, not able to reschedule", zap.Error(err), zap.String("step", todo.Desc()))
 			}
@@ -76,8 +106,28 @@ func randomSelectPolicy(parallel int) selectStepPolicy {
 	}
 }
 
+func selectByPriority(parallel int, m map[*stepStack]struct{}) []*stepStack {
+	h := make([]*stepStack, 0, len(m))
+	for k := range m {
+		h = append(h, k)
+	}
+	sort.Slice(h, func(i, j int) bool {
+		return h[i].totalPriority() > h[j].totalPriority()
+	})
+	if len(h) <= parallel {
+		return h
+	}
+	return h[:parallel]
+}
+
+func selectByPriorityPolicy(parallel int) selectStepPolicy {
+	return func(m map[*stepStack]struct{}) []*stepStack {
+		return selectByPriority(parallel, m)
+	}
+}
+
 func defaultSelectPolicy() selectStepPolicy {
-	return randomSelectPolicy(defaultBgExecutingParallel)
+	return selectByPriorityPolicy(defaultBgExecutingParallel)
 }
 
 type bgOpt func(*bgStepExecutor)

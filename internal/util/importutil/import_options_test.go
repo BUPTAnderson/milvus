@@ -20,12 +20,12 @@ import (
 	"math"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 )
 
-func TestValidateOptions(t *testing.T) {
-
+func Test_ValidateOptions(t *testing.T) {
 	assert.NoError(t, ValidateOptions([]*commonpb.KeyValuePair{}))
 	assert.NoError(t, ValidateOptions([]*commonpb.KeyValuePair{
 		{Key: "start_ts", Value: "1666007457"},
@@ -51,9 +51,13 @@ func TestValidateOptions(t *testing.T) {
 		{Key: "start_ts", Value: "3.14"},
 		{Key: "end_ts", Value: "1666007457"},
 	}))
+	assert.Error(t, ValidateOptions([]*commonpb.KeyValuePair{
+		{Key: "start_ts", Value: "1666007457"},
+		{Key: "end_ts", Value: "3.14"},
+	}))
 }
 
-func TestParseTSFromOptions(t *testing.T) {
+func Test_ParseTSFromOptions(t *testing.T) {
 	var tsStart uint64
 	var tsEnd uint64
 	var err error
@@ -86,4 +90,23 @@ func TestParseTSFromOptions(t *testing.T) {
 	assert.Equal(t, uint64(0), tsStart)
 	assert.Equal(t, uint64(0), tsEnd)
 	assert.Error(t, err)
+}
+
+func Test_IsBackup(t *testing.T) {
+	isBackup := IsBackup([]*commonpb.KeyValuePair{
+		{Key: "backup", Value: "true"},
+	})
+	assert.Equal(t, true, isBackup)
+	isBackup2 := IsBackup([]*commonpb.KeyValuePair{
+		{Key: "backup", Value: "True"},
+	})
+	assert.Equal(t, true, isBackup2)
+	falseBackup := IsBackup([]*commonpb.KeyValuePair{
+		{Key: "backup", Value: "false"},
+	})
+	assert.Equal(t, false, falseBackup)
+	noBackup := IsBackup([]*commonpb.KeyValuePair{
+		{Key: "backup", Value: "false"},
+	})
+	assert.Equal(t, false, noBackup)
 }

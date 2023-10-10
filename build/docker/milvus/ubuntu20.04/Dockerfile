@@ -9,23 +9,14 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 
-FROM milvusdb/openblas:ubuntu20.04-20220914-179ea77 AS openblas
-
-#FROM alpine
 FROM ubuntu:focal-20220426
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
+ARG TARGETARCH
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl libtbb-dev gfortran netcat iputils-ping ca-certificates liblapack3 libzstd-dev uuid-dev libaio-dev libboost-program-options-dev libboost-filesystem-dev && \
+    apt-get install -y --no-install-recommends curl ca-certificates libaio-dev libgomp1 && \
     apt-get remove --purge -y && \
     rm -rf /var/lib/apt/lists/*
-
-COPY --from=openblas /usr/local/lib/libopenblasp-r0.3.21.so /usr/lib/
-
-RUN ln -s /usr/lib/libopenblasp-r0.3.21.so /usr/lib/libopenblas.so.3 && \
-    ln -s /usr/lib/libopenblas.so.3 /usr/lib/libopenblas.so
 
 COPY ./bin/ /milvus/bin/
 
@@ -36,9 +27,10 @@ COPY ./lib/ /milvus/lib/
 ENV PATH=/milvus/bin:$PATH
 ENV LD_LIBRARY_PATH=/milvus/lib:$LD_LIBRARY_PATH:/usr/lib
 ENV LD_PRELOAD=/milvus/lib/libjemalloc.so
+ENV MALLOC_CONF=background_thread:true
 
 # Add Tini
-ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini /tini
+ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini-$TARGETARCH /tini
 RUN chmod +x /tini
 ENTRYPOINT ["/tini", "--"]
 

@@ -18,26 +18,21 @@ package components
 
 import (
 	"context"
-	"io"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	rc "github.com/milvus-io/milvus/internal/distributed/rootcoord"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
-	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	rc "github.com/milvus-io/milvus/internal/distributed/rootcoord"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // RootCoord implements RoodCoord grpc server
 type RootCoord struct {
 	ctx context.Context
 	svr *rc.Server
-
-	tracer opentracing.Tracer
-	closer io.Closer
 }
 
 // NewRootCoord creates a new RoorCoord
@@ -58,14 +53,14 @@ func (rc *RootCoord) Run() error {
 		log.Error("RootCoord starts error", zap.Error(err))
 		return err
 	}
-	log.Debug("RootCoord successfully started")
+	log.Info("RootCoord successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (rc *RootCoord) Stop() error {
-	if err := rc.svr.Stop(); err != nil {
-		return err
+	if rc.svr != nil {
+		return rc.svr.Stop()
 	}
 	return nil
 }

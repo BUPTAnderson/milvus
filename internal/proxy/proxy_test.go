@@ -18,8 +18,8 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -27,58 +27,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/metrics"
-	"github.com/milvus-io/milvus/internal/rootcoord"
-	"github.com/milvus-io/milvus/internal/util"
-	"github.com/milvus-io/milvus/internal/util/crypto"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/distance"
-	"github.com/milvus-io/milvus/internal/util/etcd"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/importutil"
-	"github.com/milvus-io/milvus/internal/util/logutil"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/trace"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	grpcdatacoordclient "github.com/milvus-io/milvus/internal/distributed/datacoord"
 	grpcdatacoordclient2 "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
 	grpcdatanode "github.com/milvus-io/milvus/internal/distributed/datanode"
-	grpcindexcoord "github.com/milvus-io/milvus/internal/distributed/indexcoord"
-	grpcindexcoordclient "github.com/milvus-io/milvus/internal/distributed/indexcoord/client"
 	grpcindexnode "github.com/milvus-io/milvus/internal/distributed/indexnode"
 	grpcquerycoord "github.com/milvus-io/milvus/internal/distributed/querycoord"
 	grpcquerycoordclient "github.com/milvus-io/milvus/internal/distributed/querycoord/client"
 	grpcquerynode "github.com/milvus-io/milvus/internal/distributed/querynode"
 	grpcrootcoord "github.com/milvus-io/milvus/internal/distributed/rootcoord"
 	rcc "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
-
-	"github.com/milvus-io/milvus/internal/datacoord"
-	"github.com/milvus-io/milvus/internal/datanode"
-	"github.com/milvus-io/milvus/internal/indexcoord"
-	"github.com/milvus-io/milvus/internal/indexnode"
-	querycoord "github.com/milvus-io/milvus/internal/querycoordv2"
-	"github.com/milvus-io/milvus/internal/querynode"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/proto/proxypb"
+	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/internal/util/componentutil"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/importutil"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/util/crypto"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 const (
@@ -100,12 +92,6 @@ func runRootCoord(ctx context.Context, localMsg bool) *grpcrootcoord.Server {
 
 	wg.Add(1)
 	go func() {
-		rootcoord.Params.InitOnce()
-		if !localMsg {
-			logutil.SetupLogger(&rootcoord.Params.Log)
-			defer log.Sync()
-		}
-
 		factory := dependency.NewDefaultFactory(localMsg)
 		var err error
 		rc, err = grpcrootcoord.NewServer(ctx, factory)
@@ -130,13 +116,6 @@ func runQueryCoord(ctx context.Context, localMsg bool) *grpcquerycoord.Server {
 
 	wg.Add(1)
 	go func() {
-		querycoord.Params.InitOnce()
-
-		if !localMsg {
-			logutil.SetupLogger(&querycoord.Params.Log)
-			defer log.Sync()
-		}
-
 		factory := dependency.NewDefaultFactory(localMsg)
 		var err error
 		qs, err = grpcquerycoord.NewServer(ctx, factory)
@@ -161,15 +140,7 @@ func runQueryNode(ctx context.Context, localMsg bool, alias string) *grpcqueryno
 
 	wg.Add(1)
 	go func() {
-		querynode.Params.QueryNodeCfg.InitAlias(alias)
-		querynode.Params.InitOnce()
-
-		if !localMsg {
-			logutil.SetupLogger(&querynode.Params.Log)
-			defer log.Sync()
-		}
-
-		factory := dependency.NewDefaultFactory(localMsg)
+		factory := dependency.MockDefaultFactory(localMsg, Params)
 		var err error
 		qn, err = grpcquerynode.NewServer(ctx, factory)
 		if err != nil {
@@ -193,13 +164,6 @@ func runDataCoord(ctx context.Context, localMsg bool) *grpcdatacoordclient.Serve
 
 	wg.Add(1)
 	go func() {
-		datacoord.Params.InitOnce()
-
-		if !localMsg {
-			logutil.SetupLogger(&datacoord.Params.Log)
-			defer log.Sync()
-		}
-
 		factory := dependency.NewDefaultFactory(localMsg)
 		ds = grpcdatacoordclient.NewServer(ctx, factory)
 		wg.Done()
@@ -220,15 +184,7 @@ func runDataNode(ctx context.Context, localMsg bool, alias string) *grpcdatanode
 
 	wg.Add(1)
 	go func() {
-		datanode.Params.DataNodeCfg.InitAlias(alias)
-		datanode.Params.InitOnce()
-
-		if !localMsg {
-			logutil.SetupLogger(&datanode.Params.Log)
-			defer log.Sync()
-		}
-
-		factory := dependency.NewDefaultFactory(localMsg)
+		factory := dependency.MockDefaultFactory(localMsg, Params)
 		var err error
 		dn, err = grpcdatanode.NewServer(ctx, factory)
 		if err != nil {
@@ -246,59 +202,27 @@ func runDataNode(ctx context.Context, localMsg bool, alias string) *grpcdatanode
 	return dn
 }
 
-func runIndexCoord(ctx context.Context, localMsg bool) *grpcindexcoord.Server {
-	var is *grpcindexcoord.Server
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		indexcoord.Params.InitOnce()
-
-		if !localMsg {
-			logutil.SetupLogger(&indexcoord.Params.Log)
-			defer log.Sync()
-		}
-
-		factory := dependency.NewDefaultFactory(localMsg)
-		var err error
-		is, err = grpcindexcoord.NewServer(ctx, factory)
-		if err != nil {
-			panic(err)
-		}
-		wg.Done()
-		err = is.Run()
-		if err != nil {
-			panic(err)
-		}
-	}()
-	wg.Wait()
-
-	metrics.RegisterIndexCoord(Registry)
-	return is
-}
-
 func runIndexNode(ctx context.Context, localMsg bool, alias string) *grpcindexnode.Server {
 	var in *grpcindexnode.Server
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
-		indexnode.Params.IndexNodeCfg.InitAlias(alias)
-		indexnode.Params.InitOnce()
-
-		if !localMsg {
-			logutil.SetupLogger(&indexnode.Params.Log)
-			defer log.Sync()
-		}
-
-		factory := dependency.NewDefaultFactory(localMsg)
+		factory := dependency.MockDefaultFactory(localMsg, Params)
 		var err error
 		in, err = grpcindexnode.NewServer(ctx, factory)
 		if err != nil {
 			panic(err)
 		}
 		wg.Done()
-		etcd, err := etcd.GetEtcdClient(&indexnode.Params.EtcdCfg)
+		etcd, err := etcd.GetEtcdClient(
+			Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+			Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
+			Params.EtcdCfg.Endpoints.GetAsStrings(),
+			Params.EtcdCfg.EtcdTLSCert.GetValue(),
+			Params.EtcdCfg.EtcdTLSKey.GetValue(),
+			Params.EtcdCfg.EtcdTLSCACert.GetValue(),
+			Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
 		if err != nil {
 			panic(err)
 		}
@@ -334,40 +258,39 @@ func (s *proxyTestServer) GetVersion(ctx context.Context, request *milvuspb.GetV
 	}, nil
 }
 
+func (s *proxyTestServer) RenameCollection(ctx context.Context, request *milvuspb.RenameCollectionRequest) (*commonpb.Status, error) {
+	return s.Proxy.RenameCollection(ctx, request)
+}
+
 func (s *proxyTestServer) GetComponentStates(ctx context.Context, request *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
-	return s.Proxy.GetComponentStates(ctx)
+	return s.Proxy.GetComponentStates(ctx, request)
 }
 
 func (s *proxyTestServer) GetStatisticsChannel(ctx context.Context, request *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
-	return s.Proxy.GetStatisticsChannel(ctx)
+	return s.Proxy.GetStatisticsChannel(ctx, request)
 }
 
-func (s *proxyTestServer) startGrpc(ctx context.Context, wg *sync.WaitGroup) {
+func (s *proxyTestServer) startGrpc(ctx context.Context, wg *sync.WaitGroup, p *paramtable.GrpcServerConfig) {
 	defer wg.Done()
 
-	var p paramtable.GrpcServerConfig
-	p.InitOnce(typeutil.ProxyRole)
-	Params.InitOnce()
-	Params.ProxyCfg.NetworkAddress = p.GetAddress()
-
-	var kaep = keepalive.EnforcementPolicy{
+	kaep := keepalive.EnforcementPolicy{
 		MinTime:             5 * time.Second, // If a client pings more than once every 5 seconds, terminate the connection
 		PermitWithoutStream: true,            // Allow pings even when there are no active streams
 	}
 
-	var kasp = keepalive.ServerParameters{
+	kasp := keepalive.ServerParameters{
 		Time:    60 * time.Second, // Ping the client if it is idle for 60 seconds to ensure the connection is still active
 		Timeout: 10 * time.Second, // Wait 10 second for the ping ack before assuming the connection is dead
 	}
 
-	log.Debug("Proxy server listen on tcp", zap.Int("port", p.Port))
-	lis, err := net.Listen("tcp", ":"+strconv.Itoa(p.Port))
+	log.Debug("Proxy server listen on tcp", zap.Int("port", p.Port.GetAsInt()))
+	lis, err := net.Listen("tcp", ":"+p.Port.GetValue())
 	if err != nil {
-		log.Warn("Proxy server failed to listen on", zap.Error(err), zap.Int("port", p.Port))
+		log.Warn("Proxy server failed to listen on", zap.Error(err), zap.Int("port", p.Port.GetAsInt()))
 		s.ch <- err
 		return
 	}
-	log.Debug("Proxy server already listen on tcp", zap.Int("port", p.Port))
+	log.Debug("Proxy server already listen on tcp", zap.Int("port", p.Port.GetAsInt()))
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -375,17 +298,17 @@ func (s *proxyTestServer) startGrpc(ctx context.Context, wg *sync.WaitGroup) {
 	multiLimiter := NewMultiRateLimiter()
 	s.multiRateLimiter = multiLimiter
 
-	opts := trace.GetInterceptorOpts()
+	opts := tracer.GetInterceptorOpts()
 	s.grpcServer = grpc.NewServer(
 		grpc.KeepaliveEnforcementPolicy(kaep),
 		grpc.KeepaliveParams(kasp),
-		grpc.MaxRecvMsgSize(p.ServerMaxRecvSize),
-		grpc.MaxSendMsgSize(p.ServerMaxSendSize),
+		grpc.MaxRecvMsgSize(p.ServerMaxRecvSize.GetAsInt()),
+		grpc.MaxSendMsgSize(p.ServerMaxSendSize.GetAsInt()),
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			ot.UnaryServerInterceptor(opts...),
+			otelgrpc.UnaryServerInterceptor(opts...),
 			RateLimitInterceptor(multiLimiter),
 		)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.StreamInterceptor(otelgrpc.StreamServerInterceptor(opts...)))
 	proxypb.RegisterProxyServer(s.grpcServer, s)
 	milvuspb.RegisterMilvusServiceServer(s.grpcServer, s)
 
@@ -416,6 +339,7 @@ func (s *proxyTestServer) gracefulStop() {
 func TestProxy(t *testing.T) {
 	var err error
 	var wg sync.WaitGroup
+	paramtable.Init()
 
 	path := "/tmp/milvus/rocksmq" + funcutil.GenRandomStr()
 	t.Setenv("ROCKSMQ_PATH", path)
@@ -424,10 +348,9 @@ func TestProxy(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = GetContext(ctx, "root:123456")
 	localMsg := true
-	factory := dependency.NewDefaultFactory(localMsg)
+	factory := dependency.MockDefaultFactory(localMsg, Params)
 	alias := "TestProxy"
 
-	Params.InitOnce()
 	log.Info("Initialize parameter table of Proxy")
 
 	rc := runRootCoord(ctx, localMsg)
@@ -475,24 +398,13 @@ func TestProxy(t *testing.T) {
 	}
 
 	qn := runQueryNode(ctx, localMsg, alias)
-	log.Info("running query node ...")
+	log.Info("running QueryNode ...")
 
 	if qn != nil {
 		defer func() {
 			err := qn.Stop()
 			assert.NoError(t, err)
 			log.Info("stop query node")
-		}()
-	}
-
-	ic := runIndexCoord(ctx, localMsg)
-	log.Info("running IndexCoord ...")
-
-	if ic != nil {
-		defer func() {
-			err := ic.Stop()
-			assert.NoError(t, err)
-			log.Info("stop IndexCoord")
 		}()
 	}
 
@@ -513,51 +425,53 @@ func TestProxy(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, proxy)
 
-	etcdcli, err := etcd.GetEtcdClient(&Params.EtcdCfg)
+	etcdcli, err := etcd.GetEtcdClient(
+		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
+		Params.EtcdCfg.Endpoints.GetAsStrings(),
+		Params.EtcdCfg.EtcdTLSCert.GetValue(),
+		Params.EtcdCfg.EtcdTLSKey.GetValue(),
+		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
+		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
 	defer etcdcli.Close()
 	assert.NoError(t, err)
 	proxy.SetEtcdClient(etcdcli)
 
 	testServer := newProxyTestServer(proxy)
 	wg.Add(1)
-	go testServer.startGrpc(ctx, &wg)
+
+	bt := paramtable.NewBaseTable(paramtable.SkipRemote(true))
+	base := &paramtable.ComponentParam{}
+	base.Init(bt)
+	var p paramtable.GrpcServerConfig
+	p.Init(typeutil.ProxyRole, bt)
+	testServer.Proxy.SetAddress(p.GetAddress())
+	assert.Equal(t, p.GetAddress(), testServer.Proxy.GetAddress())
+
+	go testServer.startGrpc(ctx, &wg, &p)
 	assert.NoError(t, testServer.waitForGrpcReady())
 
-	rootCoordClient, err := rcc.NewClient(ctx, Params.EtcdCfg.MetaRootPath, etcdcli)
+	rootCoordClient, err := rcc.NewClient(ctx, Params.EtcdCfg.MetaRootPath.GetValue(), etcdcli)
 	assert.NoError(t, err)
-	err = rootCoordClient.Init()
-	assert.NoError(t, err)
-	err = funcutil.WaitForComponentHealthy(ctx, rootCoordClient, typeutil.RootCoordRole, attempts, sleepDuration)
+	err = componentutil.WaitForComponentHealthy(ctx, rootCoordClient, typeutil.RootCoordRole, attempts, sleepDuration)
 	assert.NoError(t, err)
 	proxy.SetRootCoordClient(rootCoordClient)
 	log.Info("Proxy set root coordinator client")
 
-	dataCoordClient, err := grpcdatacoordclient2.NewClient(ctx, Params.EtcdCfg.MetaRootPath, etcdcli)
+	dataCoordClient, err := grpcdatacoordclient2.NewClient(ctx, Params.EtcdCfg.MetaRootPath.GetValue(), etcdcli)
 	assert.NoError(t, err)
-	err = dataCoordClient.Init()
-	assert.NoError(t, err)
-	err = funcutil.WaitForComponentHealthy(ctx, dataCoordClient, typeutil.DataCoordRole, attempts, sleepDuration)
+	err = componentutil.WaitForComponentHealthy(ctx, dataCoordClient, typeutil.DataCoordRole, attempts, sleepDuration)
 	assert.NoError(t, err)
 	proxy.SetDataCoordClient(dataCoordClient)
 	log.Info("Proxy set data coordinator client")
 
-	queryCoordClient, err := grpcquerycoordclient.NewClient(ctx, Params.EtcdCfg.MetaRootPath, etcdcli)
+	queryCoordClient, err := grpcquerycoordclient.NewClient(ctx, Params.EtcdCfg.MetaRootPath.GetValue(), etcdcli)
 	assert.NoError(t, err)
-	err = queryCoordClient.Init()
-	assert.NoError(t, err)
-	err = funcutil.WaitForComponentHealthy(ctx, queryCoordClient, typeutil.QueryCoordRole, attempts, sleepDuration)
+	err = componentutil.WaitForComponentHealthy(ctx, queryCoordClient, typeutil.QueryCoordRole, attempts, sleepDuration)
 	assert.NoError(t, err)
 	proxy.SetQueryCoordClient(queryCoordClient)
+	proxy.SetQueryNodeCreator(defaultQueryNodeClientCreator)
 	log.Info("Proxy set query coordinator client")
-
-	indexCoordClient, err := grpcindexcoordclient.NewClient(ctx, Params.EtcdCfg.MetaRootPath, etcdcli)
-	assert.NoError(t, err)
-	err = indexCoordClient.Init()
-	assert.NoError(t, err)
-	err = funcutil.WaitForComponentHealthy(ctx, indexCoordClient, typeutil.IndexCoordRole, attempts, sleepDuration)
-	assert.NoError(t, err)
-	proxy.SetIndexCoordClient(indexCoordClient)
-	log.Info("Proxy set index coordinator client")
 
 	proxy.UpdateStateCode(commonpb.StateCode_Initializing)
 	err = proxy.Init()
@@ -565,7 +479,7 @@ func TestProxy(t *testing.T) {
 
 	err = proxy.Start()
 	assert.NoError(t, err)
-	assert.Equal(t, commonpb.StateCode_Healthy, proxy.stateCode.Load().(commonpb.StateCode))
+	assert.Equal(t, commonpb.StateCode_Healthy, proxy.GetStateCode())
 
 	// register proxy
 	err = proxy.Register()
@@ -577,29 +491,29 @@ func TestProxy(t *testing.T) {
 	}()
 
 	t.Run("get component states", func(t *testing.T) {
-		states, err := proxy.GetComponentStates(ctx)
+		states, err := proxy.GetComponentStates(ctx, nil)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, states.Status.ErrorCode)
-		assert.Equal(t, Params.ProxyCfg.GetNodeID(), states.State.NodeID)
+		assert.Equal(t, commonpb.ErrorCode_Success, states.GetStatus().GetErrorCode())
+		assert.Equal(t, paramtable.GetNodeID(), states.State.NodeID)
 		assert.Equal(t, typeutil.ProxyRole, states.State.Role)
-		assert.Equal(t, proxy.stateCode.Load().(commonpb.StateCode), states.State.StateCode)
+		assert.Equal(t, proxy.GetStateCode(), states.State.StateCode)
 	})
 
 	t.Run("get statistics channel", func(t *testing.T) {
-		resp, err := proxy.GetStatisticsChannel(ctx)
+		resp, err := proxy.GetStatisticsChannel(ctx, nil)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, "", resp.Value)
 	})
 
 	prefix := "test_proxy_"
 	partitionPrefix := "test_proxy_partition_"
-	dbName := ""
+	dbName := GetCurDBNameFromContextOrDefault(ctx)
 	collectionName := prefix + funcutil.GenRandomStr()
 	otherCollectionName := collectionName + "_other_" + funcutil.GenRandomStr()
 	partitionName := partitionPrefix + funcutil.GenRandomStr()
 	otherPartitionName := partitionPrefix + "_other_" + funcutil.GenRandomStr()
-	shardsNum := int32(2)
+	shardsNum := common.DefaultShardsNum
 	int64Field := "int64"
 	floatVecField := "fVec"
 	dim := 128
@@ -634,7 +548,7 @@ func TestProxy(t *testing.T) {
 			DataType:     schemapb.DataType_FloatVector,
 			TypeParams: []*commonpb.KeyValuePair{
 				{
-					Key:   "dim",
+					Key:   common.DimKey,
 					Value: strconv.Itoa(dim),
 				},
 			},
@@ -694,6 +608,20 @@ func TestProxy(t *testing.T) {
 		}
 	}
 
+	constructCollectionUpsertRequest := func() *milvuspb.UpsertRequest {
+		fVecColumn := newFloatVectorFieldData(floatVecField, rowNum, dim)
+		hashKeys := generateHashKeys(rowNum)
+		return &milvuspb.UpsertRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			PartitionName:  partitionName,
+			FieldsData:     []*schemapb.FieldData{fVecColumn},
+			HashKeys:       hashKeys,
+			NumRows:        uint32(rowNum),
+		}
+	}
+
 	constructCreateIndexRequest := func() *milvuspb.CreateIndexRequest {
 		return &milvuspb.CreateIndexRequest{
 			Base:           nil,
@@ -703,15 +631,15 @@ func TestProxy(t *testing.T) {
 			IndexName:      indexName,
 			ExtraParams: []*commonpb.KeyValuePair{
 				{
-					Key:   "dim",
+					Key:   common.DimKey,
 					Value: strconv.Itoa(dim),
 				},
 				{
 					Key:   common.MetricTypeKey,
-					Value: distance.L2,
+					Value: metric.L2,
 				},
 				{
-					Key:   "index_type",
+					Key:   common.IndexTypeKey,
 					Value: "IVF_FLAT",
 				},
 				{
@@ -744,7 +672,6 @@ func TestProxy(t *testing.T) {
 		resp, err = proxy.CreateCollection(ctx, reqInvalidField)
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.ErrorCode)
-
 	})
 
 	wg.Add(1)
@@ -755,6 +682,7 @@ func TestProxy(t *testing.T) {
 			Base:           nil,
 			CollectionName: collectionName,
 			Alias:          "alias",
+			DbName:         dbName,
 		}
 		resp, err := proxy.CreateAlias(ctx, aliasReq)
 		assert.NoError(t, err)
@@ -780,6 +708,7 @@ func TestProxy(t *testing.T) {
 			Base:           nil,
 			CollectionName: collectionName,
 			Alias:          "alias",
+			DbName:         dbName,
 		}
 		resp, err := proxy.AlterAlias(ctx, alterReq)
 		assert.NoError(t, err)
@@ -812,8 +741,9 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		// drop alias
 		resp, err := proxy.DropAlias(ctx, &milvuspb.DropAliasRequest{
-			Base:  nil,
-			Alias: "alias",
+			Base:   nil,
+			Alias:  "alias",
+			DbName: dbName,
 		})
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
@@ -828,7 +758,6 @@ func TestProxy(t *testing.T) {
 			DbName:         dbName,
 			CollectionName: collectionName,
 		})
-
 	})
 
 	wg.Add(1)
@@ -841,7 +770,7 @@ func TestProxy(t *testing.T) {
 			TimeStamp:      0,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.True(t, resp.Value)
 
 		// has other collection: false
@@ -852,14 +781,14 @@ func TestProxy(t *testing.T) {
 			TimeStamp:      0,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.False(t, resp.Value)
 	})
 
 	wg.Add(1)
 	t.Run("describe collection", func(t *testing.T) {
 		defer wg.Done()
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{
@@ -870,7 +799,7 @@ func TestProxy(t *testing.T) {
 			TimeStamp:      0,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, collectionID, resp.CollectionID)
 		// TODO(dragondriver): shards num
 		assert.Equal(t, len(schema.Fields), len(resp.Schema.Fields))
@@ -885,7 +814,7 @@ func TestProxy(t *testing.T) {
 			TimeStamp:      0,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -897,7 +826,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: collectionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		// TODO(dragondriver): check num rows
 
 		// get statistics of other collection -> fail
@@ -907,7 +836,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: otherCollectionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -921,7 +850,7 @@ func TestProxy(t *testing.T) {
 			CollectionNames: nil,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 1, len(resp.CollectionNames), resp.CollectionNames)
 	})
 
@@ -931,7 +860,7 @@ func TestProxy(t *testing.T) {
 		resp, err := proxy.AlterCollection(ctx, &milvuspb.AlterCollectionRequest{
 			Base:           nil,
 			DbName:         dbName,
-			CollectionName: "cn",
+			CollectionName: collectionName,
 			Properties: []*commonpb.KeyValuePair{
 				{
 					Key:   common.CollectionTTLConfigKey,
@@ -940,7 +869,7 @@ func TestProxy(t *testing.T) {
 			},
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
 	})
 
 	wg.Add(1)
@@ -976,7 +905,7 @@ func TestProxy(t *testing.T) {
 			PartitionName:  partitionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.True(t, resp.Value)
 
 		resp, err = proxy.HasPartition(ctx, &milvuspb.HasPartitionRequest{
@@ -986,7 +915,7 @@ func TestProxy(t *testing.T) {
 			PartitionName:  otherPartitionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.False(t, resp.Value)
 
 		// non-exist collection -> fail
@@ -997,7 +926,7 @@ func TestProxy(t *testing.T) {
 			PartitionName:  partitionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1010,7 +939,7 @@ func TestProxy(t *testing.T) {
 			PartitionName:  partitionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// non-exist partition -> fail
 		resp, err = proxy.GetPartitionStatistics(ctx, &milvuspb.GetPartitionStatisticsRequest{
@@ -1020,7 +949,7 @@ func TestProxy(t *testing.T) {
 			PartitionName:  otherPartitionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// non-exist collection -> fail
 		resp, err = proxy.GetPartitionStatistics(ctx, &milvuspb.GetPartitionStatisticsRequest{
@@ -1030,13 +959,13 @@ func TestProxy(t *testing.T) {
 			PartitionName:  partitionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
 	t.Run("show partitions", func(t *testing.T) {
 		defer wg.Done()
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
@@ -1048,9 +977,20 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_All,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		// default partition
 		assert.Equal(t, 2, len(resp.PartitionNames))
+
+		{
+			stateResp, err := proxy.GetLoadState(ctx, &milvuspb.GetLoadStateRequest{
+				DbName:         dbName,
+				CollectionName: collectionName,
+				PartitionNames: resp.PartitionNames,
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+			assert.Equal(t, commonpb.LoadState_LoadStateNotLoad, stateResp.State)
+		}
 
 		// non-exist collection -> fail
 		resp, err = proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
@@ -1062,7 +1002,7 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_All,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1072,7 +1012,7 @@ func TestProxy(t *testing.T) {
 
 		resp, err := proxy.Insert(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, rowNum, len(resp.SuccIndex))
 		assert.Equal(t, 0, len(resp.ErrIndex))
 		assert.Equal(t, int64(rowNum), resp.InsertCnt)
@@ -1090,7 +1030,7 @@ func TestProxy(t *testing.T) {
 			CollectionNames: []string{collectionName},
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		segmentIDs = resp.CollSegIDs[collectionName].Data
 		log.Info("flush collection", zap.Int64s("segments to be flushed", segmentIDs))
 
@@ -1132,7 +1072,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: collectionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		rowNumStr := funcutil.KeyValuePair2Map(resp.Stats)["row_count"]
 		assert.Equal(t, strconv.Itoa(rowNum), rowNumStr)
 
@@ -1143,7 +1083,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: otherCollectionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1167,7 +1107,21 @@ func TestProxy(t *testing.T) {
 			IndexName:      "",
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		indexName = resp.IndexDescriptions[0].IndexName
+	})
+
+	wg.Add(1)
+	t.Run("get index statistics", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.GetIndexStatistics(ctx, &milvuspb.GetIndexStatisticsRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			IndexName:      "",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		indexName = resp.IndexDescriptions[0].IndexName
 	})
 
@@ -1182,7 +1136,7 @@ func TestProxy(t *testing.T) {
 			IndexName:      indexName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1196,13 +1150,23 @@ func TestProxy(t *testing.T) {
 			IndexName:      indexName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	loaded := true
 	wg.Add(1)
 	t.Run("load collection", func(t *testing.T) {
 		defer wg.Done()
+		{
+			stateResp, err := proxy.GetLoadState(ctx, &milvuspb.GetLoadStateRequest{
+				DbName:         dbName,
+				CollectionName: collectionName,
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+			assert.Equal(t, commonpb.LoadState_LoadStateNotLoad, stateResp.State)
+		}
+
 		resp, err := proxy.LoadCollection(ctx, &milvuspb.LoadCollectionRequest{
 			Base:           nil,
 			DbName:         dbName,
@@ -1229,7 +1193,7 @@ func TestProxy(t *testing.T) {
 				CollectionNames: []string{collectionName},
 			})
 			assert.NoError(t, err)
-			assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 			for idx, name := range resp.CollectionNames {
 				if name == collectionName && resp.InMemoryPercentages[idx] == 100 {
@@ -1251,8 +1215,8 @@ func TestProxy(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 			counter++
 		}
+		assert.True(t, loaded)
 	})
-	assert.True(t, loaded)
 
 	wg.Add(1)
 	t.Run("show in-memory collections", func(t *testing.T) {
@@ -1265,7 +1229,7 @@ func TestProxy(t *testing.T) {
 			CollectionNames: nil,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 1, len(resp.CollectionNames))
 
 		// get in-memory percentage
@@ -1277,7 +1241,7 @@ func TestProxy(t *testing.T) {
 			CollectionNames: []string{collectionName},
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 1, len(resp.CollectionNames))
 		assert.Equal(t, 1, len(resp.InMemoryPercentages))
 
@@ -1290,24 +1254,36 @@ func TestProxy(t *testing.T) {
 			CollectionNames: []string{otherCollectionName},
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		{
 			progressResp, err := proxy.GetLoadingProgress(ctx, &milvuspb.GetLoadingProgressRequest{
+				DbName:         dbName,
 				CollectionName: collectionName,
 			})
 			assert.NoError(t, err)
-			assert.Equal(t, commonpb.ErrorCode_Success, progressResp.Status.ErrorCode)
+			assert.Equal(t, commonpb.ErrorCode_Success, progressResp.GetStatus().GetErrorCode())
 			assert.NotEqual(t, int64(0), progressResp.Progress)
 		}
 
 		{
 			progressResp, err := proxy.GetLoadingProgress(ctx, &milvuspb.GetLoadingProgressRequest{
+				DbName:         dbName,
 				CollectionName: otherCollectionName,
 			})
 			assert.NoError(t, err)
-			assert.NotEqual(t, commonpb.ErrorCode_Success, progressResp.Status.ErrorCode)
+			assert.NotEqual(t, commonpb.ErrorCode_Success, progressResp.GetStatus().GetErrorCode())
 			assert.Equal(t, int64(0), progressResp.Progress)
+		}
+
+		{
+			stateResp, err := proxy.GetLoadState(ctx, &milvuspb.GetLoadStateRequest{
+				DbName:         dbName,
+				CollectionName: otherCollectionName,
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+			assert.Equal(t, commonpb.LoadState_LoadStateNotExist, stateResp.State)
 		}
 	})
 
@@ -1315,7 +1291,7 @@ func TestProxy(t *testing.T) {
 	t.Run("get replicas", func(t *testing.T) {
 		defer wg.Done()
 
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.GetReplicas(ctx, &milvuspb.GetReplicasRequest{
@@ -1338,7 +1314,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: collectionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		rowNumStr := funcutil.KeyValuePair2Map(resp.Stats)["row_count"]
 		assert.Equal(t, strconv.Itoa(rowNum), rowNumStr)
 
@@ -1349,7 +1325,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: otherCollectionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	// nprobe := 10
@@ -1435,33 +1411,7 @@ func TestProxy(t *testing.T) {
 	//
 	//         resp, err := proxy.Search(ctx, req)
 	//         assert.NoError(t, err)
-	//         assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
-	//     })
-	//
-	//     wg.Add(1)
-	//     t.Run("search_travel", func(t *testing.T) {
-	//         defer wg.Done()
-	//         past := time.Now().Add(time.Duration(-1*Params.CommonCfg.RetentionDuration-100) * time.Second)
-	//         travelTs := tsoutil.ComposeTSByTime(past, 0)
-	//         req := constructSearchRequest()
-	//         req.TravelTimestamp = travelTs
-	//         //resp, err := proxy.Search(ctx, req)
-	//         res, err := proxy.Search(ctx, req)
-	//         assert.NoError(t, err)
-	//         assert.NotEqual(t, commonpb.ErrorCode_Success, res.Status.ErrorCode)
-	//     })
-	//
-	//     wg.Add(1)
-	//     t.Run("search_travel_succ", func(t *testing.T) {
-	//         defer wg.Done()
-	//         past := time.Now().Add(time.Duration(-1*Params.CommonCfg.RetentionDuration+100) * time.Second)
-	//         travelTs := tsoutil.ComposeTSByTime(past, 0)
-	//         req := constructSearchRequest()
-	//         req.TravelTimestamp = travelTs
-	//         //resp, err := proxy.Search(ctx, req)
-	//         res, err := proxy.Search(ctx, req)
-	//         assert.NoError(t, err)
-	//         assert.Equal(t, commonpb.ErrorCode_Success, res.Status.ErrorCode)
+	//         assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	//     })
 	//
 	//     wg.Add(1)
@@ -1480,50 +1430,9 @@ func TestProxy(t *testing.T) {
 	//         })
 	//         assert.NoError(t, err)
 	//         // FIXME(dragondriver)
-	//         // assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+	//         // assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	//         // TODO(dragondriver): compare query result
 	//     })
-	//
-	//     wg.Add(1)
-	//     t.Run("query_travel", func(t *testing.T) {
-	//         defer wg.Done()
-	//         past := time.Now().Add(time.Duration(-1*Params.CommonCfg.RetentionDuration-100) * time.Second)
-	//         travelTs := tsoutil.ComposeTSByTime(past, 0)
-	//         queryReq := &milvuspb.QueryRequest{
-	//             Base:               nil,
-	//             DbName:             dbName,
-	//             CollectionName:     collectionName,
-	//             Expr:               expr,
-	//             OutputFields:       nil,
-	//             PartitionNames:     nil,
-	//             TravelTimestamp:    travelTs,
-	//             GuaranteeTimestamp: 0,
-	//         }
-	//         res, err := proxy.Query(ctx, queryReq)
-	//         assert.NoError(t, err)
-	//         assert.NotEqual(t, commonpb.ErrorCode_Success, res.Status.ErrorCode)
-	//     })
-	//
-	//     wg.Add(1)
-	//     t.Run("query_travel_succ", func(t *testing.T) {
-	//         defer wg.Done()
-	//         past := time.Now().Add(time.Duration(-1*Params.CommonCfg.RetentionDuration+100) * time.Second)
-	//         travelTs := tsoutil.ComposeTSByTime(past, 0)
-	//         queryReq := &milvuspb.QueryRequest{
-	//             Base:               nil,
-	//             DbName:             dbName,
-	//             CollectionName:     collectionName,
-	//             Expr:               expr,
-	//             OutputFields:       nil,
-	//             PartitionNames:     nil,
-	//             TravelTimestamp:    travelTs,
-	//             GuaranteeTimestamp: 0,
-	//         }
-	//         res, err := proxy.Query(ctx, queryReq)
-	//         assert.NoError(t, err)
-	//         assert.Equal(t, commonpb.ErrorCode_EmptyCollection, res.Status.ErrorCode)
-	//     })
-	// }
 
 	wg.Add(1)
 	t.Run("calculate distance", func(t *testing.T) {
@@ -1554,7 +1463,7 @@ func TestProxy(t *testing.T) {
 			},
 		}
 
-		//resp, err := proxy.CalcDistance(ctx, &milvuspb.CalcDistanceRequest{
+		// resp, err := proxy.CalcDistance(ctx, &milvuspb.CalcDistanceRequest{
 		_, err := proxy.CalcDistance(ctx, &milvuspb.CalcDistanceRequest{
 			Base:    nil,
 			OpLeft:  opLeft,
@@ -1562,22 +1471,20 @@ func TestProxy(t *testing.T) {
 			Params: []*commonpb.KeyValuePair{
 				{
 					Key:   common.MetricTypeKey,
-					Value: distance.L2,
+					Value: metric.L2,
 				},
 			},
 		})
 		assert.NoError(t, err)
-		// assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		// assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		// TODO(dragondriver): compare distance
 
 		// TODO(dragondriver): use primary key to calculate distance
 	})
 
 	t.Run("get dd channel", func(t *testing.T) {
-		f := func() {
-			_, _ = proxy.GetDdChannel(ctx, &internalpb.GetDdChannelRequest{})
-		}
-		assert.Panics(t, f)
+		resp, _ := proxy.GetDdChannel(ctx, &internalpb.GetDdChannelRequest{})
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1589,7 +1496,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: collectionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1601,7 +1508,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: collectionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1611,7 +1518,7 @@ func TestProxy(t *testing.T) {
 			Base: nil,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.ErrorCode)
+		assert.ErrorIs(t, merr.Error(resp), merr.ErrCollectionNotFound)
 	})
 
 	// TODO(dragondriver): dummy
@@ -1621,7 +1528,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.RegisterLink(ctx, &milvuspb.RegisterLinkRequest{})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1631,12 +1538,12 @@ func TestProxy(t *testing.T) {
 		assert.NoError(t, err)
 		resp, err := proxy.GetMetrics(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// get from cache
 		resp, err = proxy.GetMetrics(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// failed to parse metric type
 		resp, err = proxy.GetMetrics(ctx, &milvuspb.GetMetricsRequest{
@@ -1644,14 +1551,14 @@ func TestProxy(t *testing.T) {
 			Request: "not in json format",
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// not implemented metric
 		notImplemented, err := metricsinfo.ConstructRequestByMetricType("not implemented")
 		assert.NoError(t, err)
 		resp, err = proxy.GetMetrics(ctx, notImplemented)
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1661,7 +1568,7 @@ func TestProxy(t *testing.T) {
 		assert.NoError(t, err)
 		resp, err := proxy.GetProxyMetrics(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// failed to parse metric type
 		resp, err = proxy.GetProxyMetrics(ctx, &milvuspb.GetMetricsRequest{
@@ -1669,27 +1576,27 @@ func TestProxy(t *testing.T) {
 			Request: "not in json format",
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// not implemented metric
 		notImplemented, err := metricsinfo.ConstructRequestByMetricType("not implemented")
 		assert.NoError(t, err)
 		resp, err = proxy.GetProxyMetrics(ctx, notImplemented)
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// unhealthy
 		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err = proxy.GetProxyMetrics(ctx, req)
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 
 		// getProxyMetric failed
 		rateCol.Deregister(internalpb.RateType_DMLInsert.String())
 		resp, err = proxy.GetProxyMetrics(ctx, req)
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		rateCol.Register(internalpb.RateType_DMLInsert.String())
 	})
 
@@ -1697,13 +1604,14 @@ func TestProxy(t *testing.T) {
 	t.Run("test import", func(t *testing.T) {
 		defer wg.Done()
 		req := &milvuspb.ImportRequest{
+			DbName:         dbName,
 			CollectionName: collectionName,
-			Files:          []string{"f1.json", "f2.json", "f3.json"},
+			Files:          []string{"f1.json"},
 		}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 		resp, err := proxy.Import(context.TODO(), req)
-		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
-		assert.Nil(t, err)
+		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		assert.NoError(t, err)
 		// Wait a bit for complete import to start.
 		time.Sleep(2 * time.Second)
 	})
@@ -1713,12 +1621,12 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		req := &milvuspb.ImportRequest{
 			CollectionName: "bad_collection_name",
-			Files:          []string{"f1", "f2", "f3"},
+			Files:          []string{"f1.json"},
 		}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 		resp, err := proxy.Import(context.TODO(), req)
 		assert.NoError(t, err)
-		assert.EqualValues(t, commonpb.ErrorCode_UnexpectedError, resp.Status.ErrorCode)
+		assert.EqualValues(t, commonpb.ErrorCode_UnexpectedError, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1726,18 +1634,18 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		req := &milvuspb.ImportRequest{
 			CollectionName: "bad_collection_name",
-			Files:          []string{"f1", "f2", "f3"},
+			Files:          []string{"f1.json"},
 		}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 		resp, err := proxy.Import(context.TODO(), req)
 		assert.NoError(t, err)
-		assert.EqualValues(t, commonpb.ErrorCode_UnexpectedError, resp.Status.ErrorCode)
+		assert.EqualValues(t, commonpb.ErrorCode_UnexpectedError, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
 	t.Run("release collection", func(t *testing.T) {
 		defer wg.Done()
-		_, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		_, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.ReleaseCollection(ctx, &milvuspb.ReleaseCollectionRequest{
@@ -1770,7 +1678,7 @@ func TestProxy(t *testing.T) {
 			CollectionNames: nil,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 0, len(resp.CollectionNames))
 	})
 
@@ -1778,7 +1686,7 @@ func TestProxy(t *testing.T) {
 	wg.Add(1)
 	t.Run("load partitions", func(t *testing.T) {
 		defer wg.Done()
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.LoadPartitions(ctx, &milvuspb.LoadPartitionsRequest{
@@ -1823,7 +1731,7 @@ func TestProxy(t *testing.T) {
 				Type:           milvuspb.ShowType_InMemory,
 			})
 			assert.NoError(t, err)
-			assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 			for idx, name := range resp.PartitionNames {
 				if name == partitionName && resp.InMemoryPercentages[idx] == 100 {
@@ -1851,7 +1759,7 @@ func TestProxy(t *testing.T) {
 	wg.Add(1)
 	t.Run("show in-memory partitions", func(t *testing.T) {
 		defer wg.Done()
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
@@ -1863,7 +1771,7 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_InMemory,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		// default partition?
 		assert.Equal(t, 1, len(resp.PartitionNames))
 
@@ -1877,7 +1785,7 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_InMemory,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// non-exist collection -> fail
 		resp, err = proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
@@ -1889,25 +1797,27 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_InMemory,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		{
 			resp, err := proxy.GetLoadingProgress(ctx, &milvuspb.GetLoadingProgressRequest{
+				DbName:         dbName,
 				CollectionName: collectionName,
 				PartitionNames: []string{partitionName},
 			})
 			assert.NoError(t, err)
-			assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 			assert.NotEqual(t, int64(0), resp.Progress)
 		}
 
 		{
 			resp, err := proxy.GetLoadingProgress(ctx, &milvuspb.GetLoadingProgressRequest{
+				DbName:         dbName,
 				CollectionName: collectionName,
 				PartitionNames: []string{otherPartitionName},
 			})
 			assert.NoError(t, err)
-			assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+			assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 			assert.Equal(t, int64(0), resp.Progress)
 		}
 	})
@@ -1919,7 +1829,7 @@ func TestProxy(t *testing.T) {
 
 		resp, err := proxy.Insert(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, rowNum, len(resp.SuccIndex))
 		assert.Equal(t, 0, len(resp.ErrIndex))
 		assert.Equal(t, int64(rowNum), resp.InsertCnt)
@@ -1938,7 +1848,7 @@ func TestProxy(t *testing.T) {
 			PartitionNames: []string{partitionName},
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		rowNumStr := funcutil.KeyValuePair2Map(resp.Stats)["row_count"]
 		assert.Equal(t, strconv.Itoa(rowNum), rowNumStr)
 
@@ -1950,7 +1860,7 @@ func TestProxy(t *testing.T) {
 			PartitionNames: []string{otherPartitionName},
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		// non-exist collection -> fail
 		resp, err = proxy.GetStatistics(ctx, &milvuspb.GetStatisticsRequest{
@@ -1960,7 +1870,7 @@ func TestProxy(t *testing.T) {
 			PartitionNames: []string{partitionName},
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -1978,7 +1888,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: collectionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		rowNumStr := funcutil.KeyValuePair2Map(resp.Stats)["row_count"]
 		assert.Equal(t, strconv.Itoa(rowNum*2), rowNumStr)
 
@@ -1989,7 +1899,7 @@ func TestProxy(t *testing.T) {
 			CollectionName: otherCollectionName,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2008,7 +1918,7 @@ func TestProxy(t *testing.T) {
 	wg.Add(1)
 	t.Run("show in-memory partitions after release partition", func(t *testing.T) {
 		defer wg.Done()
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
@@ -2020,7 +1930,7 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_InMemory,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		// default partition
 		assert.Equal(t, 0, len(resp.PartitionNames))
 
@@ -2033,7 +1943,7 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_InMemory,
 		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2079,14 +1989,14 @@ func TestProxy(t *testing.T) {
 			PartitionName:  partitionName,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.False(t, resp.Value)
 	})
 
 	wg.Add(1)
 	t.Run("show partitions after drop partition", func(t *testing.T) {
 		defer wg.Done()
-		collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		collectionID, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
@@ -2098,7 +2008,7 @@ func TestProxy(t *testing.T) {
 			Type:           milvuspb.ShowType_All,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		// default partition
 		assert.Equal(t, 1, len(resp.PartitionNames))
 	})
@@ -2131,9 +2041,22 @@ func TestProxy(t *testing.T) {
 	})
 
 	wg.Add(1)
+	t.Run("upsert when autoID == true", func(t *testing.T) {
+		defer wg.Done()
+		req := constructCollectionUpsertRequest()
+
+		resp, err := proxy.Upsert(ctx, req)
+		assert.NoError(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrParameterInvalid)
+		assert.Equal(t, 0, len(resp.SuccIndex))
+		assert.Equal(t, rowNum, len(resp.ErrIndex))
+		assert.Equal(t, int64(0), resp.UpsertCnt)
+	})
+
+	wg.Add(1)
 	t.Run("drop collection", func(t *testing.T) {
 		defer wg.Done()
-		_, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+		_, err := globalMetaCache.GetCollectionID(ctx, dbName, collectionName)
 		assert.NoError(t, err)
 
 		resp, err := proxy.DropCollection(ctx, &milvuspb.DropCollectionRequest{
@@ -2172,7 +2095,7 @@ func TestProxy(t *testing.T) {
 			TimeStamp:      0,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.False(t, resp.Value)
 	})
 
@@ -2187,7 +2110,7 @@ func TestProxy(t *testing.T) {
 			CollectionNames: nil,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 0, len(resp.CollectionNames))
 	})
 
@@ -2239,6 +2162,12 @@ func TestProxy(t *testing.T) {
 	wg.Add(1)
 	t.Run("credential UPDATE api", func(t *testing.T) {
 		defer wg.Done()
+		rootCtx := ctx
+		fooCtx := GetContext(context.Background(), "foo:123456")
+		ctx = fooCtx
+		defer func() {
+			ctx = rootCtx
+		}()
 
 		// 2. update credential
 		newPassword := "new_password"
@@ -2290,6 +2219,15 @@ func TestProxy(t *testing.T) {
 		updateResp, err = proxy.UpdateCredential(ctx, updateCredentialReq)
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, updateResp.ErrorCode)
+
+		// super user
+		paramtable.Get().Save(Params.CommonCfg.SuperUsers.Key, "root")
+		defer paramtable.Get().Reset(Params.CommonCfg.SuperUsers.Key)
+		updateCredentialReq.OldPassword = crypto.Base64Encode("wrong_password")
+		updateCredentialReq.NewPassword = crypto.Base64Encode(newPassword)
+		updateResp, err = proxy.UpdateCredential(rootCtx, updateCredentialReq)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, updateResp.ErrorCode)
 	})
 
 	wg.Add(1)
@@ -2307,12 +2245,13 @@ func TestProxy(t *testing.T) {
 		getCredentialReq := constructGetCredentialRequest()
 		getResp, err := rootCoordClient.GetCredential(ctx, getCredentialReq)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, getResp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, getResp.GetStatus().GetErrorCode())
 		assert.True(t, passwordVerify(ctx, username, newPassword, globalMetaCache))
 
 		getCredentialReq.Username = "("
 		getResp, err = rootCoordClient.GetCredential(ctx, getCredentialReq)
-		assert.Error(t, err)
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, getResp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2356,7 +2295,7 @@ func TestProxy(t *testing.T) {
 	// proxy unhealthy
 	//
 	//notStateCode := "not state code"
-	//proxy.stateCode.Store(notStateCode)
+	//proxy.UpdateStateCode(notStateCode)
 	//
 	//t.Run("GetComponentStates fail", func(t *testing.T) {
 	//	_, err := proxy.GetComponentStates(ctx)
@@ -2386,7 +2325,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.HasCollection(ctx, &milvuspb.HasCollectionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2410,7 +2349,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2418,7 +2357,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetCollectionStatistics(ctx, &milvuspb.GetCollectionStatisticsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2426,7 +2365,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ShowCollections(ctx, &milvuspb.ShowCollectionsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2462,7 +2401,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.HasPartition(ctx, &milvuspb.HasPartitionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2486,7 +2425,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetPartitionStatistics(ctx, &milvuspb.GetPartitionStatisticsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2494,7 +2433,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2502,7 +2441,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetLoadingProgress(ctx, &milvuspb.GetLoadingProgressRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("GetLoadState fail, unhealthy", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.GetLoadState(ctx, &milvuspb.GetLoadStateRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2518,7 +2465,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.DescribeIndex(ctx, &milvuspb.DescribeIndexRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("GetIndexStatistics fail, unhealthy", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.GetIndexStatistics(ctx, &milvuspb.GetIndexStatisticsRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2534,7 +2489,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetIndexBuildProgress(ctx, &milvuspb.GetIndexBuildProgressRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2542,7 +2497,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetIndexState(ctx, &milvuspb.GetIndexStateRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2550,7 +2505,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Insert(ctx, &milvuspb.InsertRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2558,7 +2513,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Delete(ctx, &milvuspb.DeleteRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("Upsert fail, unhealthy", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.Upsert(ctx, &milvuspb.UpsertRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2566,7 +2529,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Search(ctx, &milvuspb.SearchRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2574,7 +2537,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Flush(ctx, &milvuspb.FlushRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2582,7 +2545,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Query(ctx, &milvuspb.QueryRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2614,7 +2577,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetPersistentSegmentInfo(ctx, &milvuspb.GetPersistentSegmentInfoRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2622,7 +2585,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetQuerySegmentInfo(ctx, &milvuspb.GetQuerySegmentInfoRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2638,7 +2601,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.RegisterLink(ctx, &milvuspb.RegisterLinkRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2646,7 +2609,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetMetrics(ctx, &milvuspb.GetMetricsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2694,7 +2657,13 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ListCredUsers(ctx, &milvuspb.ListCredUsersRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	t.Run("InvalidateCollectionMetaCache failed", func(t *testing.T) {
+		resp, err := proxy.InvalidateCollectionMetaCache(ctx, &proxypb.InvalidateCollMetaCacheRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
 	})
 
 	testProxyRoleUnhealthy(ctx, t, proxy)
@@ -2729,7 +2698,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.HasCollection(ctx, &milvuspb.HasCollectionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2753,7 +2722,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2761,7 +2730,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetCollectionStatistics(ctx, &milvuspb.GetCollectionStatisticsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2769,7 +2738,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ShowCollections(ctx, &milvuspb.ShowCollectionsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2805,7 +2774,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.HasPartition(ctx, &milvuspb.HasPartitionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2829,7 +2798,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetPartitionStatistics(ctx, &milvuspb.GetPartitionStatisticsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2837,7 +2806,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2853,7 +2822,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.DescribeIndex(ctx, &milvuspb.DescribeIndexRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("GetIndexStatistics fail, dd queue full", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.GetIndexStatistics(ctx, &milvuspb.GetIndexStatisticsRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2869,7 +2846,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetIndexBuildProgress(ctx, &milvuspb.GetIndexBuildProgressRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2877,7 +2854,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetIndexState(ctx, &milvuspb.GetIndexStateRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2885,7 +2862,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Flush(ctx, &milvuspb.FlushRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2922,7 +2899,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Insert(ctx, &milvuspb.InsertRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2930,7 +2907,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Delete(ctx, &milvuspb.DeleteRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("Upsert fail, dm queue full", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.Upsert(ctx, &milvuspb.UpsertRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	proxy.sched.dmQueue.setMaxTaskNum(dmParallelism)
@@ -2943,7 +2928,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Search(ctx, &milvuspb.SearchRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -2951,7 +2936,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Query(ctx, &milvuspb.QueryRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	proxy.sched.dqQueue.setMaxTaskNum(dqParallelism)
@@ -2984,7 +2969,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.HasCollection(shortCtx, &milvuspb.HasCollectionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3008,7 +2993,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.DescribeCollection(shortCtx, &milvuspb.DescribeCollectionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3016,7 +3001,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetCollectionStatistics(shortCtx, &milvuspb.GetCollectionStatisticsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3024,7 +3009,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ShowCollections(shortCtx, &milvuspb.ShowCollectionsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3060,7 +3045,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.HasPartition(shortCtx, &milvuspb.HasPartitionRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3084,7 +3069,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetPartitionStatistics(shortCtx, &milvuspb.GetPartitionStatisticsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3092,7 +3077,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.ShowPartitions(shortCtx, &milvuspb.ShowPartitionsRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3100,7 +3085,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetLoadingProgress(shortCtx, &milvuspb.GetLoadingProgressRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3116,7 +3101,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.DescribeIndex(shortCtx, &milvuspb.DescribeIndexRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("GetIndexStatistics fail, timeout", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.GetIndexStatistics(shortCtx, &milvuspb.GetIndexStatisticsRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3132,7 +3125,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetIndexBuildProgress(shortCtx, &milvuspb.GetIndexBuildProgressRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3140,7 +3133,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.GetIndexState(shortCtx, &milvuspb.GetIndexStateRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3149,7 +3142,7 @@ func TestProxy(t *testing.T) {
 		_, err := proxy.Flush(shortCtx, &milvuspb.FlushRequest{})
 		assert.NoError(t, err)
 		// FIXME(dragondriver)
-		// assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		// assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3157,7 +3150,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Insert(shortCtx, &milvuspb.InsertRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3165,7 +3158,15 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Delete(shortCtx, &milvuspb.DeleteRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	})
+
+	wg.Add(1)
+	t.Run("Update fail, timeout", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.Upsert(shortCtx, &milvuspb.UpsertRequest{})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3173,7 +3174,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Search(shortCtx, &milvuspb.SearchRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3181,7 +3182,7 @@ func TestProxy(t *testing.T) {
 		defer wg.Done()
 		resp, err := proxy.Query(shortCtx, &milvuspb.QueryRequest{})
 		assert.NoError(t, err)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
@@ -3243,6 +3244,188 @@ func TestProxy(t *testing.T) {
 	testProxyRoleTimeout(shortCtx, t, proxy)
 	testProxyPrivilegeTimeout(shortCtx, t, proxy)
 
+	constructCollectionSchema = func() *schemapb.CollectionSchema {
+		pk := &schemapb.FieldSchema{
+			FieldID:      0,
+			Name:         int64Field,
+			IsPrimaryKey: true,
+			Description:  "",
+			DataType:     schemapb.DataType_Int64,
+			TypeParams:   nil,
+			IndexParams:  nil,
+			AutoID:       false,
+		}
+		fVec := &schemapb.FieldSchema{
+			FieldID:      0,
+			Name:         floatVecField,
+			IsPrimaryKey: false,
+			Description:  "",
+			DataType:     schemapb.DataType_FloatVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{
+					Key:   common.DimKey,
+					Value: strconv.Itoa(dim),
+				},
+			},
+			IndexParams: nil,
+			AutoID:      false,
+		}
+		return &schemapb.CollectionSchema{
+			Name:        collectionName,
+			Description: "",
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				pk,
+				fVec,
+			},
+		}
+	}
+	schema = constructCollectionSchema()
+
+	constructCreateCollectionRequest = func() *milvuspb.CreateCollectionRequest {
+		bs, err := proto.Marshal(schema)
+		assert.NoError(t, err)
+		return &milvuspb.CreateCollectionRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			Schema:         bs,
+			ShardsNum:      shardsNum,
+		}
+	}
+	createCollectionReq = constructCreateCollectionRequest()
+
+	constructPartitionReqUpsertRequestValid := func() *milvuspb.UpsertRequest {
+		pkFieldData := newScalarFieldData(schema.Fields[0], int64Field, rowNum)
+		fVecColumn := newFloatVectorFieldData(floatVecField, rowNum, dim)
+		hashKeys := generateHashKeys(rowNum)
+		return &milvuspb.UpsertRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			PartitionName:  partitionName,
+			FieldsData:     []*schemapb.FieldData{pkFieldData, fVecColumn},
+			HashKeys:       hashKeys,
+			NumRows:        uint32(rowNum),
+		}
+	}
+
+	constructPartitionReqUpsertRequestInvalid := func() *milvuspb.UpsertRequest {
+		pkFieldData := newScalarFieldData(schema.Fields[0], int64Field, rowNum)
+		fVecColumn := newFloatVectorFieldData(floatVecField, rowNum, dim)
+		hashKeys := generateHashKeys(rowNum)
+		return &milvuspb.UpsertRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			PartitionName:  "%$@",
+			FieldsData:     []*schemapb.FieldData{pkFieldData, fVecColumn},
+			HashKeys:       hashKeys,
+			NumRows:        uint32(rowNum),
+		}
+	}
+
+	constructCollectionUpsertRequestValid := func() *milvuspb.UpsertRequest {
+		pkFieldData := newScalarFieldData(schema.Fields[0], int64Field, rowNum)
+		fVecColumn := newFloatVectorFieldData(floatVecField, rowNum, dim)
+		hashKeys := generateHashKeys(rowNum)
+		return &milvuspb.UpsertRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			PartitionName:  partitionName,
+			FieldsData:     []*schemapb.FieldData{pkFieldData, fVecColumn},
+			HashKeys:       hashKeys,
+			NumRows:        uint32(rowNum),
+		}
+	}
+
+	wg.Add(1)
+	t.Run("create collection upsert valid", func(t *testing.T) {
+		defer wg.Done()
+		req := createCollectionReq
+		resp, err := proxy.CreateCollection(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		reqInvalidField := constructCreateCollectionRequest()
+		schema := constructCollectionSchema()
+		schema.Fields = append(schema.Fields, &schemapb.FieldSchema{
+			Name:     "StringField",
+			DataType: schemapb.DataType_String,
+		})
+		bs, err := proto.Marshal(schema)
+		assert.NoError(t, err)
+		reqInvalidField.CollectionName = "invalid_field_coll_upsert_valid"
+		reqInvalidField.Schema = bs
+
+		resp, err = proxy.CreateCollection(ctx, reqInvalidField)
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+	})
+
+	wg.Add(1)
+	t.Run("create partition", func(t *testing.T) {
+		defer wg.Done()
+		resp, err := proxy.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: collectionName,
+			PartitionName:  partitionName,
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		// create partition with non-exist collection -> fail
+		resp, err = proxy.CreatePartition(ctx, &milvuspb.CreatePartitionRequest{
+			Base:           nil,
+			DbName:         dbName,
+			CollectionName: otherCollectionName,
+			PartitionName:  partitionName,
+		})
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+	})
+
+	wg.Add(1)
+	t.Run("upsert partition", func(t *testing.T) {
+		defer wg.Done()
+		req := constructPartitionReqUpsertRequestValid()
+
+		resp, err := proxy.Upsert(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		assert.Equal(t, rowNum, len(resp.SuccIndex))
+		assert.Equal(t, 0, len(resp.ErrIndex))
+		assert.Equal(t, int64(rowNum), resp.UpsertCnt)
+	})
+
+	wg.Add(1)
+	t.Run("upsert when occurs unexpected error like illegal partition name", func(t *testing.T) {
+		defer wg.Done()
+		req := constructPartitionReqUpsertRequestInvalid()
+
+		resp, err := proxy.Upsert(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.GetStatus().GetErrorCode())
+		assert.Equal(t, 0, len(resp.SuccIndex))
+		assert.Equal(t, rowNum, len(resp.ErrIndex))
+		assert.Equal(t, int64(0), resp.UpsertCnt)
+	})
+
+	wg.Add(1)
+	t.Run("upsert when autoID == false", func(t *testing.T) {
+		defer wg.Done()
+		req := constructCollectionUpsertRequestValid()
+
+		resp, err := proxy.Upsert(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		assert.Equal(t, rowNum, len(resp.SuccIndex))
+		assert.Equal(t, 0, len(resp.ErrIndex))
+		assert.Equal(t, int64(rowNum), resp.UpsertCnt)
+	})
+
 	testServer.gracefulStop()
 
 	wg.Wait()
@@ -3300,7 +3483,7 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 		assert.Equal(t, commonpb.ErrorCode_Success, privilegeResp.ErrorCode)
 
 		userResp, _ := proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: &milvuspb.UserEntity{Name: username}, IncludeRoleInfo: true})
-		assert.Equal(t, commonpb.ErrorCode_Success, userResp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, userResp.GetStatus().GetErrorCode())
 		roleNumOfUser := len(userResp.Results[0].Roles)
 
 		roleResp, _ = proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{
@@ -3321,7 +3504,7 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 		assert.Equal(t, commonpb.ErrorCode_Success, roleResp.ErrorCode)
 
 		userResp, _ = proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: &milvuspb.UserEntity{Name: username}, IncludeRoleInfo: true})
-		assert.Equal(t, commonpb.ErrorCode_Success, userResp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, userResp.GetStatus().GetErrorCode())
 		assert.Equal(t, roleNumOfUser, len(userResp.Results[0].Roles))
 	})
 
@@ -3349,6 +3532,9 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 
 		resp, _ = proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{Username: username, RoleName: roleName, Type: milvuspb.OperateUserRoleType_RemoveUserFromRole})
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+
+		resp, _ = proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{Username: "NotExisted", RoleName: roleName, Type: milvuspb.OperateUserRoleType_RemoveUserFromRole})
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
 	})
 
 	wg.Add(1)
@@ -3356,14 +3542,14 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 		defer wg.Done()
 
 		resp, _ := proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{Role: &milvuspb.RoleEntity{Name: "  "}})
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		resp, _ = proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		roleNum := len(resp.Results)
 
 		resp, _ = proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{Role: &milvuspb.RoleEntity{Name: "not_existed"}})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 0, len(resp.Results))
 
 		roleName := "unit_test"
@@ -3371,7 +3557,7 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 		assert.Equal(t, commonpb.ErrorCode_Success, roleResp.ErrorCode)
 
 		resp, _ = proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, roleNum+1, len(resp.Results))
 
 		roleResp, _ = proxy.DropRole(ctx, &milvuspb.DropRoleRequest{RoleName: roleName})
@@ -3381,7 +3567,7 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 		assert.Equal(t, commonpb.ErrorCode_Success, opResp.ErrorCode)
 
 		resp, _ = proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{Role: &milvuspb.RoleEntity{Name: "admin"}, IncludeUserInfo: true})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.NotEqual(t, 0, len(resp.Results))
 		assert.NotEqual(t, 0, len(resp.Results[0].Users))
 
@@ -3395,28 +3581,93 @@ func testProxyRole(ctx context.Context, t *testing.T, proxy *Proxy) {
 
 		entity := &milvuspb.UserEntity{Name: "  "}
 		resp, _ := proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: entity})
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 
 		entity.Name = "not_existed"
 		resp, _ = proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: entity})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.Equal(t, 0, len(resp.Results))
 
 		entity.Name = "root"
 		resp, _ = proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: entity})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.NotEqual(t, 0, len(resp.Results))
 
 		opResp, _ := proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{Username: "root", RoleName: "admin"})
 		assert.Equal(t, commonpb.ErrorCode_Success, opResp.ErrorCode)
 
 		resp, _ = proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: entity, IncludeRoleInfo: true})
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		assert.NotEqual(t, 0, len(resp.Results))
 		assert.NotEqual(t, 0, len(resp.Results[0].Roles))
 
 		opResp, _ = proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{Username: "root", RoleName: "admin", Type: milvuspb.OperateUserRoleType_RemoveUserFromRole})
 		assert.Equal(t, commonpb.ErrorCode_Success, opResp.ErrorCode)
+	})
+
+	wg.Add(1)
+	t.Run("User Role mapping info", func(t *testing.T) {
+		defer wg.Done()
+
+		ctx := context.Background()
+		username := fmt.Sprintf("user%d", rand.Int31())
+		roleName := fmt.Sprintf("role%d", rand.Int31())
+		{
+			createCredentialResp, err := proxy.CreateCredential(ctx, &milvuspb.CreateCredentialRequest{Username: username, Password: crypto.Base64Encode("userpwd")})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, createCredentialResp.ErrorCode)
+			createRoleResp, err := proxy.CreateRole(ctx, &milvuspb.CreateRoleRequest{Entity: &milvuspb.RoleEntity{Name: roleName}})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, createRoleResp.ErrorCode)
+		}
+		{
+			resp, err := proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{Username: username, RoleName: roleName})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		}
+		{
+			resp, err := proxy.OperateUserRole(ctx, &milvuspb.OperateUserRoleRequest{Username: username, RoleName: "admin"})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		}
+		{
+			selectUserResp, err := proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: &milvuspb.UserEntity{Name: username}, IncludeRoleInfo: true})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, selectUserResp.GetStatus().GetErrorCode())
+			assert.Equal(t, 2, len(selectUserResp.Results[0].Roles))
+
+			selectRoleResp, err := proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{Role: &milvuspb.RoleEntity{Name: roleName}, IncludeUserInfo: true})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, selectRoleResp.GetStatus().GetErrorCode())
+			assert.Equal(t, 1, len(selectRoleResp.Results[0].Users))
+		}
+		{
+			resp, err := proxy.DropRole(ctx, &milvuspb.DropRoleRequest{RoleName: roleName})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		}
+		{
+			selectUserResp, err := proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: &milvuspb.UserEntity{Name: username}, IncludeRoleInfo: true})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, selectUserResp.GetStatus().GetErrorCode())
+			assert.Equal(t, 1, len(selectUserResp.Results[0].Roles))
+
+			selectRoleResp, err := proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{Role: &milvuspb.RoleEntity{Name: roleName}, IncludeUserInfo: true})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, selectRoleResp.GetStatus().GetErrorCode())
+			assert.Equal(t, 0, len(selectRoleResp.Results))
+		}
+		{
+			resp, err := proxy.DeleteCredential(ctx, &milvuspb.DeleteCredentialRequest{Username: username})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		}
+		{
+			selectUserResp, err := proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{User: &milvuspb.UserEntity{Name: username}, IncludeRoleInfo: true})
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, selectUserResp.GetStatus().GetErrorCode())
+			assert.Equal(t, 0, len(selectUserResp.Results))
+		}
 	})
 
 	wg.Wait()
@@ -3459,14 +3710,14 @@ func testProxyRoleFail(ctx context.Context, t *testing.T, proxy *Proxy, reason s
 	t.Run(fmt.Sprintf("SelectRole fail, %s", reason), func(t *testing.T) {
 		defer wg.Done()
 		resp, _ := proxy.SelectRole(ctx, &milvuspb.SelectRoleRequest{})
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Add(1)
 	t.Run(fmt.Sprintf("SelectUser fail, %s", reason), func(t *testing.T) {
 		defer wg.Done()
 		resp, _ := proxy.SelectUser(ctx, &milvuspb.SelectUserRequest{})
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	wg.Wait()
@@ -3552,49 +3803,49 @@ func testProxyPrivilege(ctx context.Context, t *testing.T, proxy *Proxy) {
 		// select grant
 		selectReq := &milvuspb.SelectGrantRequest{}
 		results, _ := proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		selectReq.Entity = &milvuspb.GrantEntity{}
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		selectReq.Entity.Object = &milvuspb.ObjectEntity{}
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		selectReq.Entity.Object.Name = commonpb.ObjectType_Collection.String()
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		selectReq.Entity.ObjectName = "col1"
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		selectReq.Entity.Role = &milvuspb.RoleEntity{}
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		selectReq.Entity.Role = &milvuspb.RoleEntity{Name: "public"}
 
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.Equal(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 		assert.NotEqual(t, 0, len(results.Entities))
 
 		selectReq.Entity.Object.Name = "not existed"
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 		selectReq.Entity.Object.Name = commonpb.ObjectType_Collection.String()
 
 		selectReq.Entity.Role = &milvuspb.RoleEntity{Name: "not existed"}
 		results, _ = proxy.SelectGrant(ctx, selectReq)
-		assert.NotEqual(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 
 		results, _ = proxy.SelectGrant(ctx, &milvuspb.SelectGrantRequest{
 			Entity: &milvuspb.GrantEntity{
 				Role: &milvuspb.RoleEntity{Name: "public"},
 			},
 		})
-		assert.Equal(t, commonpb.ErrorCode_Success, results.Status.ErrorCode)
+		assert.Equal(t, commonpb.ErrorCode_Success, results.GetStatus().GetErrorCode())
 		assert.NotEqual(t, 0, len(results.Entities))
 
 		req.Type = milvuspb.OperatePrivilegeType_Revoke
@@ -3674,7 +3925,7 @@ func testProxyPrivilegeFail(ctx context.Context, t *testing.T, proxy *Proxy, rea
 				Role: &milvuspb.RoleEntity{Name: "admin"},
 			},
 		})
-		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 	wg.Wait()
 }
@@ -3691,14 +3942,16 @@ func testProxyRefreshPolicyInfoCache(ctx context.Context, t *testing.T, proxy *P
 		})
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
-		_, err = proxy.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{})
-		assert.Error(t, err)
+		resp, err = proxy.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{})
+		assert.NoError(t, err)
+		assert.Error(t, merr.Error(resp))
 
-		_, err = proxy.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
+		resp, err = proxy.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
 			OpType: 100,
 			OpKey:  funcutil.EncodeUserRoleCache("foo", "public"),
 		})
-		assert.Error(t, err)
+		assert.NoError(t, err)
+		assert.Error(t, merr.Error(resp))
 	})
 	wg.Wait()
 }
@@ -3725,19 +3978,19 @@ func Test_GetCompactionState(t *testing.T) {
 	t.Run("get compaction state", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 		resp, err := proxy.GetCompactionState(context.TODO(), nil)
 		assert.EqualValues(t, &milvuspb.GetCompactionStateResponse{}, resp)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	})
 
 	t.Run("get compaction state with unhealthy proxy", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Abnormal)
+		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.GetCompactionState(context.TODO(), nil)
-		assert.EqualValues(t, unhealthyStatus(), resp.Status)
-		assert.Nil(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+		assert.NoError(t, err)
 	})
 }
 
@@ -3745,18 +3998,18 @@ func Test_ManualCompaction(t *testing.T) {
 	t.Run("test manual compaction", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 		resp, err := proxy.ManualCompaction(context.TODO(), nil)
 		assert.EqualValues(t, &milvuspb.ManualCompactionResponse{}, resp)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	})
 	t.Run("test manual compaction with unhealthy", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Abnormal)
+		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.ManualCompaction(context.TODO(), nil)
-		assert.EqualValues(t, unhealthyStatus(), resp.Status)
-		assert.Nil(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+		assert.NoError(t, err)
 	})
 }
 
@@ -3764,61 +4017,67 @@ func Test_GetCompactionStateWithPlans(t *testing.T) {
 	t.Run("test get compaction state with plans", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 		resp, err := proxy.GetCompactionStateWithPlans(context.TODO(), nil)
 		assert.EqualValues(t, &milvuspb.GetCompactionPlansResponse{}, resp)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	})
 	t.Run("test get compaction state with plans with unhealthy proxy", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Abnormal)
+		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.GetCompactionStateWithPlans(context.TODO(), nil)
-		assert.EqualValues(t, unhealthyStatus(), resp.Status)
-		assert.Nil(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+		assert.NoError(t, err)
 	})
 }
 
 func Test_GetFlushState(t *testing.T) {
 	t.Run("normal test", func(t *testing.T) {
+		originCache := globalMetaCache
+		m := NewMockCache(t)
+		m.On("GetCollectionID",
+			mock.Anything,
+			mock.AnythingOfType("string"),
+			mock.AnythingOfType("string"),
+		).Return(UniqueID(1), nil)
+		globalMetaCache = m
+		defer func() {
+			globalMetaCache = originCache
+		}()
+
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
-		resp, err := proxy.GetFlushState(context.TODO(), nil)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
+		resp, err := proxy.GetFlushState(context.TODO(), &milvuspb.GetFlushStateRequest{
+			CollectionName: "coll",
+		})
 		assert.EqualValues(t, &milvuspb.GetFlushStateResponse{}, resp)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	})
 
 	t.Run("test get flush state with unhealthy proxy", func(t *testing.T) {
 		datacoord := &DataCoordMock{}
 		proxy := &Proxy{dataCoord: datacoord}
-		proxy.stateCode.Store(commonpb.StateCode_Abnormal)
+		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.GetFlushState(context.TODO(), nil)
-		assert.EqualValues(t, unhealthyStatus(), resp.Status)
-		assert.Nil(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+		assert.NoError(t, err)
 	})
 }
 
 func TestProxy_GetComponentStates(t *testing.T) {
 	n := &Proxy{}
-	n.stateCode.Store(commonpb.StateCode_Healthy)
-	resp, err := n.GetComponentStates(context.Background())
+	n.UpdateStateCode(commonpb.StateCode_Healthy)
+	resp, err := n.GetComponentStates(context.Background(), nil)
 	assert.NoError(t, err)
-	assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	assert.Equal(t, common.NotRegisteredID, resp.State.NodeID)
 	n.session = &sessionutil.Session{}
 	n.session.UpdateRegistered(true)
-	resp, err = n.GetComponentStates(context.Background())
+	resp, err = n.GetComponentStates(context.Background(), nil)
 	assert.NoError(t, err)
-	assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
-}
-
-func TestProxy_GetComponentStates_state_code(t *testing.T) {
-	p := &Proxy{}
-	p.stateCode.Store("not commonpb.StateCode")
-	states, err := p.GetComponentStates(context.Background())
-	assert.NoError(t, err)
-	assert.NotEqual(t, commonpb.ErrorCode_Success, states.Status.ErrorCode)
+	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 }
 
 func TestProxy_Import(t *testing.T) {
@@ -3834,7 +4093,7 @@ func TestProxy_Import(t *testing.T) {
 		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.Import(context.TODO(), req)
 		assert.NoError(t, err)
-		assert.EqualValues(t, unhealthyStatus(), resp.GetStatus())
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
 	})
 
 	wg.Add(1)
@@ -3842,12 +4101,10 @@ func TestProxy_Import(t *testing.T) {
 		defer wg.Done()
 		proxy := &Proxy{}
 		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
-		cache := newMockCache()
-		globalMetaCache = cache
-		chMgr := newMockChannelsMgr()
+		chMgr := NewMockChannelsMgr(t)
 		proxy.chMgr = chMgr
 		rc := newMockRootCoord()
-		rc.ImportFunc = func(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
+		rc.ImportFunc = func(ctx context.Context, req *milvuspb.ImportRequest, opts ...grpc.CallOption) (*milvuspb.ImportResponse, error) {
 			return nil, errors.New("mock")
 		}
 		proxy.rootCoord = rc
@@ -3864,12 +4121,10 @@ func TestProxy_Import(t *testing.T) {
 		defer wg.Done()
 		proxy := &Proxy{}
 		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
-		cache := newMockCache()
-		globalMetaCache = cache
-		chMgr := newMockChannelsMgr()
+		chMgr := NewMockChannelsMgr(t)
 		proxy.chMgr = chMgr
 		rc := newMockRootCoord()
-		rc.ImportFunc = func(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
+		rc.ImportFunc = func(ctx context.Context, req *milvuspb.ImportRequest, opts ...grpc.CallOption) (*milvuspb.ImportResponse, error) {
 			return &milvuspb.ImportResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}}, nil
 		}
 		proxy.rootCoord = rc
@@ -3886,12 +4141,10 @@ func TestProxy_Import(t *testing.T) {
 		defer wg.Done()
 		proxy := &Proxy{}
 		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
-		cache := newMockCache()
-		globalMetaCache = cache
-		chMgr := newMockChannelsMgr()
+		chMgr := NewMockChannelsMgr(t)
 		proxy.chMgr = chMgr
 		rc := newMockRootCoord()
-		rc.ImportFunc = func(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
+		rc.ImportFunc = func(ctx context.Context, req *milvuspb.ImportRequest, opts ...grpc.CallOption) (*milvuspb.ImportResponse, error) {
 			return &milvuspb.ImportResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}}, nil
 		}
 		proxy.rootCoord = rc
@@ -3923,18 +4176,18 @@ func TestProxy_GetImportState(t *testing.T) {
 	rootCoord.state.Store(commonpb.StateCode_Healthy)
 	t.Run("test get import state", func(t *testing.T) {
 		proxy := &Proxy{rootCoord: rootCoord}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 
 		resp, err := proxy.GetImportState(context.TODO(), req)
-		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
-		assert.Nil(t, err)
+		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		assert.NoError(t, err)
 	})
 	t.Run("test get import state with unhealthy", func(t *testing.T) {
 		proxy := &Proxy{rootCoord: rootCoord}
-		proxy.stateCode.Store(commonpb.StateCode_Abnormal)
+		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.GetImportState(context.TODO(), req)
-		assert.EqualValues(t, unhealthyStatus(), resp.Status)
-		assert.Nil(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+		assert.NoError(t, err)
 	})
 }
 
@@ -3944,21 +4197,207 @@ func TestProxy_ListImportTasks(t *testing.T) {
 	rootCoord.state.Store(commonpb.StateCode_Healthy)
 	t.Run("test list import tasks", func(t *testing.T) {
 		proxy := &Proxy{rootCoord: rootCoord}
-		proxy.stateCode.Store(commonpb.StateCode_Healthy)
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 
 		resp, err := proxy.ListImportTasks(context.TODO(), req)
-		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
-		assert.Nil(t, err)
+		assert.EqualValues(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		assert.NoError(t, err)
 	})
 	t.Run("test list import tasks with unhealthy", func(t *testing.T) {
 		proxy := &Proxy{rootCoord: rootCoord}
-		proxy.stateCode.Store(commonpb.StateCode_Abnormal)
+		proxy.UpdateStateCode(commonpb.StateCode_Abnormal)
 		resp, err := proxy.ListImportTasks(context.TODO(), req)
-		assert.EqualValues(t, unhealthyStatus(), resp.Status)
-		assert.Nil(t, err)
+		assert.ErrorIs(t, merr.Error(resp.GetStatus()), merr.ErrServiceNotReady)
+		assert.NoError(t, err)
 	})
 }
 
 func TestProxy_GetStatistics(t *testing.T) {
+}
 
+func TestProxy_GetLoadState(t *testing.T) {
+	originCache := globalMetaCache
+	m := NewMockCache(t)
+	m.On("GetCollectionID",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(UniqueID(1), nil)
+	m.On("GetPartitionID",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(UniqueID(2), nil)
+	globalMetaCache = m
+	defer func() {
+		globalMetaCache = originCache
+	}()
+
+	{
+		qc := getQueryCoordClient()
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+			Status:              merr.Status(merr.WrapErrServiceNotReady("initialization")),
+			CollectionIDs:       nil,
+			InMemoryPercentages: []int64{},
+		}, nil)
+		proxy := &Proxy{queryCoord: qc}
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
+		stateResp, err := proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.ErrorIs(t, merr.Error(stateResp.GetStatus()), merr.ErrServiceNotReady)
+
+		progressResp, err := proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.ErrorIs(t, merr.Error(progressResp.GetStatus()), merr.ErrServiceNotReady)
+	}
+
+	{
+		qc := getQueryCoordClient()
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(nil, merr.WrapErrCollectionNotLoaded("foo"))
+		qc.EXPECT().ShowPartitions(mock.Anything, mock.Anything).Return(nil, merr.WrapErrPartitionNotLoaded("p1"))
+		proxy := &Proxy{queryCoord: qc}
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		stateResp, err := proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+		assert.Equal(t, commonpb.LoadState_LoadStateNotLoad, stateResp.State)
+
+		stateResp, err = proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: "foo", PartitionNames: []string{"p1"}})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+		assert.Equal(t, commonpb.LoadState_LoadStateNotLoad, stateResp.State)
+
+		progressResp, err := proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, progressResp.GetStatus().GetErrorCode())
+		assert.Equal(t, int64(0), progressResp.Progress)
+
+		progressResp, err = proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo", PartitionNames: []string{"p1"}})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, progressResp.GetStatus().GetErrorCode())
+		assert.Equal(t, int64(0), progressResp.Progress)
+	}
+
+	{
+		qc := getQueryCoordClient()
+		qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+			State: &milvuspb.ComponentInfo{
+				NodeID:    0,
+				Role:      typeutil.QueryCoordRole,
+				StateCode: commonpb.StateCode_Healthy,
+				ExtraInfo: nil,
+			},
+			SubcomponentStates: nil,
+			Status:             merr.Status(nil),
+		}, nil)
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+			Status:              &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			CollectionIDs:       nil,
+			InMemoryPercentages: []int64{100},
+		}, nil)
+		proxy := &Proxy{queryCoord: qc}
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		stateResp, err := proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: "foo", Base: &commonpb.MsgBase{}})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+		assert.Equal(t, commonpb.LoadState_LoadStateLoaded, stateResp.State)
+
+		stateResp, err = proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: ""})
+		assert.NoError(t, err)
+		assert.ErrorIs(t, merr.Error(stateResp.GetStatus()), merr.ErrParameterInvalid)
+
+		progressResp, err := proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, progressResp.GetStatus().GetErrorCode())
+		assert.Equal(t, int64(100), progressResp.Progress)
+	}
+
+	{
+		qc := getQueryCoordClient()
+		qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+			State: &milvuspb.ComponentInfo{
+				NodeID:    0,
+				Role:      typeutil.QueryCoordRole,
+				StateCode: commonpb.StateCode_Healthy,
+				ExtraInfo: nil,
+			},
+			SubcomponentStates: nil,
+			Status:             merr.Status(nil),
+		}, nil)
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+			Status:              &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			CollectionIDs:       nil,
+			InMemoryPercentages: []int64{50},
+		}, nil)
+		proxy := &Proxy{queryCoord: qc}
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		stateResp, err := proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, stateResp.GetStatus().GetErrorCode())
+		assert.Equal(t, commonpb.LoadState_LoadStateLoading, stateResp.State)
+
+		progressResp, err := proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, progressResp.GetStatus().GetErrorCode())
+		assert.Equal(t, int64(50), progressResp.Progress)
+	}
+
+	t.Run("test insufficient memory", func(t *testing.T) {
+		qc := getQueryCoordClient()
+		qc.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(&milvuspb.ComponentStates{
+			State: &milvuspb.ComponentInfo{
+				NodeID:    0,
+				Role:      typeutil.QueryCoordRole,
+				StateCode: commonpb.StateCode_Healthy,
+				ExtraInfo: nil,
+			},
+			SubcomponentStates: nil,
+			Status:             merr.Status(nil),
+		}, nil)
+
+		mockErr := merr.WrapErrServiceMemoryLimitExceeded(110, 100)
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+			Status: merr.Status(mockErr),
+		}, nil)
+		qc.EXPECT().ShowPartitions(mock.Anything, mock.Anything).Return(&querypb.ShowPartitionsResponse{
+			Status: merr.Status(mockErr),
+		}, nil)
+		proxy := &Proxy{queryCoord: qc}
+		proxy.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		stateResp, err := proxy.GetLoadState(context.Background(), &milvuspb.GetLoadStateRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_InsufficientMemoryToLoad, stateResp.GetStatus().GetErrorCode())
+
+		progressResp, err := proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo"})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_InsufficientMemoryToLoad, progressResp.GetStatus().GetErrorCode())
+
+		progressResp, err = proxy.GetLoadingProgress(context.Background(), &milvuspb.GetLoadingProgressRequest{CollectionName: "foo", PartitionNames: []string{"p1"}})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_InsufficientMemoryToLoad, progressResp.GetStatus().GetErrorCode())
+	})
+}
+
+func TestUnhealthProxy_GetIndexStatistics(t *testing.T) {
+	// check GetIndexStatistics when proxy is unhealthy
+	factory := dependency.NewDefaultFactory(true)
+	ctx := context.Background()
+	proxy, err := NewProxy(ctx, factory)
+	assert.NoError(t, err)
+	assert.NotNil(t, proxy)
+	t.Run("TestProxy_GetIndexStatistics", func(t *testing.T) {
+		resp, err := proxy.GetIndexStatistics(ctx, &milvuspb.GetIndexStatisticsRequest{
+			Base:           nil,
+			DbName:         "",
+			CollectionName: "hello_milvus",
+			IndexName:      "",
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_NotReadyServe, resp.GetStatus().GetErrorCode())
+	})
 }

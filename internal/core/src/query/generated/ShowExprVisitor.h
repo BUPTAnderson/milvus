@@ -40,6 +40,15 @@ class ShowExprVisitor : public ExprVisitor {
     void
     visit(CompareExpr& expr) override;
 
+    void
+    visit(ExistsExpr& expr) override;
+
+    void
+    visit(AlwaysTrueExpr& expr) override;
+
+    void
+    visit(JsonContainsExpr& expr) override;
+
  public:
     Json
 
@@ -68,6 +77,6 @@ class ShowExprVisitor : public ExprVisitor {
     }
 
  private:
-    std::optional<json> json_opt_;
+    std::optional<nlohmann::json> json_opt_;
 };
 }  // namespace milvus::query

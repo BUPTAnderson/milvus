@@ -1,3 +1,5 @@
+import random
+
 import numpy
 import pandas as pd
 import pytest
@@ -15,9 +17,10 @@ exp_schema = "schema"
 exp_num = "num_entities"
 exp_primary = "primary"
 exp_shards_num = "shards_num"
+default_term_expr = f'{ct.default_int64_field_name} in [0, 1]'
 default_schema = cf.gen_default_collection_schema()
 default_binary_schema = cf.gen_default_binary_collection_schema()
-default_shards_num = 2
+default_shards_num = 1
 uid_count = "collection_count"
 tag = "collection_count_tag"
 uid_stats = "get_collection_stats"
@@ -27,6 +30,8 @@ uid_drop = "drop_collection"
 uid_has = "has_collection"
 uid_list = "list_collections"
 uid_load = "load_collection"
+partition1 = 'partition1'
+partition2 = 'partition2'
 field_name = default_float_vec_field_name
 default_single_query = {
     "data": gen_vectors(1, default_dim),
@@ -42,7 +47,7 @@ default_search_exp = "int64 >= 0"
 default_limit = ct.default_limit
 vectors = [[random.random() for _ in range(default_dim)] for _ in range(default_nq)]
 default_search_field = ct.default_float_vec_field_name
-default_search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+default_search_params = ct.default_search_params
 
 
 class TestCollectionParams(TestcaseBase):
@@ -54,7 +59,7 @@ class TestCollectionParams(TestcaseBase):
             pytest.skip("None schema is valid")
         yield request.param
 
-    @pytest.fixture(scope="function", params=ct.get_invalid_strs)
+    @pytest.fixture(scope="function", params=ct.get_invalid_type_fields)
     def get_invalid_type_fields(self, request):
         if isinstance(request.param, list):
             pytest.skip("list is valid fields")
@@ -62,7 +67,7 @@ class TestCollectionParams(TestcaseBase):
 
     @pytest.fixture(scope="function", params=cf.gen_all_type_fields())
     def get_unsupported_primary_field(self, request):
-        if request.param.dtype == DataType.INT64:
+        if request.param.dtype == DataType.INT64 or request.param.dtype == DataType.VARCHAR:
             pytest.skip("int64 type is valid primary key")
         yield request.param
 
@@ -131,7 +136,7 @@ class TestCollectionParams(TestcaseBase):
                                              check_items={exp_name: name, exp_schema: schema})
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("name", ["12-s", "12 s", "(mn)", "中文", "%$#", "a".join("a" for i in range(256))])
+    @pytest.mark.parametrize("name", ["12-s", "12 s", "(mn)", "中文", "%$#", "".join("a" for i in range(ct.max_name_length + 1))])
     def test_collection_invalid_name(self, name):
         """
         target: test collection with invalid name
@@ -322,12 +327,11 @@ class TestCollectionParams(TestcaseBase):
         expected: raise exception
         """
         self._connect()
-        error = {ct.err_code: 0, ct.err_msg: "Field dtype must be of DataType"}
+        error = {ct.err_code: 1, ct.err_msg: "Field dtype must be of DataType"}
         self.field_schema_wrap.init_field_schema(name="unknown", dtype=DataType.UNKNOWN,
                                                  check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.xfail(reason="exception not Milvus Exception")
     @pytest.mark.parametrize("name", [[], 1, (1,), {1: 1}, "12-s"])
     def test_collection_invalid_type_field(self, name):
         """
@@ -340,7 +344,7 @@ class TestCollectionParams(TestcaseBase):
         field, _ = self.field_schema_wrap.init_field_schema(name=name, dtype=5, is_primary=True)
         vec_field = cf.gen_float_vec_field()
         schema = cf.gen_collection_schema(fields=[field, vec_field])
-        error = {ct.err_code: 1, ct.err_msg: f"expected one of: bytes, unicode"}
+        error = {ct.err_code: 1, ct.err_msg: f"bad argument type for built-in"}
         self.collection_wrap.init_collection(c_name, schema=schema, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
@@ -555,7 +559,7 @@ class TestCollectionParams(TestcaseBase):
         """
         self._connect()
         fields = [cf.gen_int64_field(), cf.gen_float_vec_field()]
-        error = {ct.err_code: 0, ct.err_msg: "Primary field must in dataframe."}
+        error = {ct.err_code: 1, ct.err_msg: "Param primary_field must be str type."}
         self.collection_schema_wrap.init_collection_schema(fields, primary_field=primary_field,
                                                            check_task=CheckTasks.err_res, check_items=error)
 
@@ -601,7 +605,6 @@ class TestCollectionParams(TestcaseBase):
         assert self.collection_wrap.primary_field.name == ct.default_int64_field_name
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.xfail(reason="exception not Milvus Exception")
     def test_collection_unsupported_primary_field(self, get_unsupported_primary_field):
         """
         target: test collection with unsupported primary field type
@@ -611,7 +614,7 @@ class TestCollectionParams(TestcaseBase):
         self._connect()
         field = get_unsupported_primary_field
         vec_field = cf.gen_float_vec_field(name="vec")
-        error = {ct.err_code: 1, ct.err_msg: "Primary key type must be DataType.INT64."}
+        error = {ct.err_code: 1, ct.err_msg: "Primary key type must be DataType.INT64 or DataType.VARCHAR."}
         self.collection_schema_wrap.init_collection_schema(fields=[field, vec_field], primary_field=field.name,
                                                            check_task=CheckTasks.err_res, check_items=error)
 
@@ -625,7 +628,7 @@ class TestCollectionParams(TestcaseBase):
         self._connect()
         int_field_one = cf.gen_int64_field(is_primary=True)
         int_field_two = cf.gen_int64_field(name="int2", is_primary=True)
-        error = {ct.err_code: 0, ct.err_msg: "Primary key field can only be one."}
+        error = {ct.err_code: 0, ct.err_msg: "Expected only one primary key field"}
         self.collection_schema_wrap.init_collection_schema(
             fields=[int_field_one, int_field_two, cf.gen_float_vec_field()],
             check_task=CheckTasks.err_res, check_items=error)
@@ -641,7 +644,7 @@ class TestCollectionParams(TestcaseBase):
         int_field_one = cf.gen_int64_field(is_primary=True)
         int_field_two = cf.gen_int64_field(name="int2")
         fields = [int_field_one, int_field_two, cf.gen_float_vec_field()]
-        error = {ct.err_code: 0, ct.err_msg: "Primary key field can only be one"}
+        error = {ct.err_code: 1, ct.err_msg: "Expected only one primary key field"}
         self.collection_schema_wrap.init_collection_schema(fields, primary_field=int_field_two.name,
                                                            check_task=CheckTasks.err_res, check_items=error)
 
@@ -721,6 +724,7 @@ class TestCollectionParams(TestcaseBase):
         assert not schema.auto_id
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.xfail(reason="issue 24578")
     def test_collection_auto_id_inconsistent(self):
         """
         target: test collection auto_id with both collection schema and field schema
@@ -730,10 +734,9 @@ class TestCollectionParams(TestcaseBase):
         self._connect()
         int_field = cf.gen_int64_field(is_primary=True, auto_id=True)
         vec_field = cf.gen_float_vec_field(name='vec')
-        error = {ct.err_code: 0, ct.err_msg: "The auto_id of the collection is inconsistent with "
-                                             "the auto_id of the primary key field"}
-        self.collection_schema_wrap.init_collection_schema([int_field, vec_field], auto_id=False,
-                                                           check_task=CheckTasks.err_res, check_items=error)
+
+        schema, _ = self.collection_schema_wrap.init_collection_schema([int_field, vec_field], auto_id=False)
+        assert schema.auto_id
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("auto_id", [True, False])
@@ -763,6 +766,7 @@ class TestCollectionParams(TestcaseBase):
                                                  auto_id=None, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.xfail(reason="issue 24578")
     @pytest.mark.parametrize("auto_id", ct.get_invalid_strs)
     def test_collection_invalid_auto_id(self, auto_id):
         """
@@ -920,8 +924,8 @@ class TestCollectionParams(TestcaseBase):
                                              check_items={exp_name: c_name, exp_shards_num: default_shards_num})
         assert c_name in self.utility_wrap.list_collections()[0]
 
-    @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("shards_num", [-256, 0, 1, 10, 31, 63])
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("shards_num", [-256, 0, ct.max_shards_num // 2, ct.max_shards_num])
     def test_collection_shards_num_with_not_default_value(self, shards_num):
         """
         target:test collection with shards_num
@@ -936,21 +940,22 @@ class TestCollectionParams(TestcaseBase):
         assert c_name in self.utility_wrap.list_collections()[0]
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("shards_num", [65, 257])
+    @pytest.mark.parametrize("shards_num", [ct.max_shards_num + 1, 257])
     def test_collection_shards_num_invalid(self, shards_num):
         """
         target:test collection with invalid shards_num
-        method:create collection with shards_num out of [1,64]
+        method:create collection with shards_num out of [1, 16]
         expected: raise exception
         """
         self._connect()
         c_name = cf.gen_unique_str(prefix)
-        error = {ct.err_code: 1, ct.err_msg: "shard num (%s) exceeds limit (64)" % shards_num}
+        error = {ct.err_code: 1, ct.err_msg: f"maximum shards's number should be limited to {ct.max_shards_num}"}
         self.collection_wrap.init_collection(c_name, schema=default_schema, shards_num=shards_num,
                                              check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    def test_collection_shards_num_with_error_type(self):
+    @pytest.mark.parametrize("error_type_shards_num", [1.0, "2"])
+    def test_collection_shards_num_with_error_type(self, error_type_shards_num):
         """
         target:test collection with error type shards_num
         method:create collection with error type shards_num
@@ -958,8 +963,7 @@ class TestCollectionParams(TestcaseBase):
         """
         self._connect()
         c_name = cf.gen_unique_str(prefix)
-        error_type_shards_num = "2"  # suppose to be int rather than str
-        error = {ct.err_code: -1, ct.err_msg: f"expected one of: int, long"}
+        error = {ct.err_code: 1, ct.err_msg: f"expected one of: int, long"}
         self.collection_wrap.init_collection(c_name, schema=default_schema, shards_num=error_type_shards_num,
                                              check_task=CheckTasks.err_res,
                                              check_items=error)
@@ -1003,7 +1007,7 @@ class TestCollectionParams(TestcaseBase):
         int_fields.append(cf.gen_float_vec_field())
         int_fields.append(cf.gen_int64_field(is_primary=True))
         schema = cf.gen_collection_schema(fields=int_fields)
-        error = {ct.err_code: 1, ct.err_msg: "maximum field's number should be limited to 256"}
+        error = {ct.err_code: 1, ct.err_msg: "maximum field's number should be limited to 64"}
         self.collection_wrap.init_collection(c_name, schema=schema, check_task=CheckTasks.err_res, check_items=error)
 
 
@@ -1064,7 +1068,7 @@ class TestCollectionOperation(TestcaseBase):
                                              check_items={exp_name: c_name, exp_schema: default_schema})
         self.collection_wrap.drop()
         assert not self.utility_wrap.has_collection(c_name)[0]
-        error = {ct.err_code: 1, ct.err_msg: f'HasPartition failed: can\'t find collection: {c_name}'}
+        error = {ct.err_code: 4, ct.err_msg: 'collection not found'}
         collection_w.has_partition("p", check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -1116,9 +1120,7 @@ class TestCollectionOperation(TestcaseBase):
         partition_w1.insert(cf.gen_default_list_data())
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         collection_w.load()
-        error = {ct.err_code: 5, ct.err_msg: f'load the partition after load collection is not supported'}
-        partition_w1.load(check_task=CheckTasks.err_res,
-                          check_items=error)
+        partition_w1.load()
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_load_collection_release_partition(self):
@@ -1133,9 +1135,7 @@ class TestCollectionOperation(TestcaseBase):
         partition_w1.insert(cf.gen_default_list_data())
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         collection_w.load()
-        error = {ct.err_code: 1, ct.err_msg: f'releasing the partition after load collection is not supported'}
-        partition_w1.release(check_task=CheckTasks.err_res,
-                             check_items=error)
+        partition_w1.release()
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_load_collection_after_release_collection(self):
@@ -1207,7 +1207,7 @@ class TestCollectionDataframe(TestcaseBase):
         """
         self._connect()
         c_name = cf.gen_unique_str(prefix)
-        error = {ct.err_code: 0, ct.err_msg: "Dataframe can not be None."}
+        error = {ct.err_code: 1, ct.err_msg: "Dataframe can not be None."}
         self.collection_wrap.construct_from_dataframe(c_name, None, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
@@ -1594,7 +1594,7 @@ class TestCollectionMultiCollections(TestcaseBase):
         self._connect()
         data = cf.gen_default_list_data(insert_count)
         collection_list = []
-        collection_num = 20
+        collection_num = 10
         for i in range(collection_num):
             collection_name = gen_unique_str(uid_count)
             collection_w = self.init_collection_wrap(name=collection_name)
@@ -1654,6 +1654,11 @@ class TestCollectionMultiCollections(TestcaseBase):
 
 
 class TestCreateCollection(TestcaseBase):
+
+    @pytest.fixture(scope="function", params=[False, True])
+    def auto_id(self, request):
+        yield request.param
+
     @pytest.mark.tags(CaseLabel.L1)
     def test_create_collection_multithread(self):
         """
@@ -1682,6 +1687,31 @@ class TestCreateCollection(TestcaseBase):
         for item in collection_names:
             assert item in self.utility_wrap.list_collections()[0]
 
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.skip("not support default_value now")
+    def test_create_collection_using_default_value(self, auto_id):
+        """
+        target: test create collection with default_value
+        method: create a schema with all fields using default value
+        expected: collections are created
+        """
+        fields = [
+            cf.gen_int64_field(name='pk', is_primary=True),
+            cf.gen_float_vec_field(),
+            cf.gen_int8_field(default_value=numpy.int8(8)),
+            cf.gen_int16_field(default_value=numpy.int16(16)),
+            cf.gen_int32_field(default_value=numpy.int32(32)),
+            cf.gen_int64_field(default_value=numpy.int64(64)),
+            cf.gen_float_field(default_value=numpy.float32(3.14)),
+            cf.gen_double_field(default_value=numpy.double(3.1415)),
+            cf.gen_bool_field(default_value=False),
+            cf.gen_string_field(default_value="abc")
+        ]
+        schema = cf.gen_collection_schema(fields, auto_id=auto_id)
+        self.init_collection_wrap(schema=schema,
+                                  check_task=CheckTasks.check_collection_property,
+                                  check_items={"schema": schema})
+
 
 class TestCreateCollectionInvalid(TestcaseBase):
     """
@@ -1708,9 +1738,112 @@ class TestCreateCollectionInvalid(TestcaseBase):
             field_name_tmp = gen_unique_str("field_name")
             field_schema_temp = cf.gen_int64_field(field_name_tmp)
             field_schema_list.append(field_schema_temp)
-        error = {ct.err_code: 1, ct.err_msg: "'maximum field\'s number should be limited to 256'"}
+        error = {ct.err_code: 1, ct.err_msg: "'maximum field\'s number should be limited to 64'"}
         schema, _ = self.collection_schema_wrap.init_collection_schema(fields=field_schema_list)
         self.init_collection_wrap(name=c_name, schema=schema, check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("default_value", ["abc"])
+    @pytest.mark.skip(reason="issue #24634")
+    def test_create_collection_with_invalid_default_value_string(self, default_value):
+        """
+        target: test create collection with maximum fields
+        method: create collection with maximum field number
+        expected: raise exception
+        """
+        fields = [
+            cf.gen_int64_field(name='pk', is_primary=True),
+            cf.gen_float_vec_field(),
+            cf.gen_string_field(max_length=2, default_value=default_value)
+        ]
+        schema = cf.gen_collection_schema(fields)
+        self.init_collection_wrap(schema=schema,
+                                  check_task=CheckTasks.check_collection_property,
+                                  check_items={"schema": schema})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.skip("not support default_value now")
+    @pytest.mark.parametrize("default_value", ["abc", 9.09, 1, False])
+    def test_create_collection_with_invalid_default_value_float(self, default_value):
+        """
+        target: test create collection with maximum fields
+        method: create collection with maximum field number
+        expected: raise exception
+        """
+        fields = [
+            cf.gen_int64_field(name='pk', is_primary=True),
+            cf.gen_float_vec_field(),
+            cf.gen_float_field(default_value=default_value)
+        ]
+        schema = cf.gen_collection_schema(fields)
+        self.init_collection_wrap(schema=schema, check_task=CheckTasks.err_res,
+                                  check_items={ct.err_code: 1,
+                                               ct.err_msg: "default value type mismatches field schema type"})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.skip("not support default_value now")
+    @pytest.mark.parametrize("default_value", ["abc", 9.09, 1, False])
+    def test_create_collection_with_invalid_default_value_int8(self, default_value):
+        """
+        target: test create collection with maximum fields
+        method: create collection with maximum field number
+        expected: raise exception
+        """
+        fields = [
+            cf.gen_int64_field(name='pk', is_primary=True),
+            cf.gen_float_vec_field(),
+            cf.gen_int8_field(default_value=default_value)
+        ]
+        schema = cf.gen_collection_schema(fields)
+        self.init_collection_wrap(schema=schema, check_task=CheckTasks.err_res,
+                                  check_items={ct.err_code: 1,
+                                               ct.err_msg: "default value type mismatches field schema type"})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.skip("not support default_value now")
+    def test_create_collection_with_pk_field_using_default_value(self):
+        """
+        target: test create collection with pk field using default value
+        method: create a pk field and set default value
+        expected: report error
+        """
+        # 1. pk int64
+        fields = [
+            cf.gen_int64_field(name='pk', is_primary=True, default_value=np.int64(1)),
+            cf.gen_float_vec_field(), cf.gen_string_field(max_length=2)
+        ]
+        schema = cf.gen_collection_schema(fields)
+        collection_w = self.init_collection_wrap(schema=schema)
+        collection_w.insert([[], [vectors[0]], ["a"]],
+                            check_task=CheckTasks.err_res,
+                            check_items={ct.err_code: 1,
+                                         ct.err_msg: "pk field schema can not set default value"})
+        # 2. pk string
+        fields = [
+            cf.gen_string_field(name='pk', is_primary=True, default_value="a"),
+            cf.gen_float_vec_field(), cf.gen_string_field(max_length=2)
+        ]
+        schema = cf.gen_collection_schema(fields)
+        collection_w = self.init_collection_wrap(schema=schema)
+        collection_w.insert([[], [vectors[0]], ["a"]],
+                            check_task=CheckTasks.err_res,
+                            check_items={ct.err_code: 1,
+                                         ct.err_msg: "pk field schema can not set default value"})
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.skip("not support default_value now")
+    def test_create_collection_with_json_field_using_default_value(self):
+        """
+        target: test create collection with json field using default value
+        method: create a json field and set default value
+        expected: report error
+        """
+        json_default_value = {"number": 1, "float": 2.0, "string": "abc", "bool": True,
+                              "list": [i for i in range(5)]}
+        cf.gen_json_field(default_value=json_default_value,
+                          check_task=CheckTasks.err_res,
+                          check_items={ct.err_code: 1,
+                                       ct.err_msg: "Default value unsupported data type: 999"})
 
 
 class TestDropCollection(TestcaseBase):
@@ -1762,7 +1895,7 @@ class TestDropCollection(TestcaseBase):
         c_name = cf.gen_unique_str()
         self.init_collection_wrap(name=c_name)
         c_name_2 = cf.gen_unique_str()
-        # error = {ct.err_code: 0, ct.err_msg: 'DescribeCollection failed: can\'t find collection: %s' % c_name_2}
+        # error = {ct.err_code: 0, ct.err_msg: 'DescribeCollection failed: collection not found: %s' % c_name_2}
         # self.utility_wrap.drop_collection(c_name_2, check_task=CheckTasks.err_res, check_items=error)
         # @longjiquan: dropping collection should be idempotent.
         self.utility_wrap.drop_collection(c_name_2)
@@ -2086,7 +2219,7 @@ class TestLoadCollection(TestcaseBase):
         c_name = cf.gen_unique_str()
         collection_wr = self.init_collection_wrap(name=c_name)
         collection_wr.drop()
-        error = {ct.err_code: 1,
+        error = {ct.err_code: 4,
                  ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
         collection_wr.load(check_task=CheckTasks.err_res, check_items=error)
 
@@ -2101,7 +2234,7 @@ class TestLoadCollection(TestcaseBase):
         c_name = cf.gen_unique_str()
         collection_wr = self.init_collection_wrap(name=c_name)
         collection_wr.drop()
-        error = {ct.err_code: 1,
+        error = {ct.err_code: 4,
                  ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
         collection_wr.release(check_task=CheckTasks.err_res, check_items=error)
 
@@ -2151,6 +2284,302 @@ class TestLoadCollection(TestcaseBase):
         collection_w.load()
         collection_w.load()
 
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_load_partitions_after_load_collection(self):
+        """
+        target: test load partitions after load collection
+        method: 1. load collection
+                2. load partitions
+                3. search on one partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        self.init_partition_wrap(collection_w, partition1)
+        self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        collection_w.load(partition_names=[partition1, partition2])
+        res = collection_w.search(vectors, default_search_field, default_search_params,
+                                  default_limit, partition_names=[partition1])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_load_release_collection(self):
+        """
+        target: test load partitions after load release collection
+        method: 1. load collection
+                2. release collection
+                3. load partitions
+                4. search on one partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        self.init_partition_wrap(collection_w, partition1)
+        self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        collection_w.release()
+        collection_w.load(partition_names=[partition1, partition2])
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_release_collection_partition(self):
+        """
+        target: test load collection after release collection and partition
+        method: 1. load collection
+                2. release collection
+                3. release one partition
+                4. load collection
+                5. search on the partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w = self.init_partition_wrap(collection_w, partition1)
+        self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        collection_w.release()
+        partition_w.release()
+        collection_w.load()
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_release_collection_partition(self):
+        """
+        target: test load partitions after release collection and partition
+        method: 1. load collection
+                2. release collection
+                3. release partition
+                4. search on the partition and report error
+                5. load partitions
+                6. search on the partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        collection_w.release()
+        partition_w1.release()
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1],
+                            check_task=CheckTasks.err_res,
+                            check_items={ct.err_code: 1,
+                                         ct.err_msg: "not loaded"})
+        partition_w1.load()
+        partition_w2.load()
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_release_partition(self):
+        """
+        target: test load collection after load collection and release partition
+        method: 1. load collection
+                2. release one partition
+                3. search on the released partition and report error
+                4. search on the non-released partition and raise no exception
+                3. load collection
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1],
+                            check_task=CheckTasks.err_res,
+                            check_items={ct.err_code: 1,
+                                         ct.err_msg: "not loaded"})
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition2])
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_release_partition(self):
+        """
+        target: test load collection after release partition and load partitions
+        method: 1. load collection
+                2. release partition
+                3. search on the released partition and report error
+                4. load partitions
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1],
+                            check_task=CheckTasks.err_res,
+                            check_items={ct.err_code: 1,
+                                         ct.err_msg: "not loaded"})
+        partition_w1.load()
+        partition_w2.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_release_partition_collection(self):
+        """
+        target: test load collection after release partition and collection
+        method: 1. load collection
+                2. release partition
+                3. query on the released partition and report error
+                3. release collection
+                4. load collection
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w = self.init_partition_wrap(collection_w, partition1)
+        self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w.release()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition1],
+                           check_task=CheckTasks.err_res, check_items=error)
+        collection_w.release()
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_release_partition_collection(self):
+        """
+        target: test load partitions after release partition and collection
+        method: 1. load collection
+                2. release partition
+                3. release collection
+                4. load one partition
+                5. query on the other partition and raise error
+                6. load the other partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        collection_w.release()
+        partition_w1.load()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition2],
+                           check_task=CheckTasks.err_res, check_items=error)
+        partition_w2.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_release_partitions(self):
+        """
+        target: test load collection after release partitions
+        method: 1. load collection
+                2. release partitions
+                3. load collection
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        partition_w2.release()
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_release_partitions(self):
+        """
+        target: test load partitions after release partitions
+        method: 1. load collection
+                2. release partitions
+                3. load partitions
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        partition_w2.release()
+        partition_w1.load()
+        partition_w2.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_drop_partition_and_release_another(self):
+        """
+        target: test load collection after drop a partition and release another
+        method: 1. load collection
+                2. drop a partition
+                3. release left partition
+                4. query on the left partition
+                5. load collection
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        partition_w1.drop()
+        partition_w2.release()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition2],
+                           check_task=CheckTasks.err_res, check_items=error)
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partition_after_drop_partition_and_release_another(self):
+        """
+        target: test load partition after drop a partition and release another
+        method: 1. load collection
+                2. drop a partition
+                3. release left partition
+                4. load partition
+                5. query on the partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        partition_w1.drop()
+        partition_w2.release()
+        partition_w2.load()
+        collection_w.query(default_term_expr, partition_names=[partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_another_partition_after_drop_one_partition(self):
+        """
+        target: test load another partition after drop a partition
+        method: 1. load collection
+                2. drop a partition
+                3. load another partition
+                4. query on the partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        partition_w1.drop()
+        partition_w2.load()
+        collection_w.query(default_term_expr, partition_names=[partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_drop_one_partition(self):
+        """
+        target: test load collection after drop a partition
+        method: 1. load collection
+                2. drop a partition
+                3. load collection
+                4. query on the partition
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        collection_w.load()
+        partition_w1.release()
+        partition_w1.drop()
+        collection_w.load()
+        collection_w.query(default_term_expr, partition_names=[partition2])
+
     @pytest.mark.tags(CaseLabel.L2)
     def test_load_release_collection(self):
         """
@@ -2166,12 +2595,12 @@ class TestLoadCollection(TestcaseBase):
         collection_wr.load()
         collection_wr.release()
         collection_wr.drop()
-        error = {ct.err_code: 1,
+        error = {ct.err_code: 4,
                  ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
         collection_wr.load(check_task=CheckTasks.err_res, check_items=error)
         collection_wr.release(check_task=CheckTasks.err_res, check_items=error)
 
-    @pytest.mark.tags(CaseLabel.L0)
+    @pytest.mark.tags(CaseLabel.L2)
     def test_release_collection_after_drop(self):
         """
         target: test release collection after drop
@@ -2184,26 +2613,36 @@ class TestLoadCollection(TestcaseBase):
         collection_wr.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         collection_wr.load()
         collection_wr.drop()
-        error = {ct.err_code: 0,
+        error = {ct.err_code: 4,
                  ct.err_msg: "can't find collection"}
         collection_wr.release(check_task=CheckTasks.err_res, check_items=error)
 
-    @pytest.mark.tags(CaseLabel.L0)
-    def test_load_partitions_release_collection(self):
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_load_partition_names_empty(self):
         """
-        target: test release collection after load partitions
-        method: insert entities into partitions, load partitions and release collection
-        expected: search result empty
+        target: test query another partition
+        method: 1. insert entities into two partitions
+                2.query on one partition and query result empty
+        expected: query result is empty
         """
         self._connect()
-        collection_w = self.init_collection_wrap()
-        patition_w = self.init_partition_wrap(collection_wrap=collection_w, name=ct.default_tag)
-        data = cf.gen_default_list_data()
-        collection_w.insert(data=data, partition_name=ct.default_tag)
-        assert collection_w.num_entities == ct.default_nb
+        collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix))
+        partition_w = self.init_partition_wrap(collection_wrap=collection_w)
+
+        # insert [0, half) into partition_w
+        half = ct.default_nb // 2
+        df_partition = cf.gen_default_dataframe_data(nb=half)
+        partition_w.insert(df_partition)
+        # insert [half, nb) into _default
+        df_default = cf.gen_default_dataframe_data(nb=half, start=half)
+        collection_w.insert(df_default)
+        # flush
+        collection_w.num_entities
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
-        patition_w.load()
-        collection_w.release()
+
+        # load
+        error = {ct.err_code: 0, ct.err_msg: "due to no partition specified"}
+        collection_w.load(partition_names=[], check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.fixture(scope="function", params=ct.get_invalid_strs)
     def get_non_number_replicas(self, request):
@@ -2214,6 +2653,7 @@ class TestLoadCollection(TestcaseBase):
         yield request.param
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.xfail(reason="issue #21618")
     def test_load_replica_non_number(self, get_non_number_replicas):
         """
         target: test load collection with non-number replicas
@@ -2232,7 +2672,7 @@ class TestLoadCollection(TestcaseBase):
         collection_w.load(replica_number=get_non_number_replicas, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("replicas", [-1, 0, None])
+    @pytest.mark.parametrize("replicas", [-1, 0])
     def test_load_replica_invalid_number(self, replicas):
         """
         target: test load partition with invalid replica number
@@ -2250,7 +2690,27 @@ class TestLoadCollection(TestcaseBase):
         replicas = collection_w.get_replicas()[0]
         groups = replicas.groups
         assert len(groups) == 1
-        assert len(groups[0].shards) == 2
+        assert len(groups[0].shards) == 1
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("replicas", [None])
+    def test_load_replica_number_none(self, replicas):
+        """
+        target: test load partition with replica number none
+        method: load with replica number=None
+        expected: raise exceptions
+        """
+        # create, insert
+        collection_w = self.init_collection_wrap(cf.gen_unique_str(prefix))
+        df = cf.gen_default_dataframe_data()
+        insert_res, _ = collection_w.insert(df)
+        assert collection_w.num_entities == ct.default_nb
+        collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
+
+        collection_w.load(replica_number=replicas,
+                          check_task=CheckTasks.err_res,
+                          check_items={"err_code": 1,
+                                       "err_msg": "`replica_number` value None is illegal"})
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_load_replica_greater_than_querynodes(self):
@@ -2362,8 +2822,8 @@ class TestLoadCollection(TestcaseBase):
         expected: Verify query result
         """
         collection_w = self.init_collection_wrap(cf.gen_unique_str(prefix))
-        df_1 = cf.gen_default_dataframe_data(nb=default_nb)
-        df_2 = cf.gen_default_dataframe_data(nb=default_nb, start=default_nb)
+        df_1 = cf.gen_default_dataframe_data(nb=ct.default_nb)
+        df_2 = cf.gen_default_dataframe_data(nb=ct.default_nb, start=ct.default_nb)
 
         collection_w.insert(df_1)
         partition_w = self.init_partition_wrap(collection_w, ct.default_tag)
@@ -2378,7 +2838,7 @@ class TestLoadCollection(TestcaseBase):
         collection_w.query(expr=f"{ct.default_int64_field_name} in [0]", partition_names=[ct.default_tag],
                            check_tasks=CheckTasks.check_query_empty)
         # default query 0 empty
-        collection_w.query(expr=f"{ct.default_int64_field_name} in [3000]",
+        collection_w.query(expr=f"{ct.default_int64_field_name} in [2000]",
                            check_task=CheckTasks.check_query_results,
                            check_items={'exp_res': df_2.iloc[:1, :1].to_dict('records')})
 
@@ -2395,7 +2855,7 @@ class TestLoadCollection(TestcaseBase):
                 2.create collection with 2 shards
                 3.insert and flush
                 4.load with 2 replica number
-                5.insert growng data
+                5.insert growing data
                 6.search and query
         expected: Verify search and query results
         """
@@ -2537,6 +2997,29 @@ class TestLoadCollection(TestcaseBase):
                                   check_items={"err_code": 15,
                                                "err_msg": "collection not found, maybe not loaded"})
 
+    @pytest.mark.tags(CaseLabel.L3)
+    def test_count_multi_replicas(self):
+        """
+        target: test count multi replicas
+        method: 1. load data with multi replicas
+                2. count
+        expected: verify count
+        """
+        # create -> insert -> flush
+        collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix))
+        df = cf.gen_default_dataframe_data()
+        collection_w.insert(df)
+        collection_w.flush()
+
+        # index -> load replicas
+        collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
+        collection_w.load(replica_number=2)
+
+        # count
+        collection_w.query(expr=f'{ct.default_int64_field_name} >= 0', output_fields=[ct.default_count_output],
+                           check_task=CheckTasks.check_query_results,
+                           check_items={'exp_res': [{"count(*)": ct.default_nb}]})
+
     @pytest.mark.tags(CaseLabel.L1)
     def test_load_collection_without_creating_index(self):
         """
@@ -2544,10 +3027,48 @@ class TestLoadCollection(TestcaseBase):
         method: create a collection without index, then load
         expected: raise exception
         """
-        collection_w = self.init_collection_general(prefix, True, is_index=True)[0]
+        collection_w = self.init_collection_general(prefix, True, is_index=False)[0]
         collection_w.load(check_task=CheckTasks.err_res,
                           check_items={"err_code": 1,
-                                       "err_msg": "index not exist"})
+                                       "err_msg": "index not found"})
+
+
+class TestDescribeCollection(TestcaseBase):
+    """
+    ******************************************************************
+      The following cases are used to test `collection.describe` function
+    ******************************************************************
+    """
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_collection_describe(self):
+        """
+        target: test describe collection
+        method: create a collection and check its information when describe
+        expected: return correct information
+        """
+        self._connect()
+        c_name = cf.gen_unique_str(prefix)
+        collection_w = self.init_collection_wrap(name=c_name)
+        collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
+        description = \
+            {'collection_name': c_name, 'auto_id': False, 'num_shards': ct.default_shards_num, 'description': '',
+             'fields': [{'field_id': 100, 'name': 'int64', 'description': '', 'type': 5,
+                         'params': {}, 'is_primary': True},
+                        {'field_id': 101, 'name': 'float', 'description': '', 'type': 10, 'params': {}},
+                        {'field_id': 102, 'name': 'varchar', 'description': '', 'type': 21,
+                         'params': {'max_length': 65535}},
+                        {'field_id': 103, 'name': 'json_field', 'description': '', 'type': 23, 'params': {}},
+                        {'field_id': 104, 'name': 'float_vector', 'description': '', 'type': 101,
+                         'params': {'dim': 128}}],
+             'aliases': [], 'consistency_level': 0, 'properties': [], 'num_partitions': 1}
+        res = collection_w.describe()[0]
+        del res['collection_id']
+        log.info(res)
+        assert description['fields'] == res['fields'], description['aliases'] == res['aliases']
+        del description['fields'], res['fields'], description['aliases'], res['aliases']
+        del description['properties'], res['properties']
+        assert description == res
 
 
 class TestReleaseAdvanced(TestcaseBase):
@@ -2582,7 +3103,7 @@ class TestReleaseAdvanced(TestcaseBase):
         """
         self._connect()
         partition_num = 1
-        collection_w = self.init_collection_general(prefix, True, 10, partition_num, is_index=True)[0]
+        collection_w = self.init_collection_general(prefix, True, 10, partition_num, is_index=False)[0]
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         par = collection_w.partitions
         par_name = par[partition_num].name
@@ -2608,7 +3129,7 @@ class TestReleaseAdvanced(TestcaseBase):
         """
         self._connect()
         partition_num = 1
-        collection_w = self.init_collection_general(prefix, True, 10, partition_num, is_index=True)[0]
+        collection_w = self.init_collection_general(prefix, True, 10, partition_num, is_index=False)[0]
         collection_w.create_index(ct.default_float_vec_field_name, index_params=ct.default_flat_index)
         par = collection_w.partitions
         par_name = par[partition_num].name
@@ -2663,7 +3184,7 @@ class TestLoadPartition(TestcaseBase):
         self._connect()
         partition_num = 1
         collection_w = self.init_collection_general(prefix, True, ct.default_nb, partition_num,
-                                                    is_binary=True, is_index=True)[0]
+                                                    is_binary=True, is_index=False)[0]
 
         # for metric_type in ct.binary_metrics:
         binary_index["metric_type"] = metric_type
@@ -2831,9 +3352,349 @@ class TestLoadPartition(TestcaseBase):
                                                             "is_empty": True, "num_entities": 0}
                                                )
         collection_w.drop()
-        error = {ct.err_code: 0, ct.err_msg: "can\'t find collection"}
+        error = {ct.err_code: 0, ct.err_msg: "collection not found"}
         partition_w.load(check_task=CheckTasks.err_res, check_items=error)
         partition_w.release(check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_load_loaded_partition(self):
+        """
+        target: test load partition after load partition
+        method: 1. load partition
+                2. load the partition again
+                3. query on the non-loaded partition
+                4. load collection
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.load()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition2],
+                           check_task=CheckTasks.err_res, check_items=error)
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_load_unloaded_partition(self):
+        """
+        target: test load partition after load an unloaded partition
+        method: 1. load partition
+                2. load another partition
+                3. query on the collection
+                4. load collection
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w2.load()
+        collection_w.query(default_term_expr)
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_load_one_partition(self):
+        """
+        target: test load partition after load partition
+        method: 1. load partition
+                2. load collection
+                3. query on the partitions
+        expected: No exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        collection_w.load()
+        collection_w.query(default_term_expr, partition_names=[partition1, partition2])
+
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_load_partitions_release_collection(self):
+        """
+        target: test release collection after load partitions
+        method: 1. load partition
+                2. release collection
+                3. query on the partition
+                4. load partitions
+                5. query on the collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        collection_w.release()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition1],
+                           check_task=CheckTasks.err_res, check_items=error)
+        partition_w1.load()
+        partition_w2.load()
+        collection_w.query(default_term_expr)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_release_collection(self):
+        """
+        target: test load collection after load partitions
+        method: 1. load partition
+                2. release collection
+                3. load collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        collection_w.release()
+        collection_w.load()
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_load_release_partition(self):
+        """
+        target: test load partitions after load and release partition
+        method: 1. load partition
+                2. release partition
+                3. query on the partition
+                4. load partitions(include released partition and non-released partition)
+                5. query on the collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition1],
+                           check_task=CheckTasks.err_res, check_items=error)
+        partition_w1.load()
+        partition_w2.load()
+        collection_w.query(default_term_expr)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_load_release_partition(self):
+        """
+        target: test load collection after load and release partition
+        method: 1. load partition
+                2. release partition
+                3. load collection
+                4. search on the collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        collection_w.load()
+        collection_w.search(vectors, default_search_field, default_search_params,
+                            default_limit, partition_names=[partition1, partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partitions_after_load_partition_release_partitions(self):
+        """
+        target: test load partitions after load partition and release partitions
+        method: 1. load partition
+                2. release partitions
+                3. load partitions
+                4. query on the partitions
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        partition_w2.release()
+        partition_w1.load()
+        partition_w2.load()
+        collection_w.query(default_term_expr, partition_names=[partition1, partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_load_partition_release_partitions(self):
+        """
+        target: test load collection after load partition and release partitions
+        method: 1. load partition
+                2. release partitions
+                3. query on the partitions
+                4. load collection
+                5. query on the partitions
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        partition_w2.release()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition1, partition2],
+                           check_task=CheckTasks.err_res, check_items=error)
+        collection_w.load()
+        collection_w.query(default_term_expr, partition_names=[partition1, partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_partition_after_load_drop_partition(self):
+        """
+        target: test load partition after load and drop partition
+        method: 1. load partition
+                2. drop the loaded partition
+                3. load the left partition
+                4. query on the partition
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        partition_w1.drop()
+        partition_w2.load()
+        collection_w.query(default_term_expr, partition_names=[partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_collection_after_load_drop_partition(self):
+        """
+        target: test load collection after load and drop partition
+        method: 1. load partition
+                2. drop the loaded partition
+                3. query on the partition
+                4. drop another partition
+                5. load collection
+                6. query on the collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        partition_w1.drop()
+        error = {ct.err_code: 1, ct.err_msg: 'name not found'}
+        collection_w.query(default_term_expr, partition_names=[partition1, partition2],
+                           check_task=CheckTasks.err_res, check_items=error)
+        partition_w2.drop()
+        collection_w.load()
+        collection_w.query(default_term_expr)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_release_load_partition_after_load_drop_partition(self):
+        """
+        target: test release load partition after load and drop partition
+        method: 1. load partition
+                2. drop the loaded partition
+                3. release another partition
+                4. load the partition
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        partition_w1.drop()
+        partition_w2.release()
+        partition_w2.load()
+        collection_w.query(default_term_expr, partition_names=[partition2])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_release_load_collection_after_load_drop_partition(self):
+        """
+        target: test release load partition after load and drop partition
+        method: 1. load partition
+                2. drop the loaded partition
+                3. release another partition
+                4. load collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w1.release()
+        partition_w1.drop()
+        partition_w2.release()
+        collection_w.load()
+        collection_w.query(default_term_expr)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_load_another_partition_after_load_drop_partition(self):
+        """
+        target: test load another collection after load and drop one partition
+        method: 1. load partition
+                2. drop the unloaded partition
+                3. load the partition again
+                4. query on the partition
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w2.drop()
+        partition_w1.load()
+        collection_w.query(default_term_expr, partition_names=[partition1])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_release_load_partition_after_load_partition_drop_another(self):
+        """
+        target: test release load partition after load and drop partition
+        method: 1. load partition
+                2. drop the unloaded partition
+                3. release the loaded partition
+                4. query on the released partition
+                5. reload the partition
+                6. query on the partition
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w2.drop()
+        partition_w1.release()
+        error = {ct.err_code: 1, ct.err_msg: 'not loaded into memory'}
+        collection_w.query(default_term_expr, partition_names=[partition1],
+                           check_task=CheckTasks.err_res, check_items=error)
+        partition_w1.load()
+        collection_w.query(default_term_expr, partition_names=[partition1])
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_release_load_collection_after_load_partition_drop_another(self):
+        """
+        target: test release load partition after load and drop partition
+        method: 1. load partition
+                2. drop the unloaded partition
+                3. release the loaded partition
+                4. load collection
+                5. query on the collection
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w2.drop()
+        partition_w1.release()
+        collection_w.load()
+        collection_w.query(default_term_expr)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_release_unloaded_partition(self):
+        """
+        target: test load collection after load and drop partition
+        method: 1. load partition
+                2. release the other partition
+                3. query on the first partition
+        expected: no exception
+        """
+        collection_w = self.init_collection_general(prefix)[0]
+        partition_w1 = self.init_partition_wrap(collection_w, partition1)
+        partition_w2 = self.init_partition_wrap(collection_w, partition2)
+        partition_w1.load()
+        partition_w2.release()
+        collection_w.query(default_term_expr, partition_names=[partition1])
 
 
 class TestCollectionString(TestcaseBase):
@@ -2931,14 +3792,93 @@ class TestCollectionString(TestcaseBase):
         """
         target: test create collection with string field 
         method: create collection with string field, the string field primary and auto id are true
-        expected: Raise exception
+        expected: Create collection successfully
         """
         self._connect()
         int_field = cf.gen_int64_field()
         vec_field = cf.gen_float_vec_field()
         string_field = cf.gen_string_field(is_primary=True, auto_id=True)
         fields = [int_field, string_field, vec_field]
-        schema, _ = self.collection_schema_wrap.init_collection_schema(fields=fields)
-        error = {ct.err_code: 0, ct.err_msg: "autoID is not supported when the VarChar field is the primary key"}
-        self.collection_wrap.init_collection(name=cf.gen_unique_str(prefix), schema=schema,
-                                             check_task=CheckTasks.err_res, check_items=error)
+        schema = self.collection_schema_wrap.init_collection_schema(fields=fields)[0]
+        self.init_collection_wrap(schema=schema, check_task=CheckTasks.check_collection_property,
+                                  check_items={"schema": schema, "primary": ct.default_string_field_name})
+
+
+class TestCollectionJSON(TestcaseBase):
+    """
+    ******************************************************************
+      The following cases are used to test about string 
+    ******************************************************************
+    """
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("auto_id", [True, False])
+    def test_collection_json_field_as_primary_key(self, auto_id):
+        """
+        target: test create collection with JSON field as primary key
+        method: 1. create collection with one JSON field, and vector field
+                2. set json field is_primary=true
+                3. set auto_id as true
+        expected: Raise exception (not supported)
+        """
+        self._connect()
+        int_field = cf.gen_int64_field()
+        vec_field = cf.gen_float_vec_field()
+        string_field = cf.gen_string_field()
+        # 1. create json field as primary key through field schema api
+        error = {ct.err_code: 1, ct.err_msg: "Primary key type must be DataType.INT64 or DataType.VARCHAR"}
+        json_field = cf.gen_json_field(is_primary=True, auto_id=auto_id)
+        fields = [int_field, string_field, json_field, vec_field]
+        self.collection_schema_wrap.init_collection_schema(fields=fields,
+                                                           check_task=CheckTasks.err_res, check_items=error)
+        # 2. create json field as primary key through collection schema api
+        json_field = cf.gen_json_field()
+        fields = [int_field, string_field, json_field, vec_field]
+        self.collection_schema_wrap.init_collection_schema(fields=fields, primary_field=ct.default_json_field_name,
+                                                           check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("primary_field", [ct.default_float_field_name, ct.default_json_field_name])
+    def test_collection_json_field_partition_key(self, primary_field):
+        """
+        target: test create collection with multiple JSON fields
+        method: 1. create collection with multiple JSON fields, primary key field and vector field
+                2. set json field is_primary=false
+        expected: Raise exception
+        """
+        self._connect()
+        cf.gen_unique_str(prefix)
+        error = {ct.err_code: 1, ct.err_msg: "Partition key field type must be DataType.INT64 or DataType.VARCHAR."}
+        cf.gen_json_default_collection_schema(primary_field=primary_field, is_partition_key=True,
+                                              check_task=CheckTasks.err_res, check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L0)
+    @pytest.mark.parametrize("primary_field", [ct.default_int64_field_name, ct.default_string_field_name])
+    def test_collection_json_field_supported_primary_key(self, primary_field):
+        """
+        target: test create collection with one JSON field
+        method: 1. create collection with one JSON field, primary key field and vector field
+                2. set json field is_primary=false
+        expected: Create collection successfully
+        """
+        self._connect()
+        c_name = cf.gen_unique_str(prefix)
+        schema = cf.gen_json_default_collection_schema(primary_field=primary_field)
+        self.collection_wrap.init_collection(name=c_name, schema=schema,
+                                             check_task=CheckTasks.check_collection_property,
+                                             check_items={exp_name: c_name, exp_schema: schema})
+        
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("primary_field", [ct.default_int64_field_name, ct.default_string_field_name])
+    def test_collection_multiple_json_fields_supported_primary_key(self, primary_field):
+        """
+        target: test create collection with multiple JSON fields
+        method: 1. create collection with multiple JSON fields, primary key field and vector field
+                2. set json field is_primary=false
+        expected: Create collection successfully
+        """
+        self._connect()
+        c_name = cf.gen_unique_str(prefix)
+        schema = cf.gen_multiple_json_default_collection_schema(primary_field=primary_field)
+        self.collection_wrap.init_collection(name=c_name, schema=schema,
+                                             check_task=CheckTasks.check_collection_property,
+                                             check_items={exp_name: c_name, exp_schema: schema})

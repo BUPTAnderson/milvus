@@ -6,20 +6,18 @@ import (
 	"reflect"
 	"strings"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-
-	"github.com/milvus-io/milvus/internal/util"
-
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
 	jsonadapter "github.com/casbin/json-adapter/v2"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
 )
 
 type PrivilegeFunc func(ctx context.Context, req interface{}) (context.Context, error)
@@ -39,29 +37,22 @@ p = sub, obj, act
 e = some(where (p.eft == allow))
 
 [matchers]
-m = r.sub == p.sub && globMatch(r.obj, p.obj) && globMatch(r.act, p.act) || r.sub == "admin" || (r.sub == p.sub && p.act == "PrivilegeAll")
+m = r.sub == p.sub && globMatch(r.obj, p.obj) && globMatch(r.act, p.act) || r.sub == "admin" || (r.sub == p.sub && dbMatch(r.obj, p.obj) && p.act == "PrivilegeAll")
 `
-	ModelKey = "casbin"
 )
 
-var modelStore = make(map[string]model.Model, 1)
+var templateModel = getPolicyModel(ModelStr)
 
-func initPolicyModel() (model.Model, error) {
-	if policyModel, ok := modelStore[ModelStr]; ok {
-		return policyModel, nil
-	}
-	policyModel, err := model.NewModelFromString(ModelStr)
+func getPolicyModel(modelString string) model.Model {
+	m, err := model.NewModelFromString(modelString)
 	if err != nil {
-		log.Error("NewModelFromString fail", zap.String("model", ModelStr), zap.Error(err))
-		return nil, err
+		log.Panic("NewModelFromString fail", zap.String("model", ModelStr), zap.Error(err))
 	}
-	modelStore[ModelKey] = policyModel
-	return modelStore[ModelKey], nil
+	return m
 }
 
 // UnaryServerInterceptor returns a new unary server interceptors that performs per-request privilege access.
 func UnaryServerInterceptor(privilegeFunc PrivilegeFunc) grpc.UnaryServerInterceptor {
-	initPolicyModel()
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		newCtx, err := privilegeFunc(ctx, req)
 		if err != nil {
@@ -72,26 +63,43 @@ func UnaryServerInterceptor(privilegeFunc PrivilegeFunc) grpc.UnaryServerInterce
 }
 
 func PrivilegeInterceptor(ctx context.Context, req interface{}) (context.Context, error) {
-	if !Params.CommonCfg.AuthorizationEnabled {
+	if !Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
 		return ctx, nil
 	}
 	log.Debug("PrivilegeInterceptor", zap.String("type", reflect.TypeOf(req).String()))
 	privilegeExt, err := funcutil.GetPrivilegeExtObj(req)
 	if err != nil {
-		log.Debug("GetPrivilegeExtObj err", zap.Error(err))
+		log.Info("GetPrivilegeExtObj err", zap.Error(err))
 		return ctx, nil
 	}
 	username, err := GetCurUserFromContext(ctx)
 	if err != nil {
-		log.Error("GetCurUserFromContext fail", zap.Error(err))
+		log.Warn("GetCurUserFromContext fail", zap.Error(err))
 		return ctx, err
 	}
+	return privilegeInterceptor(ctx, privilegeExt, username, req)
+}
+
+func PrivilegeInterceptorWithUsername(ctx context.Context, username string, req interface{}) (context.Context, error) {
+	if !Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
+		return ctx, nil
+	}
+	log.Debug("PrivilegeInterceptor", zap.String("type", reflect.TypeOf(req).String()))
+	privilegeExt, err := funcutil.GetPrivilegeExtObj(req)
+	if err != nil {
+		log.Info("GetPrivilegeExtObj err", zap.Error(err))
+		return ctx, nil
+	}
+	return privilegeInterceptor(ctx, privilegeExt, username, req)
+}
+
+func privilegeInterceptor(ctx context.Context, privilegeExt commonpb.PrivilegeExt, username string, req interface{}) (context.Context, error) {
 	if username == util.UserRoot {
 		return ctx, nil
 	}
 	roleNames, err := GetRole(username)
 	if err != nil {
-		log.Error("GetRole fail", zap.String("username", username), zap.Error(err))
+		log.Warn("GetRole fail", zap.String("username", username), zap.Error(err))
 		return ctx, err
 	}
 	roleNames = append(roleNames, util.RolePublic)
@@ -104,10 +112,12 @@ func PrivilegeInterceptor(ctx context.Context, req interface{}) (context.Context
 	objectNameIndexs := privilegeExt.ObjectNameIndexs
 	objectNames := funcutil.GetObjectNames(req, objectNameIndexs)
 	objectPrivilege := privilegeExt.ObjectPrivilege.String()
+	dbName := GetCurDBNameFromContextOrDefault(ctx)
 	policyInfo := strings.Join(globalMetaCache.GetPrivilegeInfo(ctx), ",")
 
-	log.Debug("current request info", zap.String("username", username), zap.Strings("role_names", roleNames),
+	log := log.With(zap.String("username", username), zap.Strings("role_names", roleNames),
 		zap.String("object_type", objectType), zap.String("object_privilege", objectPrivilege),
+		zap.String("db_name", dbName),
 		zap.Int32("object_index", objectNameIndex), zap.String("object_name", objectName),
 		zap.Int32("object_indexs", objectNameIndexs), zap.Strings("object_names", objectNames),
 		zap.String("policy_info", policyInfo))
@@ -115,20 +125,17 @@ func PrivilegeInterceptor(ctx context.Context, req interface{}) (context.Context
 	policy := fmt.Sprintf("[%s]", policyInfo)
 	b := []byte(policy)
 	a := jsonadapter.NewAdapter(&b)
-	policyModel, err := initPolicyModel()
+	// the `templateModel` object isn't safe in the concurrent situation
+	casbinModel := templateModel.Copy()
+	e, err := casbin.NewEnforcer(casbinModel, a)
 	if err != nil {
-		errStr := "fail to get policy model"
-		log.Error(errStr, zap.Error(err))
+		log.Warn("NewEnforcer fail", zap.String("policy", policy), zap.Error(err))
 		return ctx, err
 	}
-	e, err := casbin.NewEnforcer(policyModel, a)
-	if err != nil {
-		log.Error("NewEnforcer fail", zap.String("policy", policy), zap.Error(err))
-		return ctx, err
-	}
+	e.AddFunction("dbMatch", DBMatchFunc)
 	for _, roleName := range roleNames {
 		permitFunc := func(resName string) (bool, error) {
-			object := funcutil.PolicyForResource(objectType, resName)
+			object := funcutil.PolicyForResource(dbName, objectType, resName)
 			isPermit, err := e.Enforce(roleName, object, objectPrivilege)
 			if err != nil {
 				return false, err
@@ -140,6 +147,7 @@ func PrivilegeInterceptor(ctx context.Context, req interface{}) (context.Context
 			// handle the api which refers one resource
 			permitObject, err := permitFunc(objectName)
 			if err != nil {
+				log.Warn("fail to execute permit func", zap.String("name", objectName), zap.Error(err))
 				return ctx, err
 			}
 			if permitObject {
@@ -153,6 +161,7 @@ func PrivilegeInterceptor(ctx context.Context, req interface{}) (context.Context
 			for _, name := range objectNames {
 				p, err := permitFunc(name)
 				if err != nil {
+					log.Warn("fail to execute permit func", zap.String("name", name), zap.Error(err))
 					return ctx, err
 				}
 				if !p {
@@ -166,7 +175,7 @@ func PrivilegeInterceptor(ctx context.Context, req interface{}) (context.Context
 		}
 	}
 
-	log.Debug("permission deny", zap.String("policy", policy), zap.Strings("roles", roleNames))
+	log.Info("permission deny", zap.String("policy", policy), zap.Strings("roles", roleNames))
 	return ctx, status.Error(codes.PermissionDenied, fmt.Sprintf("%s: permission deny", objectPrivilege))
 }
 
@@ -178,4 +187,14 @@ func isCurUserObject(objectType string, curUser string, object string) bool {
 		return false
 	}
 	return curUser == object
+}
+
+func DBMatchFunc(args ...interface{}) (interface{}, error) {
+	name1 := args[0].(string)
+	name2 := args[1].(string)
+
+	db1, _ := funcutil.SplitObjectName(name1[strings.Index(name1, "-")+1:])
+	db2, _ := funcutil.SplitObjectName(name2[strings.Index(name2, "-")+1:])
+
+	return db1 == db2, nil
 }

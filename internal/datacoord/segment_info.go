@@ -20,9 +20,14 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 // SegmentsInfo wraps a map, which maintains ID to SegmentInfo relation
@@ -33,12 +38,13 @@ type SegmentsInfo struct {
 // SegmentInfo wraps datapb.SegmentInfo and patches some extra info on it
 type SegmentInfo struct {
 	*datapb.SegmentInfo
-	currRows      int64
-	allocations   []*Allocation
-	lastFlushTime time.Time
-	isCompacting  bool
+	segmentIndexes map[UniqueID]*model.SegmentIndex
+	currRows       int64
+	allocations    []*Allocation
+	lastFlushTime  time.Time
+	isCompacting   bool
 	// a cache to avoid calculate twice
-	size            int64
+	size            atomic.Int64
 	lastWrittenTime time.Time
 }
 
@@ -48,10 +54,11 @@ type SegmentInfo struct {
 // the worst case scenario is to have a segment with twice size we expects
 func NewSegmentInfo(info *datapb.SegmentInfo) *SegmentInfo {
 	return &SegmentInfo{
-		SegmentInfo:   info,
-		currRows:      info.GetNumOfRows(),
-		allocations:   make([]*Allocation, 0, 16),
-		lastFlushTime: time.Now().Add(-1 * flushInterval),
+		SegmentInfo:    info,
+		segmentIndexes: make(map[UniqueID]*model.SegmentIndex),
+		currRows:       info.GetNumOfRows(),
+		allocations:    make([]*Allocation, 0, 16),
+		lastFlushTime:  time.Now().Add(-1 * flushInterval),
 		// A growing segment from recovery can be also considered idle.
 		lastWrittenTime: getZeroTime(),
 	}
@@ -93,6 +100,30 @@ func (s *SegmentsInfo) SetSegment(segmentID UniqueID, segment *SegmentInfo) {
 	s.segments[segmentID] = segment
 }
 
+// SetSegmentIndex sets SegmentIndex with segmentID, perform overwrite if already exists
+func (s *SegmentsInfo) SetSegmentIndex(segmentID UniqueID, segIndex *model.SegmentIndex) {
+	segment, ok := s.segments[segmentID]
+	if !ok {
+		log.Warn("segment missing for set segment index",
+			zap.Int64("segmentID", segmentID),
+			zap.Int64("indexID", segIndex.IndexID),
+		)
+		return
+	}
+	segment = segment.Clone()
+	if segment.segmentIndexes == nil {
+		segment.segmentIndexes = make(map[UniqueID]*model.SegmentIndex)
+	}
+	segment.segmentIndexes[segIndex.IndexID] = segIndex
+	s.segments[segmentID] = segment
+}
+
+func (s *SegmentsInfo) DropSegmentIndex(segmentID UniqueID, indexID UniqueID) {
+	if _, ok := s.segments[segmentID]; ok {
+		delete(s.segments[segmentID].segmentIndexes, indexID)
+	}
+}
+
 // SetRowCount sets rowCount info for SegmentInfo with provided segmentID
 // if SegmentInfo not found, do nothing
 func (s *SegmentsInfo) SetRowCount(segmentID UniqueID, rowCount int64) {
@@ -118,7 +149,7 @@ func (s *SegmentsInfo) SetIsImporting(segmentID UniqueID, isImporting bool) {
 
 // SetDmlPosition sets DmlPosition info (checkpoint for recovery) for SegmentInfo with provided segmentID
 // if SegmentInfo not found, do nothing
-func (s *SegmentsInfo) SetDmlPosition(segmentID UniqueID, pos *internalpb.MsgPosition) {
+func (s *SegmentsInfo) SetDmlPosition(segmentID UniqueID, pos *msgpb.MsgPosition) {
 	if segment, ok := s.segments[segmentID]; ok {
 		s.segments[segmentID] = segment.Clone(SetDmlPosition(pos))
 	}
@@ -126,7 +157,7 @@ func (s *SegmentsInfo) SetDmlPosition(segmentID UniqueID, pos *internalpb.MsgPos
 
 // SetStartPosition sets StartPosition info (recovery info when no checkout point found) for SegmentInfo with provided segmentID
 // if SegmentInfo not found, do nothing
-func (s *SegmentsInfo) SetStartPosition(segmentID UniqueID, pos *internalpb.MsgPosition) {
+func (s *SegmentsInfo) SetStartPosition(segmentID UniqueID, pos *msgpb.MsgPosition) {
 	if segment, ok := s.segments[segmentID]; ok {
 		s.segments[segmentID] = segment.Clone(SetStartPosition(pos))
 	}
@@ -196,13 +227,18 @@ func (s *SegmentsInfo) SetIsCompacting(segmentID UniqueID, isCompacting bool) {
 // Clone deep clone the segment info and return a new instance
 func (s *SegmentInfo) Clone(opts ...SegmentInfoOption) *SegmentInfo {
 	info := proto.Clone(s.SegmentInfo).(*datapb.SegmentInfo)
+	segmentIndexes := make(map[UniqueID]*model.SegmentIndex, len(s.segmentIndexes))
+	for indexID, segIdx := range s.segmentIndexes {
+		segmentIndexes[indexID] = model.CloneSegmentIndex(segIdx)
+	}
 	cloned := &SegmentInfo{
-		SegmentInfo:   info,
-		currRows:      s.currRows,
-		allocations:   s.allocations,
-		lastFlushTime: s.lastFlushTime,
-		isCompacting:  s.isCompacting,
-		//cannot copy size, since binlog may be changed
+		SegmentInfo:    info,
+		segmentIndexes: segmentIndexes,
+		currRows:       s.currRows,
+		allocations:    s.allocations,
+		lastFlushTime:  s.lastFlushTime,
+		isCompacting:   s.isCompacting,
+		// cannot copy size, since binlog may be changed
 		lastWrittenTime: s.lastWrittenTime,
 	}
 	for _, opt := range opts {
@@ -213,15 +249,20 @@ func (s *SegmentInfo) Clone(opts ...SegmentInfoOption) *SegmentInfo {
 
 // ShadowClone shadow clone the segment and return a new instance
 func (s *SegmentInfo) ShadowClone(opts ...SegmentInfoOption) *SegmentInfo {
+	segmentIndexes := make(map[UniqueID]*model.SegmentIndex, len(s.segmentIndexes))
+	for indexID, segIdx := range s.segmentIndexes {
+		segmentIndexes[indexID] = model.CloneSegmentIndex(segIdx)
+	}
 	cloned := &SegmentInfo{
 		SegmentInfo:     s.SegmentInfo,
+		segmentIndexes:  segmentIndexes,
 		currRows:        s.currRows,
 		allocations:     s.allocations,
 		lastFlushTime:   s.lastFlushTime,
 		isCompacting:    s.isCompacting,
-		size:            s.size,
 		lastWrittenTime: s.lastWrittenTime,
 	}
+	cloned.size.Store(s.size.Load())
 
 	for _, opt := range opts {
 		opt(cloned)
@@ -261,14 +302,14 @@ func SetIsImporting(isImporting bool) SegmentInfoOption {
 }
 
 // SetDmlPosition is the option to set dml position for segment info
-func SetDmlPosition(pos *internalpb.MsgPosition) SegmentInfoOption {
+func SetDmlPosition(pos *msgpb.MsgPosition) SegmentInfoOption {
 	return func(segment *SegmentInfo) {
 		segment.DmlPosition = pos
 	}
 }
 
 // SetStartPosition is the option to set start position for segment info
-func SetStartPosition(pos *internalpb.MsgPosition) SegmentInfoOption {
+func SetStartPosition(pos *msgpb.MsgPosition) SegmentInfoOption {
 	return func(segment *SegmentInfo) {
 		segment.StartPosition = pos
 	}
@@ -342,7 +383,7 @@ func addSegmentBinlogs(field2Binlogs map[UniqueID][]*datapb.Binlog) SegmentInfoO
 }
 
 func (s *SegmentInfo) getSegmentSize() int64 {
-	if s.size <= 0 {
+	if s.size.Load() <= 0 {
 		var size int64
 		for _, binlogs := range s.GetBinlogs() {
 			for _, l := range binlogs.GetBinlogs() {
@@ -361,9 +402,11 @@ func (s *SegmentInfo) getSegmentSize() int64 {
 				size += l.GetLogSize()
 			}
 		}
-		s.size = size
+		if size > 0 {
+			s.size.Store(size)
+		}
 	}
-	return s.size
+	return s.size.Load()
 }
 
 // SegmentInfoSelector is the function type to select SegmentInfo from meta

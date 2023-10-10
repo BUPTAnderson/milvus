@@ -18,62 +18,45 @@ package grpcindexnodeclient
 
 import (
 	"context"
-	"errors"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	grpcindexnode "github.com/milvus-io/milvus/internal/distributed/indexnode"
-	"github.com/milvus-io/milvus/internal/indexnode"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/etcd"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/mock"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-var ParamsGlobal paramtable.ComponentParam
-
 func Test_NewClient(t *testing.T) {
-	ClientParams.InitOnce(typeutil.IndexNodeRole)
+	paramtable.Init()
 	ctx := context.Background()
-	client, err := NewClient(ctx, "", false)
+	client, err := NewClient(ctx, "", 1, false)
 	assert.Nil(t, client)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	client, err = NewClient(ctx, "test", false)
-	assert.Nil(t, err)
+	client, err = NewClient(ctx, "test", 2, false)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret interface{}, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r3, err := client.GetStatisticsChannel(ctx)
+		r3, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r3, err)
 
 		r4, err := client.CreateJob(ctx, nil)
@@ -120,50 +103,23 @@ func Test_NewClient(t *testing.T) {
 	client.grpcClient.SetNewGrpcClientFunc(newFunc3)
 	checkFunc(true)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }
 
 func TestIndexNodeClient(t *testing.T) {
-	ctx := context.Background()
-
-	factory := dependency.NewDefaultFactory(true)
-	ins, err := grpcindexnode.NewServer(ctx, factory)
-	assert.Nil(t, err)
-	assert.NotNil(t, ins)
-
-	inm := indexnode.NewIndexNodeMock()
-	ParamsGlobal.InitOnce()
-	etcdCli, err := etcd.GetEtcdClient(&ParamsGlobal.EtcdCfg)
-	assert.NoError(t, err)
-	inm.SetEtcdClient(etcdCli)
-	err = ins.SetClient(inm)
-	assert.Nil(t, err)
-
-	err = ins.Run()
-	assert.Nil(t, err)
-
-	inc, err := NewClient(ctx, "localhost:21121", false)
-	assert.Nil(t, err)
+	inc := &mock.GrpcIndexNodeClient{Err: nil}
 	assert.NotNil(t, inc)
 
-	err = inc.Init()
-	assert.Nil(t, err)
-
-	err = inc.Start()
-	assert.Nil(t, err)
-
+	ctx := context.TODO()
 	t.Run("GetComponentStates", func(t *testing.T) {
-		states, err := inc.GetComponentStates(ctx)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.StateCode_Healthy, states.State.StateCode)
-		assert.Equal(t, commonpb.ErrorCode_Success, states.Status.ErrorCode)
+		_, err := inc.GetComponentStates(ctx, nil)
+		assert.NoError(t, err)
 	})
 
 	t.Run("GetStatisticsChannel", func(t *testing.T) {
-		resp, err := inc.GetStatisticsChannel(ctx)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		_, err := inc.GetStatisticsChannel(ctx, nil)
+		assert.NoError(t, err)
 	})
 
 	t.Run("CreatJob", func(t *testing.T) {
@@ -171,52 +127,43 @@ func TestIndexNodeClient(t *testing.T) {
 			ClusterID: "0",
 			BuildID:   0,
 		}
-		resp, err := inc.CreateJob(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		_, err := inc.CreateJob(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("QueryJob", func(t *testing.T) {
 		req := &indexpb.QueryJobsRequest{}
-		resp, err := inc.QueryJobs(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		_, err := inc.QueryJobs(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("DropJob", func(t *testing.T) {
 		req := &indexpb.DropJobsRequest{}
-		resp, err := inc.DropJobs(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		_, err := inc.DropJobs(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("ShowConfigurations", func(t *testing.T) {
 		req := &internalpb.ShowConfigurationsRequest{
 			Pattern: "",
 		}
-		resp, err := inc.ShowConfigurations(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		_, err := inc.ShowConfigurations(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("GetMetrics", func(t *testing.T) {
 		req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
-		assert.Nil(t, err)
-		resp, err := inc.GetMetrics(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NoError(t, err)
+		_, err = inc.GetMetrics(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("GetJobStats", func(t *testing.T) {
 		req := &indexpb.GetJobStatsRequest{}
-		resp, err := inc.GetJobStats(ctx, req)
+		_, err := inc.GetJobStats(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})
 
-	err = ins.Stop()
-	assert.Nil(t, err)
-
-	err = inc.Stop()
-	assert.Nil(t, err)
+	err := inc.Close()
+	assert.NoError(t, err)
 }

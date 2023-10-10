@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/Schema.h"
+#include "common/Types.h"
 #include "pb/plan.pb.h"
 
 namespace milvus::query {
@@ -32,6 +33,27 @@ namespace milvus::query {
 using optype = proto::plan::OpType;
 
 class ExprVisitor;
+
+struct ColumnInfo {
+    FieldId field_id;
+    DataType data_type;
+    std::vector<std::string> nested_path;
+
+    ColumnInfo(const proto::plan::ColumnInfo& column_info)
+        : field_id(column_info.field_id()),
+          data_type(static_cast<DataType>(column_info.data_type())),
+          nested_path(column_info.nested_path().begin(),
+                      column_info.nested_path().end()) {
+    }
+
+    ColumnInfo(FieldId field_id,
+               DataType data_type,
+               std::vector<std::string> nested_path = {})
+        : field_id(field_id),
+          data_type(data_type),
+          nested_path(std::move(nested_path)) {
+    }
+};
 
 // Base of all Exprs
 struct Expr {
@@ -49,7 +71,8 @@ struct BinaryExprBase : Expr {
 
     BinaryExprBase() = delete;
 
-    BinaryExprBase(ExprPtr& left, ExprPtr& right) : left_(std::move(left)), right_(std::move(right)) {
+    BinaryExprBase(ExprPtr& left, ExprPtr& right)
+        : left_(std::move(left)), right_(std::move(right)) {
     }
 };
 
@@ -66,7 +89,8 @@ struct LogicalUnaryExpr : UnaryExprBase {
     enum class OpType { Invalid = 0, LogicalNot = 1 };
     const OpType op_type_;
 
-    LogicalUnaryExpr(const OpType op_type, ExprPtr& child) : UnaryExprBase(child), op_type_(op_type) {
+    LogicalUnaryExpr(const OpType op_type, ExprPtr& child)
+        : UnaryExprBase(child), op_type_(op_type) {
     }
 
  public:
@@ -76,7 +100,13 @@ struct LogicalUnaryExpr : UnaryExprBase {
 
 struct LogicalBinaryExpr : BinaryExprBase {
     // Note: bitA - bitB == bitA & ~bitB, alias to LogicalMinus
-    enum class OpType { Invalid = 0, LogicalAnd = 1, LogicalOr = 2, LogicalXor = 3, LogicalMinus = 4 };
+    enum class OpType {
+        Invalid = 0,
+        LogicalAnd = 1,
+        LogicalOr = 2,
+        LogicalXor = 3,
+        LogicalMinus = 4
+    };
     const OpType op_type_;
 
     LogicalBinaryExpr(const OpType op_type, ExprPtr& left, ExprPtr& right)
@@ -89,14 +119,20 @@ struct LogicalBinaryExpr : BinaryExprBase {
 };
 
 struct TermExpr : Expr {
-    const FieldId field_id_;
-    const DataType data_type_;
+    const ColumnInfo column_;
+    const proto::plan::GenericValue::ValCase val_case_;
+    const bool is_in_field_;
 
  protected:
-    // prevent accidential instantiation
+    // prevent accidental instantiation
     TermExpr() = delete;
 
-    TermExpr(const FieldId field_id, const DataType data_type) : field_id_(field_id), data_type_(data_type) {
+    TermExpr(ColumnInfo column,
+             const proto::plan::GenericValue::ValCase val_case,
+             const bool is_in_field)
+        : column_(std::move(column)),
+          val_case_(val_case),
+          is_in_field_(is_in_field) {
     }
 
  public:
@@ -106,31 +142,41 @@ struct TermExpr : Expr {
 
 static const std::map<std::string, ArithOpType> arith_op_mapping_ = {
     // arith_op_name -> arith_op
-    {"add", ArithOpType::Add}, {"sub", ArithOpType::Sub}, {"mul", ArithOpType::Mul},
-    {"div", ArithOpType::Div}, {"mod", ArithOpType::Mod},
+    {"add", ArithOpType::Add},
+    {"sub", ArithOpType::Sub},
+    {"mul", ArithOpType::Mul},
+    {"div", ArithOpType::Div},
+    {"mod", ArithOpType::Mod},
 };
 
 static const std::map<ArithOpType, std::string> mapping_arith_op_ = {
     // arith_op_name -> arith_op
-    {ArithOpType::Add, "add"}, {ArithOpType::Sub, "sub"}, {ArithOpType::Mul, "mul"},
-    {ArithOpType::Div, "div"}, {ArithOpType::Mod, "mod"},
+    {ArithOpType::Add, "add"},
+    {ArithOpType::Sub, "sub"},
+    {ArithOpType::Mul, "mul"},
+    {ArithOpType::Div, "div"},
+    {ArithOpType::Mod, "mod"},
 };
 
 struct BinaryArithOpEvalRangeExpr : Expr {
-    const FieldId field_id_;
-    const DataType data_type_;
+    const ColumnInfo column_;
+    const proto::plan::GenericValue::ValCase val_case_;
     const OpType op_type_;
     const ArithOpType arith_op_;
 
  protected:
-    // prevent accidential instantiation
+    // prevent accidental instantiation
     BinaryArithOpEvalRangeExpr() = delete;
 
-    BinaryArithOpEvalRangeExpr(const FieldId field_id,
-                               const DataType data_type,
-                               const OpType op_type,
-                               const ArithOpType arith_op)
-        : field_id_(field_id), data_type_(data_type), op_type_(op_type), arith_op_(arith_op) {
+    BinaryArithOpEvalRangeExpr(
+        ColumnInfo column,
+        const proto::plan::GenericValue::ValCase val_case,
+        const OpType op_type,
+        const ArithOpType arith_op)
+        : column_(std::move(column)),
+          val_case_(val_case),
+          op_type_(op_type),
+          arith_op_(arith_op) {
     }
 
  public:
@@ -140,22 +186,29 @@ struct BinaryArithOpEvalRangeExpr : Expr {
 
 static const std::map<std::string, OpType> mapping_ = {
     // op_name -> op
-    {"lt", OpType::LessThan},    {"le", OpType::LessEqual},    {"lte", OpType::LessEqual},
-    {"gt", OpType::GreaterThan}, {"ge", OpType::GreaterEqual}, {"gte", OpType::GreaterEqual},
-    {"eq", OpType::Equal},       {"ne", OpType::NotEqual},
+    {"lt", OpType::LessThan},
+    {"le", OpType::LessEqual},
+    {"lte", OpType::LessEqual},
+    {"gt", OpType::GreaterThan},
+    {"ge", OpType::GreaterEqual},
+    {"gte", OpType::GreaterEqual},
+    {"eq", OpType::Equal},
+    {"ne", OpType::NotEqual},
 };
 
 struct UnaryRangeExpr : Expr {
-    const FieldId field_id_;
-    const DataType data_type_;
+    ColumnInfo column_;
     const OpType op_type_;
+    const proto::plan::GenericValue::ValCase val_case_;
 
  protected:
-    // prevent accidential instantiation
+    // prevent accidental instantiation
     UnaryRangeExpr() = delete;
 
-    UnaryRangeExpr(const FieldId field_id, const DataType data_type, const OpType op_type)
-        : field_id_(field_id), data_type_(data_type), op_type_(op_type) {
+    UnaryRangeExpr(ColumnInfo column,
+                   const OpType op_type,
+                   const proto::plan::GenericValue::ValCase val_case)
+        : column_(std::move(column)), op_type_(op_type), val_case_(val_case) {
     }
 
  public:
@@ -164,21 +217,21 @@ struct UnaryRangeExpr : Expr {
 };
 
 struct BinaryRangeExpr : Expr {
-    const FieldId field_id_;
-    const DataType data_type_;
+    const ColumnInfo column_;
+    const proto::plan::GenericValue::ValCase val_case_;
     const bool lower_inclusive_;
     const bool upper_inclusive_;
 
  protected:
-    // prevent accidential instantiation
+    // prevent accidental instantiation
     BinaryRangeExpr() = delete;
 
-    BinaryRangeExpr(const FieldId field_id,
-                    const DataType data_type,
+    BinaryRangeExpr(ColumnInfo column,
+                    const proto::plan::GenericValue::ValCase val_case,
                     const bool lower_inclusive,
                     const bool upper_inclusive)
-        : field_id_(field_id),
-          data_type_(data_type),
+        : column_(std::move(column)),
+          val_case_(val_case),
           lower_inclusive_(lower_inclusive),
           upper_inclusive_(upper_inclusive) {
     }
@@ -200,4 +253,107 @@ struct CompareExpr : Expr {
     accept(ExprVisitor&) override;
 };
 
+struct ExistsExpr : Expr {
+    const ColumnInfo column_;
+
+ protected:
+    // prevent accidental instantiation
+    ExistsExpr() = delete;
+
+    ExistsExpr(ColumnInfo column) : column_(std::move(column)) {
+    }
+
+ public:
+    void
+    accept(ExprVisitor&) override;
+};
+
+struct AlwaysTrueExpr : Expr {
+ public:
+    void
+    accept(ExprVisitor&) override;
+};
+
+inline ExprPtr
+CreateAlwaysTrueExpr() {
+    return std::make_unique<AlwaysTrueExpr>();
+}
+
+struct JsonContainsExpr : Expr {
+    const ColumnInfo column_;
+    bool same_type_;
+    ContainsType op_;
+    const proto::plan::GenericValue::ValCase val_case_;
+
+ protected:
+    JsonContainsExpr() = delete;
+
+    JsonContainsExpr(ColumnInfo column,
+                     const bool same_type,
+                     ContainsType op,
+                     proto::plan::GenericValue::ValCase val_case)
+        : column_(std::move(column)),
+          same_type_(same_type),
+          op_(op),
+          val_case_(val_case) {
+    }
+
+ public:
+    void
+    accept(ExprVisitor&) override;
+};
+
+inline bool
+IsTermExpr(Expr* expr) {
+    TermExpr* term_expr = dynamic_cast<TermExpr*>(expr);
+    return term_expr != nullptr;
+}
+
 }  // namespace milvus::query
+
+template <>
+struct fmt::formatter<milvus::query::LogicalUnaryExpr::OpType>
+    : formatter<string_view> {
+    auto
+    format(milvus::query::LogicalUnaryExpr::OpType c,
+           format_context& ctx) const {
+        string_view name = "unknown";
+        switch (c) {
+            case milvus::query::LogicalUnaryExpr::OpType::Invalid:
+                name = "Invalid";
+                break;
+            case milvus::query::LogicalUnaryExpr::OpType::LogicalNot:
+                name = "LogicalNot";
+                break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};
+
+template <>
+struct fmt::formatter<milvus::query::LogicalBinaryExpr::OpType>
+    : formatter<string_view> {
+    auto
+    format(milvus::query::LogicalBinaryExpr::OpType c,
+           format_context& ctx) const {
+        string_view name = "unknown";
+        switch (c) {
+            case milvus::query::LogicalBinaryExpr::OpType::Invalid:
+                name = "Invalid";
+                break;
+            case milvus::query::LogicalBinaryExpr::OpType::LogicalAnd:
+                name = "LogicalAdd";
+                break;
+            case milvus::query::LogicalBinaryExpr::OpType::LogicalOr:
+                name = "LogicalOr";
+                break;
+            case milvus::query::LogicalBinaryExpr::OpType::LogicalXor:
+                name = "LogicalXor";
+                break;
+            case milvus::query::LogicalBinaryExpr::OpType::LogicalMinus:
+                name = "LogicalMinus";
+                break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};

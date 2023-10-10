@@ -23,20 +23,40 @@ SegcoreInit(const char* conf_file) {
 // TODO merge small index config into one config map, including enable/disable small_index
 extern "C" void
 SegcoreSetChunkRows(const int64_t value) {
-    milvus::segcore::SegcoreConfig& config = milvus::segcore::SegcoreConfig::default_config();
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
     config.set_chunk_rows(value);
 }
 
 extern "C" void
+SegcoreSetEnableGrowingSegmentIndex(const bool value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_enable_growing_segment_index(value);
+}
+
+extern "C" void
 SegcoreSetNlist(const int64_t value) {
-    milvus::segcore::SegcoreConfig& config = milvus::segcore::SegcoreConfig::default_config();
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
     config.set_nlist(value);
 }
 
 extern "C" void
 SegcoreSetNprobe(const int64_t value) {
-    milvus::segcore::SegcoreConfig& config = milvus::segcore::SegcoreConfig::default_config();
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
     config.set_nprobe(value);
+}
+
+extern "C" void
+SegcoreSetKnowhereBuildThreadPoolNum(const uint32_t num_threads) {
+    milvus::config::KnowhereInitBuildThreadPool(num_threads);
+}
+
+extern "C" void
+SegcoreSetKnowhereSearchThreadPoolNum(const uint32_t num_threads) {
+    milvus::config::KnowhereInitSearchThreadPool(num_threads);
 }
 
 // return value must be freed by the caller
@@ -48,6 +68,23 @@ SegcoreSetSimdType(const char* value) {
     memcpy(ret, real_type.c_str(), real_type.length());
     ret[real_type.length()] = 0;
     return ret;
+}
+
+extern "C" void
+SegcoreCloseGlog() {
+    if (google::IsGoogleLoggingInitialized()) {
+        google::ShutdownGoogleLogging();
+    }
+}
+
+extern "C" int32_t
+GetCurrentIndexVersion() {
+    return milvus::config::GetCurrentIndexVersion();
+}
+
+extern "C" int32_t
+GetMinimalIndexVersion() {
+    return milvus::config::GetMinimalIndexVersion();
 }
 
 }  // namespace milvus::segcore

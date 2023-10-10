@@ -13,7 +13,7 @@ package client
 
 import (
 	"github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/server"
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 // UniqueID is the type of message ID
@@ -44,9 +44,10 @@ type ConsumerOptions struct {
 // Message is the message content of a consumer message
 type Message struct {
 	Consumer
-	MsgID   UniqueID
-	Topic   string
-	Payload []byte
+	MsgID      UniqueID
+	Topic      string
+	Payload    []byte
+	Properties map[string]string
 }
 
 // Consumer interface provide operations for a consumer
@@ -71,4 +72,7 @@ type Consumer interface {
 
 	// GetLatestMsgID get the latest msgID
 	GetLatestMsgID() (int64, error)
+
+	// check created topic whether vaild or not
+	CheckTopicValid(topic string) error
 }

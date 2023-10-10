@@ -16,40 +16,25 @@ import (
 	"path"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	rocksdbkv "github.com/milvus-io/milvus/internal/kv/rocksdb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/tecbot/gorocksdb"
 	"go.uber.org/zap"
+
+	rocksdbkv "github.com/milvus-io/milvus/internal/kv/rocksdb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
-
-// RocksmqRetentionTimeInMinutes is the time of retention
-var RocksmqRetentionTimeInSecs int64
-var DefaultRocksmqRetentionTimeInMins int64 = 7200
-
-// RocksmqRetentionSizeInMB is the size of retention
-var RocksmqRetentionSizeInMB int64
-var DefaultRocksmqRetentionSizeInMB int64 = 8192
-
-// RocksmqRetentionCompactionInterval is the Interval we trigger compaction,
-var RocksmqRetentionCompactionInterval int64
-var DefaultRocksmqRetentionCompactionInterval int64 = 86400
 
 // Const value that used to convert unit
 const (
 	MB = 1024 * 1024
 )
 
-// TickerTimeInSeconds is the time of expired check, default 10 minutes
-var TickerTimeInSeconds int64 = 600
-
 type retentionInfo struct {
 	// key is topic name, value is last retention time
-	topicRetetionTime sync.Map
+	topicRetetionTime *typeutil.ConcurrentMap[string, int64]
 	mutex             sync.RWMutex
 
 	kv *rocksdbkv.RocksdbKV
@@ -60,13 +45,9 @@ type retentionInfo struct {
 	closeOnce sync.Once
 }
 
-func initRetentionInfo(params paramtable.BaseTable, kv *rocksdbkv.RocksdbKV, db *gorocksdb.DB) (*retentionInfo, error) {
-	rawRmqRetentionTimeInMinutes := params.ParseInt64WithDefault("rocksmq.retentionTimeInMinutes", DefaultRocksmqRetentionTimeInMins)
-	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, rawRmqRetentionTimeInMinutes*60)
-	atomic.StoreInt64(&RocksmqRetentionSizeInMB, params.ParseInt64WithDefault("rocksmq.retentionSizeInMB", DefaultRocksmqRetentionSizeInMB))
-	atomic.StoreInt64(&RocksmqRetentionCompactionInterval, params.ParseInt64WithDefault("rocksmq.compactionInterval", DefaultRocksmqRetentionCompactionInterval))
+func initRetentionInfo(kv *rocksdbkv.RocksdbKV, db *gorocksdb.DB) (*retentionInfo, error) {
 	ri := &retentionInfo{
-		topicRetetionTime: sync.Map{},
+		topicRetetionTime: typeutil.NewConcurrentMap[string, int64](),
 		mutex:             sync.RWMutex{},
 		kv:                kv,
 		db:                db,
@@ -80,7 +61,7 @@ func initRetentionInfo(params paramtable.BaseTable, kv *rocksdbkv.RocksdbKV, db 
 	}
 	for _, key := range topicKeys {
 		topic := key[len(TopicIDTitle):]
-		ri.topicRetetionTime.Store(topic, time.Now().Unix())
+		ri.topicRetetionTime.Insert(topic, time.Now().Unix())
 		topicMu.Store(topic, new(sync.Mutex))
 	}
 	return ri, nil
@@ -97,10 +78,11 @@ func (ri *retentionInfo) startRetentionInfo() {
 // retention do time ticker and trigger retention check and operation for each topic
 func (ri *retentionInfo) retention() error {
 	log.Debug("Rocksmq retention goroutine start!")
+	params := paramtable.Get()
 	// Do retention check every 10 mins
-	ticker := time.NewTicker(time.Duration(atomic.LoadInt64(&TickerTimeInSeconds) * int64(time.Second)))
+	ticker := time.NewTicker(params.RocksmqCfg.TickerTimeInSeconds.GetAsDuration(time.Second))
 	defer ticker.Stop()
-	compactionTicker := time.NewTicker(time.Duration(atomic.LoadInt64(&RocksmqRetentionCompactionInterval) * int64(time.Second)))
+	compactionTicker := time.NewTicker(params.RocksmqCfg.CompactionInterval.GetAsDuration(time.Second))
 	defer compactionTicker.Stop()
 	defer ri.closeWg.Done()
 
@@ -115,21 +97,15 @@ func (ri *retentionInfo) retention() error {
 			go ri.kv.DB.CompactRange(gorocksdb.Range{Start: nil, Limit: nil})
 		case t := <-ticker.C:
 			timeNow := t.Unix()
-			checkTime := atomic.LoadInt64(&RocksmqRetentionTimeInSecs) / 10
+			checkTime := int64(params.RocksmqCfg.RetentionTimeInMinutes.GetAsFloat() * 60 / 10)
 			ri.mutex.RLock()
-			ri.topicRetetionTime.Range(func(k, v interface{}) bool {
-				topic, _ := k.(string)
-				lastRetentionTs, ok := v.(int64)
-				if !ok {
-					log.Warn("Can't parse lastRetention to int64", zap.String("topic", topic), zap.Any("value", v))
-					return true
-				}
+			ri.topicRetetionTime.Range(func(topic string, lastRetentionTs int64) bool {
 				if lastRetentionTs+checkTime < timeNow {
 					err := ri.expiredCleanUp(topic)
 					if err != nil {
-						log.Warn("Retention expired clean failed", zap.Any("error", err))
+						log.Warn("Retention expired clean failed", zap.Error(err))
 					}
-					ri.topicRetetionTime.Store(topic, timeNow)
+					ri.topicRetetionTime.Insert(topic, timeNow)
 				}
 				return true
 			})
@@ -155,6 +131,7 @@ func (ri *retentionInfo) expiredCleanUp(topic string) error {
 	start := time.Now()
 	var deletedAckedSize int64
 	var pageCleaned UniqueID
+	var lastAck int64
 	var pageEndID UniqueID
 	var err error
 
@@ -199,6 +176,7 @@ func (ri *retentionInfo) expiredCleanUp(topic string) error {
 		if err != nil {
 			return err
 		}
+		lastAck = ackedTs
 		if msgTimeExpiredCheck(ackedTs) {
 			pageEndID = pageID
 			pValue := pageIter.Value()
@@ -219,9 +197,9 @@ func (ri *retentionInfo) expiredCleanUp(topic string) error {
 		return err
 	}
 
-	log.Debug("Expired check by retention time", zap.Any("topic", topic),
-		zap.Any("pageEndID", pageEndID), zap.Any("deletedAckedSize", deletedAckedSize),
-		zap.Any("pageCleaned", pageCleaned), zap.Any("time taken", time.Since(start).Milliseconds()))
+	log.Info("Expired check by retention time", zap.String("topic", topic),
+		zap.Int64("pageEndID", pageEndID), zap.Int64("deletedAckedSize", deletedAckedSize), zap.Int64("lastAck", lastAck),
+		zap.Int64("pageCleaned", pageCleaned), zap.Int64("time taken", time.Since(start).Milliseconds()))
 
 	for ; pageIter.Valid(); pageIter.Next() {
 		pValue := pageIter.Value()
@@ -377,15 +355,19 @@ func DeleteMessages(db *gorocksdb.DB, topic string, startID, endID UniqueID) err
 }
 
 func msgTimeExpiredCheck(ackedTs int64) bool {
-	if RocksmqRetentionTimeInSecs < 0 {
+	params := paramtable.Get()
+	retentionSeconds := int64(params.RocksmqCfg.RetentionTimeInMinutes.GetAsFloat() * 60)
+	if retentionSeconds < 0 {
 		return false
 	}
-	return ackedTs+atomic.LoadInt64(&RocksmqRetentionTimeInSecs) < time.Now().Unix()
+	return ackedTs+retentionSeconds < time.Now().Unix()
 }
 
 func msgSizeExpiredCheck(deletedAckedSize, ackedSize int64) bool {
-	if RocksmqRetentionSizeInMB < 0 {
+	params := paramtable.Get()
+	size := params.RocksmqCfg.RetentionSizeInMB.GetAsInt64()
+	if size < 0 {
 		return false
 	}
-	return ackedSize-deletedAckedSize > atomic.LoadInt64(&RocksmqRetentionSizeInMB)*MB
+	return ackedSize-deletedAckedSize > size*MB
 }

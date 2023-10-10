@@ -20,42 +20,55 @@ import (
 	"fmt"
 	"path"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/internal/kv"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type channelStateTimer struct {
-	watchkv        kv.MetaKv
-	runningTimers  sync.Map // channel name to timer stop channels
+	watchkv kv.WatchKV
+
+	runningTimers     *typeutil.ConcurrentMap[string, *time.Timer]
+	runningTimerStops *typeutil.ConcurrentMap[string, chan struct{}] // channel name to timer stop channels
+
 	etcdWatcher    clientv3.WatchChan
 	timeoutWatcher chan *ackEvent
+	// Modifies afterwards must guarantee that runningTimerCount is updated synchronized with runningTimers
+	// in order to keep consistency
+	runningTimerCount atomic.Int32
 }
 
-func newChannelStateTimer(kv kv.MetaKv) *channelStateTimer {
+func newChannelStateTimer(kv kv.WatchKV) *channelStateTimer {
 	return &channelStateTimer{
-		watchkv:        kv,
-		timeoutWatcher: make(chan *ackEvent, 20),
+		watchkv:           kv,
+		timeoutWatcher:    make(chan *ackEvent, 20),
+		runningTimers:     typeutil.NewConcurrentMap[string, *time.Timer](),
+		runningTimerStops: typeutil.NewConcurrentMap[string, chan struct{}](),
 	}
 }
 
 func (c *channelStateTimer) getWatchers(prefix string) (clientv3.WatchChan, chan *ackEvent) {
 	if c.etcdWatcher == nil {
 		c.etcdWatcher = c.watchkv.WatchWithPrefix(prefix)
-
 	}
 	return c.etcdWatcher, c.timeoutWatcher
 }
 
+func (c *channelStateTimer) getWatchersWithRevision(prefix string, revision int64) (clientv3.WatchChan, chan *ackEvent) {
+	c.etcdWatcher = c.watchkv.WatchWithRevision(prefix, revision)
+	return c.etcdWatcher, c.timeoutWatcher
+}
+
 func (c *channelStateTimer) loadAllChannels(nodeID UniqueID) ([]*datapb.ChannelWatchInfo, error) {
-	prefix := path.Join(Params.DataCoordCfg.ChannelWatchSubPath, strconv.FormatInt(nodeID, 10))
+	prefix := path.Join(Params.CommonCfg.DataCoordWatchSubPath.GetValue(), strconv.FormatInt(nodeID, 10))
 
 	// TODO: change to LoadWithPrefixBytes
 	keys, values, err := c.watchkv.LoadWithPrefix(prefix)
@@ -80,40 +93,51 @@ func (c *channelStateTimer) loadAllChannels(nodeID UniqueID) ([]*datapb.ChannelW
 }
 
 // startOne can write ToWatch or ToRelease states.
-func (c *channelStateTimer) startOne(watchState datapb.ChannelWatchState, channelName string, nodeID UniqueID, timeoutTs int64) {
-	if timeoutTs == 0 {
+func (c *channelStateTimer) startOne(watchState datapb.ChannelWatchState, channelName string, nodeID UniqueID, timeout time.Duration) {
+	if timeout == 0 {
 		log.Info("zero timeoutTs, skip starting timer",
 			zap.String("watch state", watchState.String()),
 			zap.Int64("nodeID", nodeID),
-			zap.String("channel name", channelName),
+			zap.String("channelName", channelName),
 		)
 		return
 	}
+
 	stop := make(chan struct{})
+	ticker := time.NewTimer(timeout)
 	c.removeTimers([]string{channelName})
-	c.runningTimers.Store(channelName, stop)
-	timeoutT := time.Unix(0, timeoutTs)
+	c.runningTimerStops.Insert(channelName, stop)
+	c.runningTimers.Insert(channelName, ticker)
+	c.runningTimerCount.Inc()
 	go func() {
 		log.Info("timer started",
 			zap.String("watch state", watchState.String()),
 			zap.Int64("nodeID", nodeID),
-			zap.String("channel name", channelName),
-			zap.Time("timeout time", timeoutT))
+			zap.String("channelName", channelName),
+			zap.Duration("check interval", timeout))
+		defer ticker.Stop()
+
 		select {
-		case <-time.NewTimer(time.Until(timeoutT)).C:
-			log.Info("timeout and stop timer: wait for channel ACK timeout",
+		case <-ticker.C:
+			// check tickle at path as :tickle/[prefix]/{channel_name}
+			c.removeTimers([]string{channelName})
+			log.Warn("timeout and stop timer: wait for channel ACK timeout",
 				zap.String("watch state", watchState.String()),
 				zap.Int64("nodeID", nodeID),
-				zap.String("channel name", channelName),
-				zap.Time("timeout time", timeoutT))
+				zap.String("channelName", channelName),
+				zap.Duration("timeout interval", timeout),
+				zap.Int32("runningTimerCount", c.runningTimerCount.Load()))
 			ackType := getAckType(watchState)
 			c.notifyTimeoutWatcher(&ackEvent{ackType, channelName, nodeID})
+			return
 		case <-stop:
 			log.Info("stop timer before timeout",
 				zap.String("watch state", watchState.String()),
 				zap.Int64("nodeID", nodeID),
-				zap.String("channel name", channelName),
-				zap.Time("timeout time", timeoutT))
+				zap.String("channelName", channelName),
+				zap.Duration("timeout interval", timeout),
+				zap.Int32("runningTimerCount", c.runningTimerCount.Load()))
+			return
 		}
 	}()
 }
@@ -124,24 +148,43 @@ func (c *channelStateTimer) notifyTimeoutWatcher(e *ackEvent) {
 
 func (c *channelStateTimer) removeTimers(channels []string) {
 	for _, channel := range channels {
-		if stop, ok := c.runningTimers.LoadAndDelete(channel); ok {
-			close(stop.(chan struct{}))
+		if stop, ok := c.runningTimerStops.GetAndRemove(channel); ok {
+			close(stop)
+			c.runningTimers.GetAndRemove(channel)
+			c.runningTimerCount.Dec()
+			log.Info("remove timer for channel", zap.String("channel", channel),
+				zap.Int32("timerCount", c.runningTimerCount.Load()))
 		}
 	}
 }
 
 func (c *channelStateTimer) stopIfExist(e *ackEvent) {
-	stop, ok := c.runningTimers.LoadAndDelete(e.channelName)
+	stop, ok := c.runningTimerStops.GetAndRemove(e.channelName)
 	if ok && e.ackType != watchTimeoutAck && e.ackType != releaseTimeoutAck {
-		close(stop.(chan struct{}))
+		close(stop)
+		c.runningTimers.GetAndRemove(e.channelName)
+		c.runningTimerCount.Dec()
+		log.Info("stop timer for channel", zap.String("channel", e.channelName),
+			zap.Int32("timerCount", c.runningTimerCount.Load()))
 	}
+}
+
+func (c *channelStateTimer) resetIfExist(channel string, interval time.Duration) {
+	if timer, ok := c.runningTimers.Get(channel); ok {
+		timer.Reset(interval)
+	}
+}
+
+// Note here the reading towards c.running are not protected by mutex
+// because it's meaningless, since we cannot guarantee the following add/delete node operations
+func (c *channelStateTimer) hasRunningTimers() bool {
+	return c.runningTimerCount.Load() != 0
 }
 
 func parseWatchInfo(key string, data []byte) (*datapb.ChannelWatchInfo, error) {
 	watchInfo := datapb.ChannelWatchInfo{}
 	if err := proto.Unmarshal(data, &watchInfo); err != nil {
 		return nil, fmt.Errorf("invalid event data: fail to parse ChannelWatchInfo, key: %s, err: %v", key, err)
-
 	}
 
 	if watchInfo.Vchan == nil {

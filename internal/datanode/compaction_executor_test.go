@@ -18,18 +18,21 @@ package datanode
 
 import (
 	"context"
-	"sync"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/internal/proto/datapb"
 )
 
 func TestCompactionExecutor(t *testing.T) {
 	t.Run("Test execute", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
 		ex := newCompactionExecutor()
-		go ex.start(context.TODO())
+		go ex.start(ctx)
 		ex.execute(newMockCompactor(true))
+
+		cancel()
 	})
 
 	t.Run("Test stopTask", func(t *testing.T) {
@@ -101,7 +104,7 @@ func TestCompactionExecutor(t *testing.T) {
 		// wait for task enqueued
 		found := false
 		for !found {
-			_, found = ex.executing.Load(mc.getPlanID())
+			found = ex.executing.Contain(mc.getPlanID())
 		}
 
 		ex.stopExecutingtaskByVChannelName("mock")
@@ -112,7 +115,6 @@ func TestCompactionExecutor(t *testing.T) {
 			t.FailNow()
 		}
 	})
-
 }
 
 func newMockCompactor(isvalid bool) *mockCompactor {
@@ -121,6 +123,7 @@ func newMockCompactor(isvalid bool) *mockCompactor {
 		ctx:     ctx,
 		cancel:  cancel,
 		isvalid: isvalid,
+		done:    make(chan struct{}, 1),
 	}
 }
 
@@ -130,17 +133,16 @@ type mockCompactor struct {
 	isvalid       bool
 	alwaysWorking bool
 
-	wg sync.WaitGroup
+	done chan struct{}
 }
 
 var _ compactor = (*mockCompactor)(nil)
 
-func (mc *mockCompactor) start() {
-	mc.wg.Add(1)
+func (mc *mockCompactor) complete() {
+	mc.done <- struct{}{}
 }
 
-func (mc *mockCompactor) complete() {
-	mc.wg.Done()
+func (mc *mockCompactor) injectDone(success bool) {
 }
 
 func (mc *mockCompactor) compact() (*datapb.CompactionResult, error) {
@@ -161,7 +163,7 @@ func (mc *mockCompactor) getPlanID() UniqueID {
 func (mc *mockCompactor) stop() {
 	if mc.cancel != nil {
 		mc.cancel()
-		mc.wg.Wait()
+		<-mc.done
 	}
 }
 

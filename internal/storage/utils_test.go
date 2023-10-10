@@ -26,16 +26,14 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-
-	"github.com/milvus-io/milvus/internal/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 )
 
 func TestCheckTsField(t *testing.T) {
@@ -68,16 +66,13 @@ func TestCheckNumRows(t *testing.T) {
 	assert.True(t, checkNumRows())
 
 	f1 := &Int64FieldData{
-		NumRows: nil,
-		Data:    []int64{1, 2, 3},
+		Data: []int64{1, 2, 3},
 	}
 	f2 := &Int64FieldData{
-		NumRows: nil,
-		Data:    []int64{1, 2, 3},
+		Data: []int64{1, 2, 3},
 	}
 	f3 := &Int64FieldData{
-		NumRows: nil,
-		Data:    []int64{1, 2, 3, 4},
+		Data: []int64{1, 2, 3, 4},
 	}
 
 	assert.True(t, checkNumRows(f1, f2))
@@ -88,16 +83,13 @@ func TestCheckNumRows(t *testing.T) {
 
 func TestSortFieldDataList(t *testing.T) {
 	f1 := &Int16FieldData{
-		NumRows: nil,
-		Data:    []int16{1, 2, 3},
+		Data: []int16{1, 2, 3},
 	}
 	f2 := &Int32FieldData{
-		NumRows: nil,
-		Data:    []int32{4, 5, 6},
+		Data: []int32{4, 5, 6},
 	}
 	f3 := &Int64FieldData{
-		NumRows: nil,
-		Data:    []int64{7, 8, 9},
+		Data: []int64{7, 8, 9},
 	}
 
 	ls := fieldDataList{
@@ -177,6 +169,10 @@ func TestTransferColumnBasedInsertDataToRowBased(t *testing.T) {
 		Dim:  1,
 		Data: []float32{0, 0, 0},
 	}
+	f11 := &Float16VectorFieldData{
+		Dim:  1,
+		Data: []byte{1, 1, 2, 2, 3, 3},
+	}
 
 	data.Data[101] = f1
 	data.Data[102] = f2
@@ -188,6 +184,7 @@ func TestTransferColumnBasedInsertDataToRowBased(t *testing.T) {
 	// data.Data[108] = f8
 	data.Data[109] = f9
 	data.Data[110] = f10
+	data.Data[111] = f11
 
 	utss, rowIds, rows, err := TransferColumnBasedInsertDataToRowBased(data)
 	assert.NoError(t, err)
@@ -210,6 +207,7 @@ func TestTransferColumnBasedInsertDataToRowBased(t *testing.T) {
 				// b + 1, // "1"
 				1,          // 1
 				0, 0, 0, 0, // 0
+				1, 1,
 			},
 			rows[0].Value)
 		assert.ElementsMatch(t,
@@ -224,6 +222,7 @@ func TestTransferColumnBasedInsertDataToRowBased(t *testing.T) {
 				// b + 2, // "2"
 				2,          // 2
 				0, 0, 0, 0, // 0
+				2, 2,
 			},
 			rows[1].Value)
 		assert.ElementsMatch(t,
@@ -238,6 +237,7 @@ func TestTransferColumnBasedInsertDataToRowBased(t *testing.T) {
 				// b + 3, // "3"
 				3,          // 3
 				0, 0, 0, 0, // 0
+				3, 3,
 			},
 			rows[2].Value)
 	}
@@ -247,7 +247,7 @@ func TestGetDimFromParams(t *testing.T) {
 	dim := 8
 	params1 := []*commonpb.KeyValuePair{
 		{
-			Key:   "dim",
+			Key:   common.DimKey,
 			Value: strconv.Itoa(dim),
 		},
 	}
@@ -257,7 +257,7 @@ func TestGetDimFromParams(t *testing.T) {
 
 	params2 := []*commonpb.KeyValuePair{
 		{
-			Key:   "dim",
+			Key:   common.DimKey,
 			Value: "not in int format",
 		},
 	}
@@ -321,7 +321,7 @@ func TestReadBinary(t *testing.T) {
 	}
 }
 
-func genAllFieldsSchema(fVecDim, bVecDim int) (schema *schemapb.CollectionSchema, pkFieldID UniqueID, fieldIDs []UniqueID) {
+func genAllFieldsSchema(fVecDim, bVecDim, f16VecDim int) (schema *schemapb.CollectionSchema, pkFieldID UniqueID, fieldIDs []UniqueID) {
 	schema = &schemapb.CollectionSchema{
 		Name:        "all_fields_schema",
 		Description: "all_fields_schema",
@@ -353,7 +353,7 @@ func genAllFieldsSchema(fVecDim, bVecDim int) (schema *schemapb.CollectionSchema
 				DataType: schemapb.DataType_FloatVector,
 				TypeParams: []*commonpb.KeyValuePair{
 					{
-						Key:   "dim",
+						Key:   common.DimKey,
 						Value: strconv.Itoa(fVecDim),
 					},
 				},
@@ -362,10 +362,25 @@ func genAllFieldsSchema(fVecDim, bVecDim int) (schema *schemapb.CollectionSchema
 				DataType: schemapb.DataType_BinaryVector,
 				TypeParams: []*commonpb.KeyValuePair{
 					{
-						Key:   "dim",
+						Key:   common.DimKey,
 						Value: strconv.Itoa(bVecDim),
 					},
 				},
+			},
+			{
+				DataType: schemapb.DataType_Float16Vector,
+				TypeParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.DimKey,
+						Value: strconv.Itoa(f16VecDim),
+					},
+				},
+			},
+			{
+				DataType: schemapb.DataType_Array,
+			},
+			{
+				DataType: schemapb.DataType_JSON,
 			},
 		},
 	}
@@ -414,6 +429,16 @@ func generateBinaryVectors(numRows, dim int) []byte {
 	return ret
 }
 
+func generateFloat16Vectors(numRows, dim int) []byte {
+	total := (numRows * dim) * 2
+	ret := make([]byte, total)
+	_, err := rand.Read(ret)
+	if err != nil {
+		panic(err)
+	}
+	return ret
+}
+
 func generateBoolArray(numRows int) []bool {
 	ret := make([]bool, 0, numRows)
 	for i := 0; i < numRows; i++ {
@@ -454,8 +479,30 @@ func generateFloat64Array(numRows int) []float64 {
 	return ret
 }
 
-func genRowWithAllFields(fVecDim, bVecDim int) (blob *commonpb.Blob, pk int64, row []interface{}) {
-	schema, _, _ := genAllFieldsSchema(fVecDim, bVecDim)
+func generateBytesArray(numRows int) [][]byte {
+	ret := make([][]byte, 0, numRows)
+	for i := 0; i < numRows; i++ {
+		ret = append(ret, []byte(fmt.Sprint(rand.Int())))
+	}
+	return ret
+}
+
+func generateInt32ArrayList(numRows int) []*schemapb.ScalarField {
+	ret := make([]*schemapb.ScalarField, 0, numRows)
+	for i := 0; i < numRows; i++ {
+		ret = append(ret, &schemapb.ScalarField{
+			Data: &schemapb.ScalarField_IntData{
+				IntData: &schemapb.IntArray{
+					Data: []int32{rand.Int31(), rand.Int31()},
+				},
+			},
+		})
+	}
+	return ret
+}
+
+func genRowWithAllFields(fVecDim, bVecDim, f16VecDim int) (blob *commonpb.Blob, pk int64, row []interface{}) {
+	schema, _, _ := genAllFieldsSchema(fVecDim, bVecDim, f16VecDim)
 	ret := &commonpb.Blob{
 		Value: nil,
 	}
@@ -473,6 +520,11 @@ func genRowWithAllFields(fVecDim, bVecDim int) (blob *commonpb.Blob, pk int64, r
 			_ = binary.Write(&buffer, common.Endian, bVec)
 			ret.Value = append(ret.Value, buffer.Bytes()...)
 			row = append(row, bVec)
+		case schemapb.DataType_Float16Vector:
+			f16Vec := generateFloat16Vectors(1, f16VecDim)
+			_ = binary.Write(&buffer, common.Endian, f16Vec)
+			ret.Value = append(ret.Value, buffer.Bytes()...)
+			row = append(row, f16Vec)
 		case schemapb.DataType_Bool:
 			data := rand.Int()%2 == 0
 			_ = binary.Write(&buffer, common.Endian, data)
@@ -508,12 +560,29 @@ func genRowWithAllFields(fVecDim, bVecDim int) (blob *commonpb.Blob, pk int64, r
 			_ = binary.Write(&buffer, common.Endian, data)
 			ret.Value = append(ret.Value, buffer.Bytes()...)
 			row = append(row, data)
+		case schemapb.DataType_Array:
+			data := &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_IntData{
+					IntData: &schemapb.IntArray{
+						Data: []int32{1, 2, 3},
+					},
+				},
+			}
+			bytes, _ := proto.Marshal(data)
+			binary.Write(&buffer, common.Endian, bytes)
+			ret.Value = append(ret.Value, buffer.Bytes()...)
+			row = append(row, data)
+		case schemapb.DataType_JSON:
+			data := []byte(`{"key":"value"}`)
+			binary.Write(&buffer, common.Endian, data)
+			ret.Value = append(ret.Value, buffer.Bytes()...)
+			row = append(row, data)
 		}
 	}
 	return ret, pk, row
 }
 
-func genRowBasedInsertMsg(numRows, fVecDim, bVecDim int) (msg *msgstream.InsertMsg, pks []int64, columns [][]interface{}) {
+func genRowBasedInsertMsg(numRows, fVecDim, bVecDim, f16VecDim int) (msg *msgstream.InsertMsg, pks []int64, columns [][]interface{}) {
 	msg = &msgstream.InsertMsg{
 		BaseMsg: msgstream.BaseMsg{
 			Ctx:            nil,
@@ -522,7 +591,7 @@ func genRowBasedInsertMsg(numRows, fVecDim, bVecDim int) (msg *msgstream.InsertM
 			HashValues:     nil,
 			MsgPosition:    nil,
 		},
-		InsertRequest: internalpb.InsertRequest{
+		InsertRequest: msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_Insert,
 				MsgID:     0,
@@ -530,13 +599,13 @@ func genRowBasedInsertMsg(numRows, fVecDim, bVecDim int) (msg *msgstream.InsertM
 				SourceID:  0,
 			},
 			RowData: nil,
-			Version: internalpb.InsertDataVersion_RowBased,
+			Version: msgpb.InsertDataVersion_RowBased,
 		},
 	}
 	pks = make([]int64, 0)
 	raws := make([][]interface{}, 0)
 	for i := 0; i < numRows; i++ {
-		row, pk, raw := genRowWithAllFields(fVecDim, bVecDim)
+		row, pk, raw := genRowWithAllFields(fVecDim, bVecDim, f16VecDim)
 		msg.InsertRequest.RowData = append(msg.InsertRequest.RowData, row)
 		pks = append(pks, pk)
 		raws = append(raws, raw)
@@ -551,7 +620,7 @@ func genRowBasedInsertMsg(numRows, fVecDim, bVecDim int) (msg *msgstream.InsertM
 	return msg, pks, columns
 }
 
-func genColumnBasedInsertMsg(schema *schemapb.CollectionSchema, numRows, fVecDim, bVecDim int) (msg *msgstream.InsertMsg, pks []int64, columns [][]interface{}) {
+func genColumnBasedInsertMsg(schema *schemapb.CollectionSchema, numRows, fVecDim, bVecDim, f16VecDim int) (msg *msgstream.InsertMsg, pks []int64, columns [][]interface{}) {
 	msg = &msgstream.InsertMsg{
 		BaseMsg: msgstream.BaseMsg{
 			Ctx:            nil,
@@ -560,7 +629,7 @@ func genColumnBasedInsertMsg(schema *schemapb.CollectionSchema, numRows, fVecDim
 			HashValues:     nil,
 			MsgPosition:    nil,
 		},
-		InsertRequest: internalpb.InsertRequest{
+		InsertRequest: msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_Insert,
 				MsgID:     0,
@@ -569,7 +638,7 @@ func genColumnBasedInsertMsg(schema *schemapb.CollectionSchema, numRows, fVecDim
 			},
 			FieldsData: nil,
 			NumRows:    uint64(numRows),
-			Version:    internalpb.InsertDataVersion_ColumnBased,
+			Version:    msgpb.InsertDataVersion_ColumnBased,
 		},
 	}
 	pks = make([]int64, 0)
@@ -758,6 +827,68 @@ func genColumnBasedInsertMsg(schema *schemapb.CollectionSchema, numRows, fVecDim
 			for nrows := 0; nrows < numRows; nrows++ {
 				columns[idx] = append(columns[idx], data[nrows*bVecDim/8:(nrows+1)*bVecDim/8])
 			}
+		case schemapb.DataType_Float16Vector:
+			data := generateFloat16Vectors(numRows, f16VecDim)
+			f := &schemapb.FieldData{
+				Type:      schemapb.DataType_Float16Vector,
+				FieldName: field.Name,
+				Field: &schemapb.FieldData_Vectors{
+					Vectors: &schemapb.VectorField{
+						Dim: int64(f16VecDim),
+						Data: &schemapb.VectorField_Float16Vector{
+							Float16Vector: data,
+						},
+					},
+				},
+				FieldId: field.FieldID,
+			}
+			msg.FieldsData = append(msg.FieldsData, f)
+			for nrows := 0; nrows < numRows; nrows++ {
+				columns[idx] = append(columns[idx], data[nrows*f16VecDim*2:(nrows+1)*f16VecDim*2])
+			}
+
+		case schemapb.DataType_Array:
+			data := generateInt32ArrayList(numRows)
+			f := &schemapb.FieldData{
+				Type:      schemapb.DataType_Array,
+				FieldName: field.GetName(),
+				Field: &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_ArrayData{
+							ArrayData: &schemapb.ArrayArray{
+								Data:        data,
+								ElementType: schemapb.DataType_Int32,
+							},
+						},
+					},
+				},
+				FieldId: field.FieldID,
+			}
+			msg.FieldsData = append(msg.FieldsData, f)
+			for _, d := range data {
+				columns[idx] = append(columns[idx], d)
+			}
+
+		case schemapb.DataType_JSON:
+			data := generateBytesArray(numRows)
+			f := &schemapb.FieldData{
+				Type:      schemapb.DataType_Array,
+				FieldName: field.GetName(),
+				Field: &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_JsonData{
+							JsonData: &schemapb.JSONArray{
+								Data: data,
+							},
+						},
+					},
+				},
+				FieldId: field.FieldID,
+			}
+			msg.FieldsData = append(msg.FieldsData, f)
+			for _, d := range data {
+				columns[idx] = append(columns[idx], d)
+			}
 		}
 	}
 
@@ -765,12 +896,13 @@ func genColumnBasedInsertMsg(schema *schemapb.CollectionSchema, numRows, fVecDim
 }
 
 func TestRowBasedInsertMsgToInsertData(t *testing.T) {
-	numRows, fVecDim, bVecDim := 10, 8, 8
-	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim)
-	msg, _, columns := genRowBasedInsertMsg(numRows, fVecDim, bVecDim)
+	numRows, fVecDim, bVecDim, f16VecDim := 10, 8, 8, 8
+	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim, f16VecDim)
+	fieldIDs = fieldIDs[:len(fieldIDs)-2]
+	msg, _, columns := genRowBasedInsertMsg(numRows, fVecDim, bVecDim, f16VecDim)
 
 	idata, err := RowBasedInsertMsgToInsertData(msg, schema)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	for idx, fID := range fieldIDs {
 		column := columns[idx]
 		fData, ok := idata.Data[fID]
@@ -783,12 +915,12 @@ func TestRowBasedInsertMsgToInsertData(t *testing.T) {
 }
 
 func TestColumnBasedInsertMsgToInsertData(t *testing.T) {
-	numRows, fVecDim, bVecDim := 2, 2, 8
-	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim)
-	msg, _, columns := genColumnBasedInsertMsg(schema, numRows, fVecDim, bVecDim)
+	numRows, fVecDim, bVecDim, f16VecDim := 2, 2, 8, 2
+	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim, f16VecDim)
+	msg, _, columns := genColumnBasedInsertMsg(schema, numRows, fVecDim, bVecDim, f16VecDim)
 
 	idata, err := ColumnBasedInsertMsgToInsertData(msg, schema)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	for idx, fID := range fieldIDs {
 		column := columns[idx]
 		fData, ok := idata.Data[fID]
@@ -801,16 +933,17 @@ func TestColumnBasedInsertMsgToInsertData(t *testing.T) {
 }
 
 func TestInsertMsgToInsertData(t *testing.T) {
-	numRows, fVecDim, bVecDim := 10, 8, 8
-	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim)
-	msg, _, columns := genRowBasedInsertMsg(numRows, fVecDim, bVecDim)
+	numRows, fVecDim, bVecDim, f16VecDim := 10, 8, 8, 8
+	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim, f16VecDim)
+	fieldIDs = fieldIDs[:len(fieldIDs)-2]
+	msg, _, columns := genRowBasedInsertMsg(numRows, fVecDim, bVecDim, f16VecDim)
 
 	idata, err := InsertMsgToInsertData(msg, schema)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	for idx, fID := range fieldIDs {
 		column := columns[idx]
 		fData, ok := idata.Data[fID]
-		assert.True(t, ok)
+		assert.True(t, ok, "fID =", fID)
 		assert.Equal(t, len(column), fData.RowNum())
 		for j := range column {
 			assert.Equal(t, fData.GetRow(j), column[j])
@@ -819,12 +952,12 @@ func TestInsertMsgToInsertData(t *testing.T) {
 }
 
 func TestInsertMsgToInsertData2(t *testing.T) {
-	numRows, fVecDim, bVecDim := 2, 2, 8
-	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim)
-	msg, _, columns := genColumnBasedInsertMsg(schema, numRows, fVecDim, bVecDim)
+	numRows, fVecDim, bVecDim, f16VecDim := 2, 2, 8, 2
+	schema, _, fieldIDs := genAllFieldsSchema(fVecDim, bVecDim, f16VecDim)
+	msg, _, columns := genColumnBasedInsertMsg(schema, numRows, fVecDim, bVecDim, f16VecDim)
 
 	idata, err := InsertMsgToInsertData(msg, schema)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	for idx, fID := range fieldIDs {
 		column := columns[idx]
 		fData, ok := idata.Data[fID]
@@ -840,54 +973,56 @@ func TestMergeInsertData(t *testing.T) {
 	d1 := &InsertData{
 		Data: map[int64]FieldData{
 			common.RowIDField: &Int64FieldData{
-				NumRows: []int64{1},
-				Data:    []int64{1},
+				Data: []int64{1},
 			},
 			common.TimeStampField: &Int64FieldData{
-				NumRows: []int64{1},
-				Data:    []int64{1},
+				Data: []int64{1},
 			},
 			BoolField: &BoolFieldData{
-				NumRows: []int64{1},
-				Data:    []bool{true},
+				Data: []bool{true},
 			},
 			Int8Field: &Int8FieldData{
-				NumRows: []int64{1},
-				Data:    []int8{1},
+				Data: []int8{1},
 			},
 			Int16Field: &Int16FieldData{
-				NumRows: []int64{1},
-				Data:    []int16{1},
+				Data: []int16{1},
 			},
 			Int32Field: &Int32FieldData{
-				NumRows: []int64{1},
-				Data:    []int32{1},
+				Data: []int32{1},
 			},
 			Int64Field: &Int64FieldData{
-				NumRows: []int64{1},
-				Data:    []int64{1},
+				Data: []int64{1},
 			},
 			FloatField: &FloatFieldData{
-				NumRows: []int64{1},
-				Data:    []float32{0},
+				Data: []float32{0},
 			},
 			DoubleField: &DoubleFieldData{
-				NumRows: []int64{1},
-				Data:    []float64{0},
+				Data: []float64{0},
 			},
 			StringField: &StringFieldData{
-				NumRows: []int64{1},
-				Data:    []string{"1"},
+				Data: []string{"1"},
 			},
 			BinaryVectorField: &BinaryVectorFieldData{
-				NumRows: []int64{1},
-				Data:    []byte{0},
-				Dim:     8,
+				Data: []byte{0},
+				Dim:  8,
 			},
 			FloatVectorField: &FloatVectorFieldData{
-				NumRows: []int64{1},
-				Data:    []float32{0},
-				Dim:     1,
+				Data: []float32{0},
+				Dim:  1,
+			},
+			ArrayField: &ArrayFieldData{
+				Data: []*schemapb.ScalarField{
+					{
+						Data: &schemapb.ScalarField_IntData{
+							IntData: &schemapb.IntArray{
+								Data: []int32{1, 2, 3},
+							},
+						},
+					},
+				},
+			},
+			JSONField: &JSONFieldData{
+				Data: [][]byte{[]byte(`{"key":"value"}`)},
 			},
 		},
 		Infos: nil,
@@ -895,120 +1030,119 @@ func TestMergeInsertData(t *testing.T) {
 	d2 := &InsertData{
 		Data: map[int64]FieldData{
 			common.RowIDField: &Int64FieldData{
-				NumRows: []int64{1},
-				Data:    []int64{2},
+				Data: []int64{2},
 			},
 			common.TimeStampField: &Int64FieldData{
-				NumRows: []int64{1},
-				Data:    []int64{2},
+				Data: []int64{2},
 			},
 			BoolField: &BoolFieldData{
-				NumRows: []int64{1},
-				Data:    []bool{false},
+				Data: []bool{false},
 			},
 			Int8Field: &Int8FieldData{
-				NumRows: []int64{1},
-				Data:    []int8{2},
+				Data: []int8{2},
 			},
 			Int16Field: &Int16FieldData{
-				NumRows: []int64{1},
-				Data:    []int16{2},
+				Data: []int16{2},
 			},
 			Int32Field: &Int32FieldData{
-				NumRows: []int64{1},
-				Data:    []int32{2},
+				Data: []int32{2},
 			},
 			Int64Field: &Int64FieldData{
-				NumRows: []int64{1},
-				Data:    []int64{2},
+				Data: []int64{2},
 			},
 			FloatField: &FloatFieldData{
-				NumRows: []int64{1},
-				Data:    []float32{0},
+				Data: []float32{0},
 			},
 			DoubleField: &DoubleFieldData{
-				NumRows: []int64{1},
-				Data:    []float64{0},
+				Data: []float64{0},
 			},
 			StringField: &StringFieldData{
-				NumRows: []int64{1},
-				Data:    []string{"2"},
+				Data: []string{"2"},
 			},
 			BinaryVectorField: &BinaryVectorFieldData{
-				NumRows: []int64{1},
-				Data:    []byte{0},
-				Dim:     8,
+				Data: []byte{0},
+				Dim:  8,
 			},
 			FloatVectorField: &FloatVectorFieldData{
-				NumRows: []int64{1},
-				Data:    []float32{0},
-				Dim:     1,
+				Data: []float32{0},
+				Dim:  1,
+			},
+			ArrayField: &ArrayFieldData{
+				Data: []*schemapb.ScalarField{
+					{
+						Data: &schemapb.ScalarField_IntData{
+							IntData: &schemapb.IntArray{
+								Data: []int32{4, 5, 6},
+							},
+						},
+					},
+				},
+			},
+			JSONField: &JSONFieldData{
+				Data: [][]byte{[]byte(`{"hello":"world"}`)},
 			},
 		},
 		Infos: nil,
 	}
 
-	merged := MergeInsertData(d1, d2)
+	MergeInsertData(d1, d2)
 
-	f, ok := merged.Data[common.RowIDField]
+	f, ok := d1.Data[common.RowIDField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*Int64FieldData).NumRows)
 	assert.Equal(t, []int64{1, 2}, f.(*Int64FieldData).Data)
 
-	f, ok = merged.Data[common.TimeStampField]
+	f, ok = d1.Data[common.TimeStampField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*Int64FieldData).NumRows)
 	assert.Equal(t, []int64{1, 2}, f.(*Int64FieldData).Data)
 
-	f, ok = merged.Data[BoolField]
+	f, ok = d1.Data[BoolField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*BoolFieldData).NumRows)
 	assert.Equal(t, []bool{true, false}, f.(*BoolFieldData).Data)
 
-	f, ok = merged.Data[Int8Field]
+	f, ok = d1.Data[Int8Field]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*Int8FieldData).NumRows)
 	assert.Equal(t, []int8{1, 2}, f.(*Int8FieldData).Data)
 
-	f, ok = merged.Data[Int16Field]
+	f, ok = d1.Data[Int16Field]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*Int16FieldData).NumRows)
 	assert.Equal(t, []int16{1, 2}, f.(*Int16FieldData).Data)
 
-	f, ok = merged.Data[Int32Field]
+	f, ok = d1.Data[Int32Field]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*Int32FieldData).NumRows)
 	assert.Equal(t, []int32{1, 2}, f.(*Int32FieldData).Data)
 
-	f, ok = merged.Data[Int64Field]
+	f, ok = d1.Data[Int64Field]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*Int64FieldData).NumRows)
 	assert.Equal(t, []int64{1, 2}, f.(*Int64FieldData).Data)
 
-	f, ok = merged.Data[FloatField]
+	f, ok = d1.Data[FloatField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*FloatFieldData).NumRows)
 	assert.Equal(t, []float32{0, 0}, f.(*FloatFieldData).Data)
 
-	f, ok = merged.Data[DoubleField]
+	f, ok = d1.Data[DoubleField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*DoubleFieldData).NumRows)
 	assert.Equal(t, []float64{0, 0}, f.(*DoubleFieldData).Data)
 
-	f, ok = merged.Data[StringField]
+	f, ok = d1.Data[StringField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*StringFieldData).NumRows)
 	assert.Equal(t, []string{"1", "2"}, f.(*StringFieldData).Data)
 
-	f, ok = merged.Data[BinaryVectorField]
+	f, ok = d1.Data[BinaryVectorField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*BinaryVectorFieldData).NumRows)
 	assert.Equal(t, []byte{0, 0}, f.(*BinaryVectorFieldData).Data)
 
-	f, ok = merged.Data[FloatVectorField]
+	f, ok = d1.Data[FloatVectorField]
 	assert.True(t, ok)
-	assert.Equal(t, []int64{2}, f.(*FloatVectorFieldData).NumRows)
 	assert.Equal(t, []float32{0, 0}, f.(*FloatVectorFieldData).Data)
+
+	f, ok = d1.Data[ArrayField]
+	assert.True(t, ok)
+	assert.Equal(t, []int32{1, 2, 3}, f.(*ArrayFieldData).Data[0].GetIntData().GetData())
+	assert.Equal(t, []int32{4, 5, 6}, f.(*ArrayFieldData).Data[1].GetIntData().GetData())
+
+	f, ok = d1.Data[JSONField]
+	assert.True(t, ok)
+	assert.EqualValues(t, [][]byte{[]byte(`{"key":"value"}`), []byte(`{"hello":"world"}`)}, f.(*JSONFieldData).Data)
 }
 
 func TestGetPkFromInsertData(t *testing.T) {
@@ -1250,6 +1384,6 @@ func TestJson(t *testing.T) {
 	assert.NoError(t, err)
 	ExtraLength := int32(len(ExtraBytes))
 
-	fmt.Print(string(ExtraBytes))
-	fmt.Println(ExtraLength)
+	t.Log(string(ExtraBytes))
+	t.Log(ExtraLength)
 }

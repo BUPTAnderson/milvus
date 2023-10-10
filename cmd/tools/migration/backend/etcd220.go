@@ -4,11 +4,10 @@ import (
 	"fmt"
 
 	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/internal/util"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/meta"
+	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
+	"github.com/milvus-io/milvus/pkg/util"
 )
 
 // etcd220 implements Backend.
@@ -128,8 +127,13 @@ func (b etcd220) Clean() error {
 		rootcoord.FieldMetaPrefix,
 		rootcoord.AliasMetaPrefix,
 
+		rootcoord.SnapshotPrefix,
+
 		util.FieldIndexPrefix,
 		util.SegmentIndexPrefix,
+
+		querycoord.CollectionLoadInfoPrefix,
+		querycoord.PartitionLoadInfoPrefix,
 	}
 	for _, prefix := range prefixes {
 		if err := b.CleanWithPrefix(prefix); err != nil {

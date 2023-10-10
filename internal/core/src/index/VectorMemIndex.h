@@ -21,14 +21,20 @@
 #include <string>
 #include <vector>
 #include <boost/dynamic_bitset.hpp>
-
+#include "knowhere/factory.h"
 #include "index/VectorIndex.h"
+#include "storage/MemFileManagerImpl.h"
 
 namespace milvus::index {
 
 class VectorMemIndex : public VectorIndex {
  public:
-    explicit VectorMemIndex(const IndexType& index_type, const MetricType& metric_type, const IndexMode& index_mode);
+    explicit VectorMemIndex(
+        const IndexType& index_type,
+        const MetricType& metric_type,
+        const IndexVersion& version,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
 
     BinarySet
     Serialize(const Config& config) override;
@@ -37,31 +43,49 @@ class VectorMemIndex : public VectorIndex {
     Load(const BinarySet& binary_set, const Config& config = {}) override;
 
     void
-    BuildWithDataset(const DatasetPtr& dataset, const Config& config = {}) override;
+    Load(const Config& config = {}) override;
+
+    void
+    BuildWithDataset(const DatasetPtr& dataset,
+                     const Config& config = {}) override;
+
+    void
+    Build(const Config& config = {}) override;
+
+    void
+    AddWithDataset(const DatasetPtr& dataset, const Config& config) override;
 
     int64_t
     Count() override {
-        return index_->Count();
+        return index_.Count();
     }
 
     std::unique_ptr<SearchResult>
-    Query(const DatasetPtr dataset, const SearchInfo& search_info, const BitsetView& bitset) override;
+    Query(const DatasetPtr dataset,
+          const SearchInfo& search_info,
+          const BitsetView& bitset) override;
+
+    const bool
+    HasRawData() const override;
+
+    std::vector<uint8_t>
+    GetVector(const DatasetPtr dataset) const override;
+
+    BinarySet
+    Upload(const Config& config = {}) override;
+
+ protected:
+    virtual void
+    LoadWithoutAssemble(const BinarySet& binary_set, const Config& config);
 
  private:
     void
-    store_raw_data(const knowhere::DatasetPtr& dataset);
+    LoadFromFile(const Config& config);
 
-    void
-    parse_config(Config& config);
-
-    void
-    LoadRawData();
-
- private:
+ protected:
     Config config_;
-    knowhere::VecIndexPtr index_ = nullptr;
-    std::vector<uint8_t> raw_data_;
-    std::once_flag raw_data_loaded_;
+    knowhere::Index<knowhere::IndexNode> index_;
+    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
 };
 
 using VectorMemIndexPtr = std::unique_ptr<VectorMemIndex>;

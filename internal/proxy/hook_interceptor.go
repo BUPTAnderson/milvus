@@ -4,16 +4,20 @@ import (
 	"context"
 	"fmt"
 	"plugin"
-
-	"github.com/milvus-io/milvus-proto/go-api/hook"
+	"strconv"
+	"strings"
 
 	"go.uber.org/zap"
-
 	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/hook"
+	"github.com/milvus-io/milvus/pkg/config"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-type defaultHook struct {
-}
+type defaultHook struct{}
 
 func (d defaultHook) Init(params map[string]string) error {
 	return nil
@@ -36,7 +40,7 @@ func (d defaultHook) Release() {}
 var hoo hook.Hook
 
 func initHook() error {
-	path := Params.ProxyCfg.SoPath
+	path := Params.ProxyCfg.SoPath.GetValue()
 	if path == "" {
 		hoo = defaultHook{}
 		return nil
@@ -59,15 +63,25 @@ func initHook() error {
 	if !ok {
 		return fmt.Errorf("fail to convert the `Hook` interface")
 	}
-	if err = hoo.Init(Params.HookCfg.SoConfig); err != nil {
+	if err = hoo.Init(paramtable.GetHookParams().SoConfig.GetValue()); err != nil {
 		return fmt.Errorf("fail to init configs for the hook, error: %s", err.Error())
 	}
+	paramtable.GetHookParams().WatchHookWithPrefix("watch_hook", "", func(event *config.Event) {
+		log.Info("receive the hook refresh event", zap.Any("event", event))
+		go func() {
+			soConfig := paramtable.GetHookParams().SoConfig.GetValue()
+			log.Info("refresh hook configs", zap.Any("config", soConfig))
+			if err = hoo.Init(soConfig); err != nil {
+				log.Panic("fail to init configs for the hook when refreshing", zap.Error(err))
+			}
+		}()
+	})
 	return nil
 }
 
 func UnaryServerHookInterceptor() grpc.UnaryServerInterceptor {
 	if hookError := initHook(); hookError != nil {
-		logger.Error("hook error", zap.String("path", Params.ProxyCfg.SoPath), zap.Error(hookError))
+		logger.Error("hook error", zap.String("path", Params.ProxyCfg.SoPath.GetValue()), zap.Error(hookError))
 		hoo = defaultHook{}
 	}
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
@@ -82,16 +96,46 @@ func UnaryServerHookInterceptor() grpc.UnaryServerInterceptor {
 		)
 
 		if isMock, mockResp, err = hoo.Mock(ctx, req, fullMethod); isMock {
+			log.Info("hook mock", zap.String("user", getCurrentUser(ctx)),
+				zap.String("full method", fullMethod), zap.Error(err))
+			metrics.ProxyHookFunc.WithLabelValues(metrics.HookMock, fullMethod).Inc()
+			updateProxyFunctionCallMetric(fullMethod)
 			return mockResp, err
 		}
 
 		if newCtx, err = hoo.Before(ctx, req, fullMethod); err != nil {
+			log.Warn("hook before error", zap.String("user", getCurrentUser(ctx)), zap.String("full method", fullMethod),
+				zap.Any("request", req), zap.Error(err))
+			metrics.ProxyHookFunc.WithLabelValues(metrics.HookBefore, fullMethod).Inc()
+			updateProxyFunctionCallMetric(fullMethod)
 			return nil, err
 		}
 		realResp, realErr = handler(newCtx, req)
 		if err = hoo.After(newCtx, realResp, realErr, fullMethod); err != nil {
+			log.Warn("hook after error", zap.String("user", getCurrentUser(ctx)), zap.String("full method", fullMethod),
+				zap.Any("request", req), zap.Error(err))
+			metrics.ProxyHookFunc.WithLabelValues(metrics.HookAfter, fullMethod).Inc()
+			updateProxyFunctionCallMetric(fullMethod)
 			return nil, err
 		}
 		return realResp, realErr
 	}
+}
+
+func updateProxyFunctionCallMetric(fullMethod string) {
+	strs := strings.Split(fullMethod, "/")
+	method := strs[len(strs)-1]
+	if method == "" {
+		return
+	}
+	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, metrics.TotalLabel).Inc()
+	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, metrics.FailLabel).Inc()
+}
+
+func getCurrentUser(ctx context.Context) string {
+	username, err := GetCurUserFromContext(ctx)
+	if err != nil {
+		log.Warn("fail to get current user", zap.Error(err))
+	}
+	return username
 }

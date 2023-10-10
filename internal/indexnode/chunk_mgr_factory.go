@@ -3,37 +3,44 @@ package indexnode
 import (
 	"context"
 	"fmt"
-	"sync"
 
-	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type StorageFactory interface {
 	NewChunkManager(ctx context.Context, config *indexpb.StorageConfig) (storage.ChunkManager, error)
 }
 
-type chunkMgr struct {
-	cached sync.Map
+type chunkMgrFactory struct {
+	cached *typeutil.ConcurrentMap[string, storage.ChunkManager]
 }
 
-func (m *chunkMgr) NewChunkManager(ctx context.Context, config *indexpb.StorageConfig) (storage.ChunkManager, error) {
-	key := m.cacheKey(config.StorageType, config.BucketName, config.Address)
-	if v, ok := m.cached.Load(key); ok {
-		return v.(storage.ChunkManager), nil
+func NewChunkMgrFactory() *chunkMgrFactory {
+	return &chunkMgrFactory{
+		cached: typeutil.NewConcurrentMap[string, storage.ChunkManager](),
 	}
-
-	chunkManagerFactory := storage.NewChunkManagerFactoryWithParam(&Params)
-	mgr, err := chunkManagerFactory.NewPersistentStorageChunkManager(ctx)
-	if err != nil {
-		return nil, err
-	}
-	v, _ := m.cached.LoadOrStore(key, mgr)
-	log.Ctx(ctx).Info("index node successfully init chunk manager")
-	return v.(storage.ChunkManager), nil
 }
 
-func (m *chunkMgr) cacheKey(storageType, bucket, address string) string {
+func (m *chunkMgrFactory) NewChunkManager(ctx context.Context, config *indexpb.StorageConfig) (storage.ChunkManager, error) {
+	chunkManagerFactory := storage.NewChunkManagerFactory(config.GetStorageType(),
+		storage.RootPath(config.GetRootPath()),
+		storage.Address(config.GetAddress()),
+		storage.AccessKeyID(config.GetAccessKeyID()),
+		storage.SecretAccessKeyID(config.GetSecretAccessKey()),
+		storage.UseSSL(config.GetUseSSL()),
+		storage.BucketName(config.GetBucketName()),
+		storage.UseIAM(config.GetUseIAM()),
+		storage.CloudProvider(config.GetCloudProvider()),
+		storage.IAMEndpoint(config.GetIAMEndpoint()),
+		storage.UseVirtualHost(config.GetUseVirtualHost()),
+		storage.Region(config.GetRegion()),
+		storage.CreateBucket(true),
+	)
+	return chunkManagerFactory.NewPersistentStorageChunkManager(ctx)
+}
+
+func (m *chunkMgrFactory) cacheKey(storageType, bucket, address string) string {
 	return fmt.Sprintf("%s/%s/%s", storageType, bucket, address)
 }

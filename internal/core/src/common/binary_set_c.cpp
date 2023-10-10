@@ -14,7 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "knowhere/common/BinarySet.h"
+#include "common/EasyAssert.h"
+#include "knowhere/binaryset.h"
 #include "common/binary_set_c.h"
 
 CStatus
@@ -23,12 +24,12 @@ NewBinarySet(CBinarySet* c_binary_set) {
         auto binary_set = std::make_unique<knowhere::BinarySet>();
         *c_binary_set = binary_set.release();
         auto status = CStatus();
-        status.error_code = Success;
+        status.error_code = milvus::ErrorCode::Success;
         status.error_msg = "";
         return status;
     } catch (std::exception& e) {
         auto status = CStatus();
-        status.error_code = UnexpectedError;
+        status.error_code = milvus::ErrorCode::UnexpectedError;
         status.error_msg = strdup(e.what());
         return status;
     }
@@ -41,7 +42,10 @@ DeleteBinarySet(CBinarySet c_binary_set) {
 }
 
 CStatus
-AppendIndexBinary(CBinarySet c_binary_set, void* index_binary, int64_t index_size, const char* c_index_key) {
+AppendIndexBinary(CBinarySet c_binary_set,
+                  void* index_binary,
+                  int64_t index_size,
+                  const char* c_index_key) {
     auto status = CStatus();
     try {
         auto binary_set = (knowhere::BinarySet*)c_binary_set;
@@ -52,10 +56,10 @@ AppendIndexBinary(CBinarySet c_binary_set, void* index_binary, int64_t index_siz
         std::shared_ptr<uint8_t[]> data(dup);
         binary_set->Append(index_key, data, index_size);
 
-        status.error_code = Success;
+        status.error_code = milvus::ErrorCode::Success;
         status.error_msg = "";
     } catch (std::exception& e) {
-        status.error_code = UnexpectedError;
+        status.error_code = milvus::ErrorCode::UnexpectedError;
         status.error_msg = strdup(e.what());
     }
     return status;
@@ -68,13 +72,13 @@ GetBinarySetSize(CBinarySet c_binary_set) {
 }
 
 void
-GetBinarySetKeys(CBinarySet c_binary_set, void* datas) {
+GetBinarySetKeys(CBinarySet c_binary_set, void* data) {
     auto binary_set = (knowhere::BinarySet*)c_binary_set;
     auto& map_ = binary_set->binary_map_;
-    const char** datas_ = (const char**)datas;
+    const char** data_ = (const char**)data;
     std::size_t i = 0;
     for (auto it = map_.begin(); it != map_.end(); ++it, i++) {
-        datas_[i] = it->first.c_str();
+        data_[i] = it->first.c_str();
     }
 }
 
@@ -97,11 +101,11 @@ CopyBinarySetValue(void* data, const char* key, CBinarySet c_binary_set) {
     auto binary_set = (knowhere::BinarySet*)c_binary_set;
     try {
         auto binary = binary_set->GetByName(key);
-        status.error_code = Success;
+        status.error_code = milvus::ErrorCode::Success;
         status.error_msg = "";
         memcpy((uint8_t*)data, binary->data.get(), binary->size);
     } catch (std::exception& e) {
-        status.error_code = UnexpectedError;
+        status.error_code = milvus::ErrorCode::UnexpectedError;
         status.error_msg = strdup(e.what());
     }
     return status;

@@ -18,21 +18,18 @@ package datacoord
 
 import (
 	"context"
-	"errors"
 	"strconv"
-	"sync"
+	"strings"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/common"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 // Response response interface for verification
@@ -54,55 +51,19 @@ func VerifyResponse(response interface{}, err error) error {
 		if resp.GetStatus() == nil {
 			return errNilStatusResponse
 		}
-		if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-			return errors.New(resp.GetStatus().GetReason())
-		}
+		return merr.Error(resp.GetStatus())
+
 	case *commonpb.Status:
 		if resp == nil {
 			return errNilResponse
 		}
-		if resp.ErrorCode != commonpb.ErrorCode_Success {
-			return errors.New(resp.GetReason())
-		}
+		return merr.Error(resp)
 	default:
 		return errUnknownResponseType
 	}
-	return nil
 }
 
-// failResponse sets status to failed with unexpected error and reason.
-func failResponse(status *commonpb.Status, reason string) {
-	status.ErrorCode = commonpb.ErrorCode_UnexpectedError
-	status.Reason = reason
-}
-
-// failResponseWithCode sets status to failed with error code and reason.
-func failResponseWithCode(status *commonpb.Status, errCode commonpb.ErrorCode, reason string) {
-	status.ErrorCode = errCode
-	status.Reason = reason
-}
-
-func GetCompactTime(ctx context.Context, allocator allocator) (*compactTime, error) {
-	ts, err := allocator.allocTimestamp(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	pts, _ := tsoutil.ParseTS(ts)
-	ttRetention := pts.Add(-time.Duration(Params.CommonCfg.RetentionDuration) * time.Second)
-	ttRetentionLogic := tsoutil.ComposeTS(ttRetention.UnixNano()/int64(time.Millisecond), 0)
-
-	// TODO, change to collection level
-	if Params.CommonCfg.EntityExpirationTTL > 0 {
-		ttexpired := pts.Add(-Params.CommonCfg.EntityExpirationTTL)
-		ttexpiredLogic := tsoutil.ComposeTS(ttexpired.UnixNano()/int64(time.Millisecond), 0)
-		return &compactTime{ttRetentionLogic, ttexpiredLogic, Params.CommonCfg.EntityExpirationTTL}, nil
-	}
-	// no expiration time
-	return &compactTime{ttRetentionLogic, 0, 0}, nil
-}
-
-func FilterInIndexedSegments(handler Handler, indexCoord types.IndexCoord, segments ...*SegmentInfo) []*SegmentInfo {
+func FilterInIndexedSegments(handler Handler, mt *meta, segments ...*SegmentInfo) []*SegmentInfo {
 	if len(segments) == 0 {
 		return nil
 	}
@@ -127,69 +88,26 @@ func FilterInIndexedSegments(handler Handler, indexCoord types.IndexCoord, segme
 		}
 		for _, field := range coll.Schema.GetFields() {
 			if field.GetDataType() == schemapb.DataType_BinaryVector ||
-				field.GetDataType() == schemapb.DataType_FloatVector {
+				field.GetDataType() == schemapb.DataType_FloatVector ||
+				field.GetDataType() == schemapb.DataType_Float16Vector {
 				vecFieldID[collection] = field.GetFieldID()
 				break
 			}
 		}
 	}
 
-	wg := sync.WaitGroup{}
-	indexedSegmentCh := make(chan []int64, len(segments))
-	for _, segment := range segments {
-		segment := segment
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			resp, err := indexCoord.GetIndexInfos(ctx, &indexpb.GetIndexInfoRequest{
-				CollectionID: segment.GetCollectionID(),
-				SegmentIDs:   []int64{segment.GetID()},
-			})
-			if err != nil || resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-				log.Warn("failed to get index of collection",
-					zap.Int64("collectionID", segment.GetCollectionID()),
-					zap.Int64("segmentID", segment.GetID()))
-				return
-			}
-			indexed := extractSegmentsWithVectorIndex(vecFieldID, resp.GetSegmentInfo())
-			if len(indexed) == 0 {
-				log.Info("no vector index for the segment",
-					zap.Int64("collectionID", segment.GetCollectionID()),
-					zap.Int64("segmentID", segment.GetID()))
-				return
-			}
-			indexedSegmentCh <- indexed
-		}()
-	}
-	wg.Wait()
-	close(indexedSegmentCh)
-
 	indexedSegments := make([]*SegmentInfo, 0)
-	for segments := range indexedSegmentCh {
-		for _, segment := range segments {
-			if info, ok := segmentMap[segment]; ok {
-				delete(segmentMap, segment)
-				indexedSegments = append(indexedSegments, info)
-			}
+	for _, segment := range segments {
+		if !isFlushState(segment.GetState()) && segment.GetState() != commonpb.SegmentState_Dropped {
+			continue
+		}
+		segmentState := mt.GetSegmentIndexStateOnField(segment.GetCollectionID(), segment.GetID(), vecFieldID[segment.GetCollectionID()])
+		if segmentState.state == commonpb.IndexState_Finished {
+			indexedSegments = append(indexedSegments, segment)
 		}
 	}
 
 	return indexedSegments
-}
-
-func extractSegmentsWithVectorIndex(vecFieldID map[int64]int64, segentIndexInfo map[int64]*indexpb.SegmentInfo) []int64 {
-	indexedSegments := make(typeutil.UniqueSet)
-	for _, indexInfo := range segentIndexInfo {
-		for _, index := range indexInfo.GetIndexInfos() {
-			if index.GetFieldID() == vecFieldID[indexInfo.GetCollectionID()] {
-				indexedSegments.Insert(indexInfo.GetSegmentID())
-				break
-			}
-		}
-	}
-	return indexedSegments.Collect()
 }
 
 func getZeroTime() time.Time {
@@ -208,5 +126,66 @@ func getCollectionTTL(properties map[string]string) (time.Duration, error) {
 		return time.Duration(ttl) * time.Second, nil
 	}
 
-	return Params.CommonCfg.EntityExpirationTTL, nil
+	return Params.CommonCfg.EntityExpirationTTL.GetAsDuration(time.Second), nil
+}
+
+func getCompactedSegmentSize(s *datapb.CompactionResult) int64 {
+	var segmentSize int64
+
+	if s != nil {
+		for _, binlogs := range s.GetInsertLogs() {
+			for _, l := range binlogs.GetBinlogs() {
+				segmentSize += l.GetLogSize()
+			}
+		}
+
+		for _, deltaLogs := range s.GetDeltalogs() {
+			for _, l := range deltaLogs.GetBinlogs() {
+				segmentSize += l.GetLogSize()
+			}
+		}
+
+		for _, statsLogs := range s.GetDeltalogs() {
+			for _, l := range statsLogs.GetBinlogs() {
+				segmentSize += l.GetLogSize()
+			}
+		}
+	}
+
+	return segmentSize
+}
+
+// getCollectionAutoCompactionEnabled returns whether auto compaction for collection is enabled.
+// if not set, returns global auto compaction config.
+func getCollectionAutoCompactionEnabled(properties map[string]string) (bool, error) {
+	v, ok := properties[common.CollectionAutoCompactionKey]
+	if ok {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return false, err
+		}
+		return enabled, nil
+	}
+	return Params.DataCoordCfg.EnableAutoCompaction.GetAsBool(), nil
+}
+
+func getIndexType(indexParams []*commonpb.KeyValuePair) string {
+	for _, param := range indexParams {
+		if param.Key == common.IndexTypeKey {
+			return param.Value
+		}
+	}
+	return invalidIndex
+}
+
+func isFlatIndex(indexType string) bool {
+	return indexType == flatIndex || indexType == binFlatIndex
+}
+
+func parseBuildIDFromFilePath(key string) (UniqueID, error) {
+	ss := strings.Split(key, "/")
+	if strings.HasSuffix(key, "/") {
+		return strconv.ParseInt(ss[len(ss)-2], 10, 64)
+	}
+	return strconv.ParseInt(ss[len(ss)-1], 10, 64)
 }

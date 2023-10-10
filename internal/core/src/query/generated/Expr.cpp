@@ -49,4 +49,18 @@ CompareExpr::accept(ExprVisitor& visitor) {
     visitor.visit(*this);
 }
 
+void
+ExistsExpr::accept(ExprVisitor& visitor) {
+    visitor.visit(*this);
+}
+
+void
+AlwaysTrueExpr::accept(ExprVisitor& visitor) {
+    visitor.visit(*this);
+}
+
+void
+JsonContainsExpr::accept(ExprVisitor& visitor) {
+    visitor.visit(*this);
+}
 }  // namespace milvus::query

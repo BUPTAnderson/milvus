@@ -17,67 +17,22 @@
 package datacoord
 
 import (
-	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus/internal/kv"
+	"github.com/milvus-io/milvus/internal/kv/mocks"
+	"github.com/milvus-io/milvus/internal/kv/predicates"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/testutils"
 )
-
-type mockTxnKv struct{}
-
-func (m *mockTxnKv) Load(key string) (string, error) {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) MultiLoad(keys []string) ([]string, error) {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) LoadWithPrefix(key string) ([]string, []string, error) {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) Save(key string, value string) error {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) MultiSave(kvs map[string]string) error {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) Remove(key string) error {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) MultiRemove(keys []string) error {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) RemoveWithPrefix(key string) error {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) Close() {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) MultiSaveAndRemove(saves map[string]string, removals []string) error {
-	if len(saves)+len(removals) > 128 {
-		return errors.New("too many operations")
-	}
-	return nil
-}
-
-func (m *mockTxnKv) MultiRemoveWithPrefix(keys []string) error {
-	panic("not implemented") // TODO: Implement
-}
-
-func (m *mockTxnKv) MultiSaveAndRemoveWithPrefix(saves map[string]string, removals []string) error {
-	panic("not implemented") // TODO: Implement
-}
 
 func genNodeChannelInfos(id int64, num int) *NodeChannelInfo {
 	channels := make([]*channel, 0, num)
@@ -118,6 +73,11 @@ func genChannelOperations(from, to int64, num int) ChannelOpSet {
 }
 
 func TestChannelStore_Update(t *testing.T) {
+	txnKv := mocks.NewTxnKV(t)
+	txnKv.EXPECT().MultiSaveAndRemove(mock.Anything, mock.Anything).Run(func(saves map[string]string, removals []string, preds ...predicates.Predicate) {
+		assert.False(t, len(saves)+len(removals) > 128, "too many operations")
+	}).Return(nil)
+
 	type fields struct {
 		store        kv.TxnKV
 		channelsInfo map[int64]*NodeChannelInfo
@@ -134,7 +94,7 @@ func TestChannelStore_Update(t *testing.T) {
 		{
 			"test more than 128 operations",
 			fields{
-				&mockTxnKv{},
+				txnKv,
 				map[int64]*NodeChannelInfo{
 					1: genNodeChannelInfos(1, 500),
 					2: {NodeID: 2},
@@ -156,4 +116,87 @@ func TestChannelStore_Update(t *testing.T) {
 			assert.Equal(t, tt.wantErr, err != nil)
 		})
 	}
+}
+
+type ChannelStoreReloadSuite struct {
+	testutils.PromMetricsSuite
+
+	mockTxn *mocks.TxnKV
+}
+
+func (suite *ChannelStoreReloadSuite) SetupTest() {
+	suite.mockTxn = mocks.NewTxnKV(suite.T())
+}
+
+func (suite *ChannelStoreReloadSuite) generateWatchInfo(name string, state datapb.ChannelWatchState) *datapb.ChannelWatchInfo {
+	return &datapb.ChannelWatchInfo{
+		Vchan: &datapb.VchannelInfo{
+			ChannelName: name,
+		},
+		State: state,
+	}
+}
+
+func (suite *ChannelStoreReloadSuite) TestReload() {
+	type item struct {
+		nodeID      int64
+		channelName string
+	}
+	type testCase struct {
+		tag    string
+		items  []item
+		expect map[int64]int
+	}
+
+	cases := []testCase{
+		{
+			tag:    "empty",
+			items:  []item{},
+			expect: map[int64]int{},
+		},
+		{
+			tag: "normal",
+			items: []item{
+				{nodeID: 1, channelName: "dml1_v0"},
+				{nodeID: 1, channelName: "dml2_v1"},
+				{nodeID: 2, channelName: "dml3_v0"},
+			},
+			expect: map[int64]int{1: 2, 2: 1},
+		},
+		{
+			tag: "buffer",
+			items: []item{
+				{nodeID: bufferID, channelName: "dml1_v0"},
+			},
+			expect: map[int64]int{bufferID: 1},
+		},
+	}
+
+	for _, tc := range cases {
+		suite.Run(tc.tag, func() {
+			suite.mockTxn.ExpectedCalls = nil
+
+			var keys, values []string
+			for _, item := range tc.items {
+				keys = append(keys, fmt.Sprintf("channel_store/%d/%s", item.nodeID, item.channelName))
+				info := suite.generateWatchInfo(item.channelName, datapb.ChannelWatchState_WatchSuccess)
+				bs, err := proto.Marshal(info)
+				suite.Require().NoError(err)
+				values = append(values, string(bs))
+			}
+			suite.mockTxn.EXPECT().LoadWithPrefix(mock.AnythingOfType("string")).Return(keys, values, nil)
+
+			store := NewChannelStore(suite.mockTxn)
+			err := store.Reload()
+			suite.Require().NoError(err)
+
+			for nodeID, expect := range tc.expect {
+				suite.MetricsEqual(metrics.DataCoordDmlChannelNum.WithLabelValues(strconv.FormatInt(nodeID, 10)), float64(expect))
+			}
+		})
+	}
+}
+
+func TestChannelStore(t *testing.T) {
+	suite.Run(t, new(ChannelStoreReloadSuite))
 }

@@ -22,21 +22,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	grpcdatanodeclient "github.com/milvus-io/milvus/internal/distributed/datanode/client"
-	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-	"go.uber.org/zap"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 const (
 	flushTimeout = 15 * time.Second
 	// TODO: evaluate and update import timeout.
-	importTimeout     = 3 * time.Hour
-	reCollectTimeout  = 5 * time.Second
-	addSegmentTimeout = 30 * time.Second
+	importTimeout    = 3 * time.Hour
+	reCollectTimeout = 5 * time.Second
 )
 
 // SessionManager provides the grpc interfaces of cluster
@@ -56,8 +61,8 @@ func withSessionCreator(creator dataNodeCreatorFunc) SessionOpt {
 }
 
 func defaultSessionCreator() dataNodeCreatorFunc {
-	return func(ctx context.Context, addr string) (types.DataNode, error) {
-		return grpcdatanodeclient.NewClient(ctx, addr)
+	return func(ctx context.Context, addr string, nodeID int64) (types.DataNodeClient, error) {
+		return grpcdatanodeclient.NewClient(ctx, addr, nodeID)
 	}
 }
 
@@ -83,6 +88,7 @@ func (c *SessionManager) AddSession(node *NodeInfo) {
 
 	session := NewSession(node, c.sessionCreator)
 	c.sessions.data[node.NodeID] = session
+	metrics.DataCoordNumDataNodes.WithLabelValues().Set(float64(len(c.sessions.data)))
 }
 
 // DeleteSession removes the node session
@@ -94,6 +100,7 @@ func (c *SessionManager) DeleteSession(node *NodeInfo) {
 		session.Dispose()
 		delete(c.sessions.data, node.NodeID)
 	}
+	metrics.DataCoordNumDataNodes.WithLabelValues().Set(float64(len(c.sessions.data)))
 }
 
 // getLiveNodeIDs returns IDs of all live DataNodes.
@@ -144,7 +151,7 @@ func (c *SessionManager) execFlush(ctx context.Context, nodeID int64, req *datap
 
 // Compaction is a grpc interface. It will send request to DataNode with provided `nodeID` synchronously.
 func (c *SessionManager) Compaction(nodeID int64, plan *datapb.CompactionPlan) error {
-	ctx, cancel := context.WithTimeout(context.Background(), rpcCompactionTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), Params.DataCoordCfg.CompactionRPCTimeout.GetAsDuration(time.Second))
 	defer cancel()
 	cli, err := c.getClient(ctx, nodeID)
 	if err != nil {
@@ -164,21 +171,36 @@ func (c *SessionManager) Compaction(nodeID int64, plan *datapb.CompactionPlan) e
 
 // SyncSegments is a grpc interface. It will send request to DataNode with provided `nodeID` synchronously.
 func (c *SessionManager) SyncSegments(nodeID int64, req *datapb.SyncSegmentsRequest) error {
-	ctx, cancel := context.WithTimeout(context.Background(), rpcCompactionTimeout)
+	log := log.With(
+		zap.Int64("nodeID", nodeID),
+		zap.Int64("planID", req.GetPlanID()),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), Params.DataCoordCfg.CompactionRPCTimeout.GetAsDuration(time.Second))
 	defer cancel()
 	cli, err := c.getClient(ctx, nodeID)
 	if err != nil {
-		log.Warn("failed to get client", zap.Int64("nodeID", nodeID), zap.Error(err))
+		log.Warn("failed to get client", zap.Error(err))
 		return err
 	}
 
-	resp, err := cli.SyncSegments(ctx, req)
-	if err := VerifyResponse(resp, err); err != nil {
-		log.Warn("failed to sync segments", zap.Int64("node", nodeID), zap.Error(err), zap.Int64("planID", req.GetPlanID()))
+	err = retry.Do(context.Background(), func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), Params.DataCoordCfg.CompactionRPCTimeout.GetAsDuration(time.Second))
+		defer cancel()
+
+		resp, err := cli.SyncSegments(ctx, req)
+		if err := VerifyResponse(resp, err); err != nil {
+			log.Warn("failed to sync segments", zap.Error(err))
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Warn("failed to sync segments after retry", zap.Error(err))
 		return err
 	}
 
-	log.Info("success to sync segments", zap.Int64("node", nodeID), zap.Any("planID", req.GetPlanID()))
+	log.Info("success to sync segments")
 	return nil
 }
 
@@ -206,39 +228,36 @@ func (c *SessionManager) execImport(ctx context.Context, nodeID int64, itr *data
 }
 
 // ReCollectSegmentStats collects segment stats info from DataNodes, after DataCoord reboots.
-func (c *SessionManager) ReCollectSegmentStats(ctx context.Context, nodeID int64) {
-	go c.execReCollectSegmentStats(ctx, nodeID)
-}
-
-func (c *SessionManager) execReCollectSegmentStats(ctx context.Context, nodeID int64) {
+func (c *SessionManager) ReCollectSegmentStats(ctx context.Context, nodeID int64) error {
 	cli, err := c.getClient(ctx, nodeID)
 	if err != nil {
 		log.Warn("failed to get dataNode client", zap.Int64("DataNode ID", nodeID), zap.Error(err))
-		return
+		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, reCollectTimeout)
 	defer cancel()
 	resp, err := cli.ResendSegmentStats(ctx, &datapb.ResendSegmentStatsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_ResendSegmentStats),
-			commonpbutil.WithSourceID(Params.DataCoordCfg.GetNodeID()),
+			commonpbutil.WithSourceID(paramtable.GetNodeID()),
 		),
 	})
 	if err := VerifyResponse(resp, err); err != nil {
-		log.Error("re-collect segment stats call failed",
+		log.Warn("re-collect segment stats call failed",
 			zap.Int64("DataNode ID", nodeID), zap.Error(err))
-	} else {
-		log.Info("re-collect segment stats call succeeded",
-			zap.Int64("DataNode ID", nodeID),
-			zap.Int64s("segment stat collected", resp.GetSegResent()))
+		return err
 	}
+	log.Info("re-collect segment stats call succeeded",
+		zap.Int64("DataNode ID", nodeID),
+		zap.Int64s("segment stat collected", resp.GetSegResent()))
+	return nil
 }
 
 func (c *SessionManager) GetCompactionState() map[int64]*datapb.CompactionStateResult {
 	wg := sync.WaitGroup{}
 	ctx := context.Background()
 
-	plans := sync.Map{}
+	plans := typeutil.NewConcurrentMap[int64, *datapb.CompactionStateResult]()
 	c.sessions.RLock()
 	for nodeID, s := range c.sessions.data {
 		wg.Add(1)
@@ -249,12 +268,12 @@ func (c *SessionManager) GetCompactionState() map[int64]*datapb.CompactionStateR
 				log.Info("Cannot Create Client", zap.Int64("NodeID", nodeID))
 				return
 			}
-			ctx, cancel := context.WithTimeout(ctx, rpcCompactionTimeout)
+			ctx, cancel := context.WithTimeout(ctx, Params.DataCoordCfg.CompactionRPCTimeout.GetAsDuration(time.Second))
 			defer cancel()
 			resp, err := cli.GetCompactionState(ctx, &datapb.CompactionStateRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_GetSystemConfigs),
-					commonpbutil.WithSourceID(Params.DataCoordCfg.GetNodeID()),
+					commonpbutil.WithSourceID(paramtable.GetNodeID()),
 				),
 			})
 			if err != nil {
@@ -267,7 +286,7 @@ func (c *SessionManager) GetCompactionState() map[int64]*datapb.CompactionStateR
 				return
 			}
 			for _, rst := range resp.GetResults() {
-				plans.Store(rst.PlanID, rst)
+				plans.Insert(rst.PlanID, rst)
 			}
 		}(nodeID, s)
 	}
@@ -275,15 +294,36 @@ func (c *SessionManager) GetCompactionState() map[int64]*datapb.CompactionStateR
 	wg.Wait()
 
 	rst := make(map[int64]*datapb.CompactionStateResult)
-	plans.Range(func(key, value any) bool {
-		rst[key.(int64)] = value.(*datapb.CompactionStateResult)
+	plans.Range(func(planID int64, result *datapb.CompactionStateResult) bool {
+		rst[planID] = result
 		return true
 	})
 
 	return rst
 }
 
-func (c *SessionManager) getClient(ctx context.Context, nodeID int64) (types.DataNode, error) {
+func (c *SessionManager) FlushChannels(ctx context.Context, nodeID int64, req *datapb.FlushChannelsRequest) error {
+	log := log.Ctx(ctx).With(zap.Int64("nodeID", nodeID),
+		zap.Time("flushTs", tsoutil.PhysicalTime(req.GetFlushTs())),
+		zap.Strings("channels", req.GetChannels()))
+	cli, err := c.getClient(ctx, nodeID)
+	if err != nil {
+		log.Warn("failed to get client", zap.Error(err))
+		return err
+	}
+
+	log.Info("SessionManager.FlushChannels start")
+	resp, err := cli.FlushChannels(ctx, req)
+	err = VerifyResponse(resp, err)
+	if err != nil {
+		log.Warn("SessionManager.FlushChannels failed", zap.Error(err))
+		return err
+	}
+	log.Info("SessionManager.FlushChannels successfully")
+	return nil
+}
+
+func (c *SessionManager) getClient(ctx context.Context, nodeID int64) (types.DataNodeClient, error) {
 	c.sessions.RLock()
 	session, ok := c.sessions.data[nodeID]
 	c.sessions.RUnlock()

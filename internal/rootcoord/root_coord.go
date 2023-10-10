@@ -18,7 +18,6 @@ package rootcoord
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -27,45 +26,49 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"github.com/tikv/client-go/v2/txnkv"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
-	"github.com/milvus-io/milvus/internal/common"
-	pnc "github.com/milvus-io/milvus/internal/distributed/proxy/client"
 	"github.com/milvus-io/milvus/internal/kv"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/internal/kv/tikv"
 	"github.com/milvus-io/milvus/internal/metastore"
-	"github.com/milvus-io/milvus/internal/metastore/db/dao"
-	"github.com/milvus-io/milvus/internal/metastore/db/dbcore"
-	"github.com/milvus-io/milvus/internal/metastore/db/rootcoord"
 	kvmetestore "github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/metrics"
 	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/tso"
+	tso2 "github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-	"github.com/milvus-io/milvus/internal/util/crypto"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/errorutil"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/retry"
+	"github.com/milvus-io/milvus/internal/util/importutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/timerecord"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
+	tsoutil2 "github.com/milvus-io/milvus/internal/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/crypto"
+	"github.com/milvus-io/milvus/pkg/util/errorutil"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/logutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // UniqueID is an alias of typeutil.UniqueID.
@@ -76,19 +79,11 @@ type Timestamp = typeutil.Timestamp
 
 const InvalidCollectionID = UniqueID(0)
 
-// ------------------ struct -----------------------
-
-var Params paramtable.ComponentParam
+var Params *paramtable.ComponentParam = paramtable.Get()
 
 type Opt func(*Core)
 
-type metaKVCreator func(root string) (kv.MetaKv, error)
-
-func defaultMetaKVCreator(etcdCli *clientv3.Client) metaKVCreator {
-	return func(root string) (kv.MetaKv, error) {
-		return etcdkv.NewEtcdKV(etcdCli, root), nil
-	}
-}
+type metaKVCreator func() (kv.MetaKv, error)
 
 // Core root coordinator core
 type Core struct {
@@ -96,6 +91,8 @@ type Core struct {
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	etcdCli          *clientv3.Client
+	tikvCli          *txnkv.Client
+	address          string
 	meta             IMetaTable
 	scheduler        IScheduler
 	broker           Broker
@@ -114,11 +111,10 @@ type Core struct {
 	chanTimeTick *timetickSync
 
 	idAllocator  allocator.Interface
-	tsoAllocator tso.Allocator
+	tsoAllocator tso2.Allocator
 
-	dataCoord  types.DataCoord
-	queryCoord types.QueryCoord
-	indexCoord types.IndexCoord
+	dataCoord  types.DataCoordClient
+	queryCoord types.QueryCoordClient
 
 	quotaCenter *QuotaCenter
 
@@ -132,7 +128,7 @@ type Core struct {
 	importManager *importManager
 
 	enableActiveStandBy bool
-	activateFunc        func()
+	activateFunc        func() error
 }
 
 // --------------------- function --------------------------
@@ -145,23 +141,11 @@ func NewCore(c context.Context, factory dependency.Factory) (*Core, error) {
 		ctx:                 ctx,
 		cancel:              cancel,
 		factory:             factory,
-		enableActiveStandBy: Params.RootCoordCfg.EnableActiveStandby,
+		enableActiveStandBy: Params.RootCoordCfg.EnableActiveStandby.GetAsBool(),
 	}
 
 	core.UpdateStateCode(commonpb.StateCode_Abnormal)
-	core.proxyCreator = func(se *sessionutil.Session) (types.Proxy, error) {
-		cli, err := pnc.NewClient(c, se.Address)
-		if err != nil {
-			return nil, err
-		}
-		if err := cli.Init(); err != nil {
-			return nil, err
-		}
-		if err := cli.Start(); err != nil {
-			return nil, err
-		}
-		return cli, nil
-	}
+	core.SetProxyCreator(DefaultProxyCreator)
 
 	return core, nil
 }
@@ -188,7 +172,7 @@ func (c *Core) sendTimeTick(t Timestamp, reason string) error {
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_TimeTick),
 			commonpbutil.WithTimeStamp(t),
-			commonpbutil.WithSourceID(c.session.ServerID),
+			commonpbutil.WithSourceID(ddlSourceID),
 		),
 		ChannelNames:     pc,
 		Timestamps:       pt,
@@ -198,6 +182,11 @@ func (c *Core) sendTimeTick(t Timestamp, reason string) error {
 }
 
 func (c *Core) sendMinDdlTsAsTt() {
+	code := c.stateCode.Load().(commonpb.StateCode)
+	if code != commonpb.StateCode_Healthy {
+		log.Warn("rootCoord is not healthy, skip send timetick")
+		return
+	}
 	minBgDdlTs := c.ddlTsLockManager.GetMinDdlTs()
 	minNormalDdlTs := c.scheduler.GetMinDdlTs()
 	minDdlTs := funcutil.Min(minBgDdlTs, minNormalDdlTs)
@@ -221,10 +210,12 @@ func (c *Core) sendMinDdlTsAsTt() {
 
 func (c *Core) startTimeTickLoop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(Params.ProxyCfg.TimeTickInterval)
+	ticker := time.NewTicker(Params.ProxyCfg.TimeTickInterval.GetAsDuration(time.Millisecond))
+	defer ticker.Stop()
 	for {
 		select {
 		case <-c.ctx.Done():
+			log.Info("rootcoord's timetick loop quit!")
 			return
 		case <-ticker.C:
 			c.sendMinDdlTsAsTt()
@@ -234,7 +225,7 @@ func (c *Core) startTimeTickLoop() {
 
 func (c *Core) tsLoop() {
 	defer c.wg.Done()
-	tsoTicker := time.NewTicker(tso.UpdateTimestampStep)
+	tsoTicker := time.NewTicker(tso2.UpdateTimestampStep)
 	defer tsoTicker.Stop()
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
@@ -242,49 +233,34 @@ func (c *Core) tsLoop() {
 		select {
 		case <-tsoTicker.C:
 			if err := c.tsoAllocator.UpdateTSO(); err != nil {
-				log.Warn("failed to update timestamp: ", zap.Error(err))
+				log.Warn("failed to update tso", zap.Error(err))
 				continue
 			}
 			ts := c.tsoAllocator.GetLastSavedTime()
 			metrics.RootCoordTimestampSaved.Set(float64(ts.Unix()))
-			if err := c.idAllocator.UpdateID(); err != nil {
-				log.Warn("failed to update id: ", zap.Error(err))
-				continue
-			}
+
 		case <-ctx.Done():
+			log.Info("rootcoord's ts loop quit!")
 			return
 		}
 	}
 }
 
-func (c *Core) SetDataCoord(ctx context.Context, s types.DataCoord) error {
-	if err := s.Init(); err != nil {
-		return err
-	}
-	if err := s.Start(); err != nil {
-		return err
+func (c *Core) SetProxyCreator(f func(ctx context.Context, addr string, nodeID int64) (types.ProxyClient, error)) {
+	c.proxyCreator = f
+}
+
+func (c *Core) SetDataCoordClient(s types.DataCoordClient) error {
+	if s == nil {
+		return errors.New("null DataCoord interface")
 	}
 	c.dataCoord = s
 	return nil
 }
 
-func (c *Core) SetIndexCoord(s types.IndexCoord) error {
-	if err := s.Init(); err != nil {
-		return err
-	}
-	if err := s.Start(); err != nil {
-		return err
-	}
-	c.indexCoord = s
-	return nil
-}
-
-func (c *Core) SetQueryCoord(s types.QueryCoord) error {
-	if err := s.Init(); err != nil {
-		return err
-	}
-	if err := s.Start(); err != nil {
-		return err
+func (c *Core) SetQueryCoordClient(s types.QueryCoordClient) error {
+	if s == nil {
+		return errors.New("null QueryCoord interface")
 	}
 	c.queryCoord = s
 	return nil
@@ -294,17 +270,18 @@ func (c *Core) SetQueryCoord(s types.QueryCoord) error {
 func (c *Core) Register() error {
 	c.session.Register()
 	if c.enableActiveStandBy {
-		c.session.ProcessActiveStandBy(c.activateFunc)
-	} else {
-		c.UpdateStateCode(commonpb.StateCode_Healthy)
-		log.Debug("RootCoord start successfully ", zap.String("State Code", commonpb.StateCode_Healthy.String()))
+		if err := c.session.ProcessActiveStandBy(c.activateFunc); err != nil {
+			return err
+		}
 	}
+	metrics.NumNodes.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), typeutil.RootCoordRole).Inc()
 	log.Info("RootCoord Register Finished")
-	go c.session.LivenessCheck(c.ctx, func() {
+	c.session.LivenessCheck(c.ctx, func() {
 		log.Error("Root Coord disconnected from etcd, process will exit", zap.Int64("Server Id", c.session.ServerID))
 		if err := c.Stop(); err != nil {
 			log.Fatal("failed to stop server", zap.Error(err))
 		}
+		metrics.NumNodes.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), typeutil.RootCoordRole).Dec()
 		// manually send signal to starter goroutine
 		if c.session.TriggerKill {
 			if p, err := os.FindProcess(os.Getpid()); err == nil {
@@ -313,8 +290,11 @@ func (c *Core) Register() error {
 		}
 	})
 
-	c.UpdateStateCode(commonpb.StateCode_Healthy)
 	return nil
+}
+
+func (c *Core) SetAddress(address string) {
+	c.address = address
 }
 
 // SetEtcdClient sets the etcdCli of Core
@@ -322,20 +302,32 @@ func (c *Core) SetEtcdClient(etcdClient *clientv3.Client) {
 	c.etcdCli = etcdClient
 }
 
+// SetTiKVClient sets the tikvCli of Core
+func (c *Core) SetTiKVClient(client *txnkv.Client) {
+	c.tikvCli = client
+}
+
 func (c *Core) initSession() error {
-	c.session = sessionutil.NewSession(c.ctx, Params.EtcdCfg.MetaRootPath, c.etcdCli)
+	c.session = sessionutil.NewSession(c.ctx, Params.EtcdCfg.MetaRootPath.GetValue(), c.etcdCli)
 	if c.session == nil {
 		return fmt.Errorf("session is nil, the etcd client connection may have failed")
 	}
-	c.session.Init(typeutil.RootCoordRole, Params.RootCoordCfg.Address, true, true)
+	c.session.Init(typeutil.RootCoordRole, c.address, true, true)
 	c.session.SetEnableActiveStandBy(c.enableActiveStandBy)
-	Params.SetLogger(c.session.ServerID)
 	return nil
 }
 
 func (c *Core) initKVCreator() {
 	if c.metaKVCreator == nil {
-		c.metaKVCreator = defaultMetaKVCreator(c.etcdCli)
+		if Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+			c.metaKVCreator = func() (kv.MetaKv, error) {
+				return tikv.NewTiKV(c.tikvCli, Params.TiKVCfg.MetaRootPath.GetValue()), nil
+			}
+		} else {
+			c.metaKVCreator = func() (kv.MetaKv, error) {
+				return etcdkv.NewEtcdKV(c.etcdCli, Params.EtcdCfg.MetaRootPath.GetValue()), nil
+			}
+		}
 	}
 }
 
@@ -344,34 +336,40 @@ func (c *Core) initMetaTable() error {
 		var catalog metastore.RootCoordCatalog
 		var err error
 
-		switch Params.MetaStoreCfg.MetaStoreType {
+		switch Params.MetaStoreCfg.MetaStoreType.GetValue() {
 		case util.MetaStoreTypeEtcd:
+			log.Info("Using etcd as meta storage.")
 			var metaKV kv.MetaKv
 			var ss *kvmetestore.SuffixSnapshot
 			var err error
 
-			if metaKV, err = c.metaKVCreator(Params.EtcdCfg.MetaRootPath); err != nil {
+			if metaKV, err = c.metaKVCreator(); err != nil {
 				return err
 			}
 
-			if ss, err = kvmetestore.NewSuffixSnapshot(metaKV, kvmetestore.SnapshotsSep, Params.EtcdCfg.MetaRootPath, kvmetestore.SnapshotPrefix); err != nil {
+			if ss, err = kvmetestore.NewSuffixSnapshot(metaKV, kvmetestore.SnapshotsSep, Params.EtcdCfg.MetaRootPath.GetValue(), kvmetestore.SnapshotPrefix); err != nil {
 				return err
 			}
-
 			catalog = &kvmetestore.Catalog{Txn: metaKV, Snapshot: ss}
-		case util.MetaStoreTypeMysql:
-			// connect to database
-			err := dbcore.Connect(&Params.DBCfg)
-			if err != nil {
+		case util.MetaStoreTypeTiKV:
+			log.Info("Using tikv as meta storage.")
+			var metaKV kv.MetaKv
+			var ss *kvmetestore.SuffixSnapshot
+			var err error
+
+			if metaKV, err = c.metaKVCreator(); err != nil {
 				return err
 			}
 
-			catalog = rootcoord.NewTableCatalog(dbcore.NewTxImpl(), dao.NewMetaDomain())
+			if ss, err = kvmetestore.NewSuffixSnapshot(metaKV, kvmetestore.SnapshotsSep, Params.TiKVCfg.MetaRootPath.GetValue(), kvmetestore.SnapshotPrefix); err != nil {
+				return err
+			}
+			catalog = &kvmetestore.Catalog{Txn: metaKV, Snapshot: ss}
 		default:
-			return retry.Unrecoverable(fmt.Errorf("not supported meta store: %s", Params.MetaStoreCfg.MetaStoreType))
+			return retry.Unrecoverable(fmt.Errorf("not supported meta store: %s", Params.MetaStoreCfg.MetaStoreType.GetValue()))
 		}
 
-		if c.meta, err = NewMetaTable(c.ctx, catalog); err != nil {
+		if c.meta, err = NewMetaTable(c.ctx, catalog, c.tsoAllocator); err != nil {
 			return err
 		}
 
@@ -382,28 +380,55 @@ func (c *Core) initMetaTable() error {
 }
 
 func (c *Core) initIDAllocator() error {
-	tsoKV := tsoutil.NewTSOKVBase(c.etcdCli, Params.EtcdCfg.KvRootPath, globalIDAllocatorSubPath)
+	var tsoKV kv.TxnKV
+	var kvPath string
+	if Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		kvPath = Params.TiKVCfg.KvRootPath.GetValue()
+		tsoKV = tsoutil2.NewTSOTiKVBase(c.tikvCli, kvPath, globalIDAllocatorSubPath)
+	} else {
+		kvPath = Params.EtcdCfg.KvRootPath.GetValue()
+		tsoKV = tsoutil2.NewTSOKVBase(c.etcdCli, kvPath, globalIDAllocatorSubPath)
+	}
 	idAllocator := allocator.NewGlobalIDAllocator(globalIDAllocatorKey, tsoKV)
 	if err := idAllocator.Initialize(); err != nil {
 		return err
 	}
 	c.idAllocator = idAllocator
+
+	log.Info("id allocator initialized",
+		zap.String("root_path", kvPath),
+		zap.String("sub_path", globalIDAllocatorSubPath),
+		zap.String("key", globalIDAllocatorKey))
+
 	return nil
 }
 
 func (c *Core) initTSOAllocator() error {
-	tsoKV := tsoutil.NewTSOKVBase(c.etcdCli, Params.EtcdCfg.KvRootPath, globalTSOAllocatorSubPath)
-	tsoAllocator := tso.NewGlobalTSOAllocator(globalTSOAllocatorKey, tsoKV)
+	var tsoKV kv.TxnKV
+	var kvPath string
+	if Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		kvPath = Params.TiKVCfg.KvRootPath.GetValue()
+		tsoKV = tsoutil2.NewTSOTiKVBase(c.tikvCli, Params.TiKVCfg.KvRootPath.GetValue(), globalIDAllocatorSubPath)
+	} else {
+		kvPath = Params.EtcdCfg.KvRootPath.GetValue()
+		tsoKV = tsoutil2.NewTSOKVBase(c.etcdCli, Params.EtcdCfg.KvRootPath.GetValue(), globalIDAllocatorSubPath)
+	}
+	tsoAllocator := tso2.NewGlobalTSOAllocator(globalTSOAllocatorKey, tsoKV)
 	if err := tsoAllocator.Initialize(); err != nil {
 		return err
 	}
 	c.tsoAllocator = tsoAllocator
 
+	log.Info("tso allocator initialized",
+		zap.String("root_path", kvPath),
+		zap.String("sub_path", globalIDAllocatorSubPath),
+		zap.String("key", globalIDAllocatorKey))
+
 	return nil
 }
 
 func (c *Core) initImportManager() error {
-	impTaskKv, err := c.metaKVCreator(Params.EtcdCfg.KvRootPath)
+	impTaskKv, err := c.metaKVCreator()
 	if err != nil {
 		return err
 	}
@@ -414,10 +439,8 @@ func (c *Core) initImportManager() error {
 		impTaskKv,
 		f.NewIDAllocator(),
 		f.NewImportFunc(),
-		f.NewMarkSegmentsDroppedFunc(),
+		f.NewGetSegmentStatesFunc(),
 		f.NewGetCollectionNameFunc(),
-		f.NewDescribeIndexFunc(),
-		f.NewGetSegmentIndexStateFunc(),
 		f.NewUnsetIsImportingStateFunc(),
 	)
 	c.importManager.init(c.ctx)
@@ -426,15 +449,8 @@ func (c *Core) initImportManager() error {
 }
 
 func (c *Core) initInternal() error {
-	if err := c.initSession(); err != nil {
-		return err
-	}
-
+	c.UpdateStateCode(commonpb.StateCode_Initializing)
 	c.initKVCreator()
-
-	if err := c.initMetaTable(); err != nil {
-		return err
-	}
 
 	if err := c.initIDAllocator(); err != nil {
 		return err
@@ -444,13 +460,15 @@ func (c *Core) initInternal() error {
 		return err
 	}
 
+	if err := c.initMetaTable(); err != nil {
+		return err
+	}
+
 	c.scheduler = newScheduler(c.ctx, c.idAllocator, c.tsoAllocator)
 
-	c.factory.Init(&Params)
-
+	c.factory.Init(Params)
 	chanMap := c.meta.ListCollectionPhysicalChannels()
 	c.chanTimeTick = newTimeTickSync(c.ctx, c.session.ServerID, c.factory, chanMap)
-	c.chanTimeTick.addSession(c.session)
 	c.proxyClientManager = newProxyClientManager(c.proxyCreator)
 
 	c.broker = newServerBroker(c)
@@ -469,7 +487,7 @@ func (c *Core) initInternal() error {
 
 	c.metricsCacheManager = metricsinfo.NewMetricsCacheManager()
 
-	c.quotaCenter = NewQuotaCenter(c.proxyClientManager, c.queryCoord, c.dataCoord, c.tsoAllocator)
+	c.quotaCenter = NewQuotaCenter(c.proxyClientManager, c.queryCoord, c.dataCoord, c.tsoAllocator, c.meta)
 	log.Debug("RootCoord init QuotaCenter done")
 
 	if err := c.initImportManager(); err != nil {
@@ -490,9 +508,40 @@ func (c *Core) initInternal() error {
 // Init initialize routine
 func (c *Core) Init() error {
 	var initError error
-	c.initOnce.Do(func() {
-		initError = c.initInternal()
-	})
+	c.factory.Init(Params)
+	if err := c.initSession(); err != nil {
+		return err
+	}
+
+	if c.enableActiveStandBy {
+		c.activateFunc = func() error {
+			log.Info("RootCoord switch from standby to active, activating")
+
+			var err error
+			c.initOnce.Do(func() {
+				if err = c.initInternal(); err != nil {
+					log.Error("RootCoord init failed", zap.Error(err))
+				}
+			})
+			if err != nil {
+				return err
+			}
+			c.startOnce.Do(func() {
+				if err = c.startInternal(); err != nil {
+					log.Error("RootCoord start failed", zap.Error(err))
+				}
+			})
+			log.Info("RootCoord startup success", zap.String("address", c.session.Address))
+			return err
+		}
+		c.UpdateStateCode(commonpb.StateCode_StandBy)
+		log.Info("RootCoord enter standby mode successfully")
+	} else {
+		c.initOnce.Do(func() {
+			initError = c.initInternal()
+		})
+	}
+
 	return initError
 }
 
@@ -507,15 +556,13 @@ func (c *Core) initCredentials() error {
 	return nil
 }
 
-func (c *Core) initRbac() (initError error) {
+func (c *Core) initRbac() error {
+	var err error
 	// create default roles, including admin, public
 	for _, role := range util.DefaultRoles {
-		if initError = c.meta.CreateRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: role}); initError != nil {
-			if common.IsIgnorableError(initError) {
-				initError = nil
-				continue
-			}
-			return
+		err = c.meta.CreateRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: role})
+		if err != nil && !common.IsIgnorableError(err) {
+			return errors.Wrap(err, "failed to create role")
 		}
 	}
 
@@ -529,78 +576,72 @@ func (c *Core) initRbac() (initError error) {
 	}
 
 	for _, globalPrivilege := range globalPrivileges {
-		if initError = c.meta.OperatePrivilege(util.DefaultTenant, &milvuspb.GrantEntity{
+		err = c.meta.OperatePrivilege(util.DefaultTenant, &milvuspb.GrantEntity{
 			Role:       &milvuspb.RoleEntity{Name: util.RolePublic},
 			Object:     &milvuspb.ObjectEntity{Name: commonpb.ObjectType_Global.String()},
 			ObjectName: util.AnyWord,
+			DbName:     util.AnyWord,
 			Grantor: &milvuspb.GrantorEntity{
 				User:      &milvuspb.UserEntity{Name: util.UserRoot},
 				Privilege: &milvuspb.PrivilegeEntity{Name: globalPrivilege},
 			},
-		}, milvuspb.OperatePrivilegeType_Grant); initError != nil {
-			if common.IsIgnorableError(initError) {
-				initError = nil
-				continue
-			}
-			return
+		}, milvuspb.OperatePrivilegeType_Grant)
+		if err != nil && !common.IsIgnorableError(err) {
+			return errors.Wrap(err, "failed to grant global privilege")
 		}
 	}
 	for _, collectionPrivilege := range collectionPrivileges {
-		if initError = c.meta.OperatePrivilege(util.DefaultTenant, &milvuspb.GrantEntity{
+		err = c.meta.OperatePrivilege(util.DefaultTenant, &milvuspb.GrantEntity{
 			Role:       &milvuspb.RoleEntity{Name: util.RolePublic},
 			Object:     &milvuspb.ObjectEntity{Name: commonpb.ObjectType_Collection.String()},
 			ObjectName: util.AnyWord,
+			DbName:     util.AnyWord,
 			Grantor: &milvuspb.GrantorEntity{
 				User:      &milvuspb.UserEntity{Name: util.UserRoot},
 				Privilege: &milvuspb.PrivilegeEntity{Name: collectionPrivilege},
 			},
-		}, milvuspb.OperatePrivilegeType_Grant); initError != nil {
-			if common.IsIgnorableError(initError) {
-				initError = nil
-				continue
-			}
-			return
+		}, milvuspb.OperatePrivilegeType_Grant)
+		if err != nil && !common.IsIgnorableError(err) {
+			return errors.Wrap(err, "failed to grant collection privilege")
 		}
 	}
 	return nil
 }
 
 func (c *Core) restore(ctx context.Context) error {
-	colls, err := c.meta.ListAbnormalCollections(ctx, typeutil.MaxTimestamp)
+	dbs, err := c.meta.ListDatabases(ctx, typeutil.MaxTimestamp)
 	if err != nil {
 		return err
 	}
 
-	for _, coll := range colls {
-		ts, err := c.tsoAllocator.GenerateTSO(1)
+	for _, db := range dbs {
+		colls, err := c.meta.ListCollections(ctx, db.Name, typeutil.MaxTimestamp, false)
 		if err != nil {
 			return err
 		}
-
-		switch coll.State {
-		case pb.CollectionState_CollectionDropping:
-			go c.garbageCollector.ReDropCollection(coll.Clone(), ts)
-		case pb.CollectionState_CollectionCreating:
-			go c.garbageCollector.RemoveCreatingCollection(coll.Clone())
-		default:
-		}
-	}
-
-	colls, err = c.meta.ListCollections(ctx, typeutil.MaxTimestamp)
-	if err != nil {
-		return err
-	}
-	for _, coll := range colls {
-		for _, part := range coll.Partitions {
+		for _, coll := range colls {
 			ts, err := c.tsoAllocator.GenerateTSO(1)
 			if err != nil {
 				return err
 			}
-
-			switch part.State {
-			case pb.PartitionState_PartitionDropping:
-				go c.garbageCollector.ReDropPartition(coll.PhysicalChannelNames, part.Clone(), ts)
-			default:
+			if coll.Available() {
+				for _, part := range coll.Partitions {
+					switch part.State {
+					case pb.PartitionState_PartitionDropping:
+						go c.garbageCollector.ReDropPartition(coll.DBID, coll.PhysicalChannelNames, part.Clone(), ts)
+					case pb.PartitionState_PartitionCreating:
+						go c.garbageCollector.RemoveCreatingPartition(coll.DBID, part.Clone(), ts)
+					default:
+					}
+				}
+			} else {
+				switch coll.State {
+				case pb.CollectionState_CollectionDropping:
+					go c.garbageCollector.ReDropCollection(coll.Clone(), ts)
+				case pb.CollectionState_CollectionCreating:
+					go c.garbageCollector.RemoveCreatingCollection(coll.Clone())
+				default:
+				}
 			}
 		}
 	}
@@ -618,6 +659,35 @@ func (c *Core) startInternal() error {
 		panic(err)
 	}
 
+	if Params.QuotaConfig.QuotaAndLimitsEnabled.GetAsBool() {
+		go c.quotaCenter.run()
+	}
+
+	c.scheduler.Start()
+	c.stepExecutor.Start()
+	go func() {
+		// refresh rbac cache
+		if err := retry.Do(c.ctx, func() error {
+			if err := c.proxyClientManager.RefreshPolicyInfoCache(c.ctx, &proxypb.RefreshPolicyInfoCacheRequest{
+				OpType: int32(typeutil.CacheRefresh),
+			}); err != nil {
+				log.Info("fail to refresh policy info cache", zap.Error(err))
+				return err
+			}
+			return nil
+		}, retry.Attempts(100), retry.Sleep(time.Second)); err != nil {
+			log.Warn("fail to refresh policy info cache", zap.Error(err))
+		}
+	}()
+
+	c.startServerLoop()
+	c.UpdateStateCode(commonpb.StateCode_Healthy)
+	logutil.Logger(c.ctx).Info("rootcoord startup successfully")
+
+	return nil
+}
+
+func (c *Core) startServerLoop() {
 	c.wg.Add(6)
 	go c.startTimeTickLoop()
 	go c.tsLoop()
@@ -625,36 +695,17 @@ func (c *Core) startInternal() error {
 	go c.importManager.cleanupLoop(&c.wg)
 	go c.importManager.sendOutTasksLoop(&c.wg)
 	go c.importManager.flipTaskStateLoop(&c.wg)
-	Params.RootCoordCfg.CreatedTime = time.Now()
-	Params.RootCoordCfg.UpdatedTime = time.Now()
-
-	if Params.QuotaConfig.QuotaAndLimitsEnabled {
-		go c.quotaCenter.run()
-	}
-
-	c.scheduler.Start()
-	c.stepExecutor.Start()
-
-	Params.RootCoordCfg.CreatedTime = time.Now()
-	Params.RootCoordCfg.UpdatedTime = time.Now()
-
-	if c.enableActiveStandBy {
-		c.activateFunc = func() {
-			// todo to complete
-			log.Info("rootcoord switch from standby to active, activating")
-			c.UpdateStateCode(commonpb.StateCode_Healthy)
-		}
-		c.UpdateStateCode(commonpb.StateCode_StandBy)
-	}
-	return nil
 }
 
 // Start starts RootCoord.
 func (c *Core) Start() error {
 	var err error
-	c.startOnce.Do(func() {
-		err = c.startInternal()
-	})
+	if !c.enableActiveStandBy {
+		c.startOnce.Do(func() {
+			err = c.startInternal()
+		})
+	}
+
 	return err
 }
 
@@ -682,7 +733,7 @@ func (c *Core) cancelIfNotNil() {
 func (c *Core) revokeSession() {
 	if c.session != nil {
 		// wait at most one second to revoke
-		c.session.Revoke(time.Second)
+		c.session.Stop()
 		log.Info("revoke rootcoord session")
 	}
 }
@@ -692,14 +743,20 @@ func (c *Core) Stop() error {
 	c.UpdateStateCode(commonpb.StateCode_Abnormal)
 	c.stopExecutor()
 	c.stopScheduler()
+	if c.proxyManager != nil {
+		c.proxyManager.Stop()
+	}
 	c.cancelIfNotNil()
+	if c.quotaCenter != nil {
+		c.quotaCenter.stop()
+	}
 	c.wg.Wait()
 	c.revokeSession()
 	return nil
 }
 
 // GetComponentStates get states of components
-func (c *Core) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+func (c *Core) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	code := c.stateCode.Load().(commonpb.StateCode)
 
 	nodeID := common.NotRegisteredID
@@ -715,10 +772,7 @@ func (c *Core) GetComponentStates(ctx context.Context) (*milvuspb.ComponentState
 			StateCode: code,
 			ExtraInfo: nil,
 		},
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status: merr.Status(nil),
 		SubcomponentStates: []*milvuspb.ComponentInfo{
 			{
 				NodeID:    nodeID,
@@ -731,133 +785,259 @@ func (c *Core) GetComponentStates(ctx context.Context) (*milvuspb.ComponentState
 }
 
 // GetTimeTickChannel get timetick channel name
-func (c *Core) GetTimeTickChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (c *Core) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
 	return &milvuspb.StringResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Value: Params.CommonCfg.RootCoordTimeTick,
+		Status: merr.Status(nil),
+		Value:  Params.CommonCfg.RootCoordTimeTick.GetValue(),
 	}, nil
 }
 
 // GetStatisticsChannel get statistics channel name
-func (c *Core) GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (c *Core) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
 	return &milvuspb.StringResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Value: Params.CommonCfg.RootCoordStatistics,
+		Status: merr.Status(nil),
+		Value:  Params.CommonCfg.RootCoordStatistics.GetValue(),
 	}, nil
+}
+
+func (c *Core) CreateDatabase(ctx context.Context, in *milvuspb.CreateDatabaseRequest) (*commonpb.Status, error) {
+	if code, ok := c.checkHealthy(); !ok {
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
+	}
+
+	method := "CreateDatabase"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("CreateDatabase")
+
+	log.Ctx(ctx).Info("received request to create database", zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+
+	t := &createDatabaseTask{
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
+	}
+
+	if err := c.scheduler.AddTask(t); err != nil {
+		log.Ctx(ctx).Info("failed to enqueue request to create database",
+			zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err),
+			zap.String("dbName", in.GetDbName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+	}
+
+	if err := t.WaitToFinish(); err != nil {
+		log.Ctx(ctx).Info("failed to create database",
+			zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err),
+			zap.String("dbName", in.GetDbName()),
+			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordNumOfDatabases.Inc()
+	log.Ctx(ctx).Info("done to create database", zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+	return succStatus(), nil
+}
+
+func (c *Core) DropDatabase(ctx context.Context, in *milvuspb.DropDatabaseRequest) (*commonpb.Status, error) {
+	if code, ok := c.checkHealthy(); !ok {
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
+	}
+
+	method := "DropDatabase"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("DropDatabase")
+
+	log.Ctx(ctx).Info("received request to drop database", zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+
+	t := &dropDatabaseTask{
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
+	}
+
+	if err := c.scheduler.AddTask(t); err != nil {
+		log.Ctx(ctx).Info("failed to enqueue request to drop database", zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err),
+			zap.String("dbName", in.GetDbName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+	}
+
+	if err := t.WaitToFinish(); err != nil {
+		log.Ctx(ctx).Info("failed to drop database", zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err),
+			zap.String("dbName", in.GetDbName()),
+			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordNumOfDatabases.Dec()
+	log.Ctx(ctx).Info("done to drop database", zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()), zap.Int64("msgID", in.GetBase().GetMsgID()),
+		zap.Uint64("ts", t.GetTs()))
+	return succStatus(), nil
+}
+
+func (c *Core) ListDatabases(ctx context.Context, in *milvuspb.ListDatabasesRequest) (*milvuspb.ListDatabasesResponse, error) {
+	if code, ok := c.checkHealthy(); !ok {
+		ret := &milvuspb.ListDatabasesResponse{Status: merr.Status(merr.WrapErrServiceNotReady(code.String()))}
+		return ret, nil
+	}
+	method := "ListDatabases"
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("ListDatabases")
+
+	log := log.Ctx(ctx).With(zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Info("received request to list databases")
+
+	t := &listDatabaseTask{
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
+		Resp:     &milvuspb.ListDatabasesResponse{},
+	}
+
+	if err := c.scheduler.AddTask(t); err != nil {
+		log.Info("failed to enqueue request to list databases", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return &milvuspb.ListDatabasesResponse{
+			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "ListDatabases failed: "+err.Error()),
+		}, nil
+	}
+
+	if err := t.WaitToFinish(); err != nil {
+		log.Info("failed to list databases", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		return &milvuspb.ListDatabasesResponse{
+			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "ListDatabases failed: "+err.Error()),
+		}, nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	log.Info("done to list databases", zap.Int("num of databases", len(t.Resp.GetDbNames())))
+	return t.Resp, nil
 }
 
 // CreateCollection create collection
 func (c *Core) CreateCollection(ctx context.Context, in *milvuspb.CreateCollectionRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("CreateCollection", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("CreateCollection")
 
-	log.Ctx(ctx).Info("received request to create collection", zap.String("role", typeutil.RootCoordRole),
-		zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to create collection",
+		zap.String("dbName", in.GetDbName()),
+		zap.String("name", in.GetCollectionName()),
+		zap.String("role", typeutil.RootCoordRole))
 
 	t := &createCollectionTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Ctx(ctx).Error("failed to enqueue request to create collection", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to create collection",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("name", in.GetCollectionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("CreateCollection", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Ctx(ctx).Error("failed to create collection", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to create collection",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
 			zap.String("name", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("CreateCollection", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("CreateCollection", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("CreateCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfCollections.Inc()
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("CreateCollection").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Ctx(ctx).Info("done to create collection", zap.String("role", typeutil.RootCoordRole),
+	log.Ctx(ctx).Info("done to create collection",
+		zap.String("role", typeutil.RootCoordRole),
 		zap.String("name", in.GetCollectionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
 }
 
 // DropCollection drop collection
 func (c *Core) DropCollection(ctx context.Context, in *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollection", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("DropCollection")
 
-	log.Ctx(ctx).Info("received request to drop collection", zap.String("role", typeutil.RootCoordRole),
-		zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to drop collection",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("name", in.GetCollectionName()))
 
 	t := &dropCollectionTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Ctx(ctx).Error("failed to enqueue request to drop collection", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to drop collection", zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("name", in.GetCollectionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollection", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Ctx(ctx).Error("failed to drop collection", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to drop collection", zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
 			zap.String("name", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollection", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropCollection", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("DropCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfCollections.Dec()
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("DropCollection").Observe(float64(t.queueDur.Milliseconds()))
 
 	log.Ctx(ctx).Info("done to drop collection", zap.String("role", typeutil.RootCoordRole),
-		zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()),
+		zap.String("name", in.GetCollectionName()),
 		zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // HasCollection check collection existence
 func (c *Core) HasCollection(ctx context.Context, in *milvuspb.HasCollectionRequest) (*milvuspb.BoolResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.BoolResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
-			Value:  false,
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
@@ -865,7 +1045,8 @@ func (c *Core) HasCollection(ctx context.Context, in *milvuspb.HasCollectionRequ
 	tr := timerecord.NewTimeRecorder("HasCollection")
 
 	ts := getTravelTs(in)
-	log := log.Ctx(ctx).With(zap.String("collection name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", ts))
+	log := log.Ctx(ctx).With(zap.String("collectionName", in.GetCollectionName()),
+		zap.Uint64("ts", ts))
 
 	log.Info("received request to has collection")
 
@@ -876,47 +1057,47 @@ func (c *Core) HasCollection(ctx context.Context, in *milvuspb.HasCollectionRequ
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to has collection", zap.Error(err))
+		log.Info("failed to enqueue request to has collection", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("HasCollection", metrics.FailLabel).Inc()
 		return &milvuspb.BoolResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "HasCollection failed: "+err.Error()),
-			Value:  false,
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to has collection", zap.Error(err))
+		log.Info("failed to has collection", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("HasCollection", metrics.FailLabel).Inc()
 		return &milvuspb.BoolResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "HasCollection failed: "+err.Error()),
-			Value:  false,
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("HasCollection", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("HasCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("HasCollection").Observe(float64(t.queueDur.Milliseconds()))
 
 	log.Info("done to has collection", zap.Bool("exist", t.Rsp.GetValue()))
 
 	return t.Rsp, nil
 }
 
-func (c *Core) describeCollection(ctx context.Context, in *milvuspb.DescribeCollectionRequest) (*model.Collection, error) {
+func (c *Core) describeCollection(ctx context.Context, in *milvuspb.DescribeCollectionRequest, allowUnavailable bool) (*model.Collection, error) {
 	ts := getTravelTs(in)
 	if in.GetCollectionName() != "" {
-		return c.meta.GetCollectionByName(ctx, in.GetCollectionName(), ts)
+		return c.meta.GetCollectionByName(ctx, in.GetDbName(), in.GetCollectionName(), ts)
 	}
-	return c.meta.GetCollectionByID(ctx, in.GetCollectionID(), ts)
+	return c.meta.GetCollectionByID(ctx, in.GetDbName(), in.GetCollectionID(), ts, allowUnavailable)
 }
 
 func convertModelToDesc(collInfo *model.Collection, aliases []string) *milvuspb.DescribeCollectionResponse {
-	resp := &milvuspb.DescribeCollectionResponse{Status: succStatus()}
+	resp := &milvuspb.DescribeCollectionResponse{Status: merr.Status(nil)}
 
 	resp.Schema = &schemapb.CollectionSchema{
-		Name:        collInfo.Name,
-		Description: collInfo.Description,
-		AutoID:      collInfo.AutoID,
-		Fields:      model.MarshalFieldModels(collInfo.Fields),
+		Name:               collInfo.Name,
+		Description:        collInfo.Description,
+		AutoID:             collInfo.AutoID,
+		Fields:             model.MarshalFieldModels(collInfo.Fields),
+		EnableDynamicField: collInfo.EnableDynamicField,
 	}
 	resp.CollectionID = collInfo.CollectionID
 	resp.VirtualChannelNames = collInfo.VirtualChannelNames
@@ -934,14 +1115,14 @@ func convertModelToDesc(collInfo *model.Collection, aliases []string) *milvuspb.
 	resp.StartPositions = collInfo.StartPositions
 	resp.CollectionName = resp.Schema.Name
 	resp.Properties = collInfo.Properties
+	resp.NumPartitions = int64(len(collInfo.Partitions))
 	return resp
 }
 
-// DescribeCollection return collection info
-func (c *Core) DescribeCollection(ctx context.Context, in *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+func (c *Core) describeCollectionImpl(ctx context.Context, in *milvuspb.DescribeCollectionRequest, allowUnavailable bool) (*milvuspb.DescribeCollectionResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.DescribeCollectionResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode"+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
@@ -949,49 +1130,68 @@ func (c *Core) DescribeCollection(ctx context.Context, in *milvuspb.DescribeColl
 	tr := timerecord.NewTimeRecorder("DescribeCollection")
 
 	ts := getTravelTs(in)
-	log := log.Ctx(ctx).With(zap.String("collection name", in.GetCollectionName()), zap.Int64("id", in.GetCollectionID()), zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", ts))
+	log := log.Ctx(ctx).With(zap.String("collectionName", in.GetCollectionName()),
+		zap.String("dbName", in.GetDbName()),
+		zap.Int64("id", in.GetCollectionID()),
+		zap.Uint64("ts", ts),
+		zap.Bool("allowUnavailable", allowUnavailable))
 
 	// TODO(longjiquan): log may be very frequent here.
 
 	log.Info("received request to describe collection")
 
 	t := &describeCollectionTask{
-		baseTask: newBaseTask(ctx, c),
-		Req:      in,
-		Rsp:      &milvuspb.DescribeCollectionResponse{},
+		baseTask:         newBaseTask(ctx, c),
+		Req:              in,
+		Rsp:              &milvuspb.DescribeCollectionResponse{Status: merr.Status(nil)},
+		allowUnavailable: allowUnavailable,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to describe collection", zap.Error(err))
+		log.Info("failed to enqueue request to describe collection", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DescribeCollection", metrics.FailLabel).Inc()
 		return &milvuspb.DescribeCollectionResponse{
-			// TODO: use commonpb.ErrorCode_CollectionNotExists. SDK use commonpb.ErrorCode_UnexpectedError now.
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()),
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to describe collection", zap.Error(err))
+		log.Warn("failed to describe collection", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DescribeCollection", metrics.FailLabel).Inc()
 		return &milvuspb.DescribeCollectionResponse{
-			// TODO: use commonpb.ErrorCode_CollectionNotExists. SDK use commonpb.ErrorCode_UnexpectedError now.
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()),
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DescribeCollection", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("DescribeCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("DescribeCollection").Observe(float64(t.queueDur.Milliseconds()))
 
 	log.Info("done to describe collection", zap.Int64("collection_id", t.Rsp.GetCollectionID()))
 
 	return t.Rsp, nil
 }
 
+// DescribeCollection return collection info
+func (c *Core) DescribeCollection(ctx context.Context, in *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+	return c.describeCollectionImpl(ctx, in, false)
+}
+
+// DescribeCollectionInternal same to DescribeCollection, but will return unavailable collections and
+// only used in internal RPC.
+// When query cluster tried to do recovery, it'll be healthy until all collections' targets were recovered,
+// so during this time, releasing request generated by rootcoord's recovery won't succeed. So in theory, rootcoord goes
+// to be healthy, querycoord recovers all collections' targets, and then querycoord serves the releasing request sent
+// by rootcoord, eventually, the dropping collections will be released.
+func (c *Core) DescribeCollectionInternal(ctx context.Context, in *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+	return c.describeCollectionImpl(ctx, in, true)
+}
+
 // ShowCollections list all collection names
 func (c *Core) ShowCollections(ctx context.Context, in *milvuspb.ShowCollectionsRequest) (*milvuspb.ShowCollectionsResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.ShowCollectionsResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
@@ -999,7 +1199,8 @@ func (c *Core) ShowCollections(ctx context.Context, in *milvuspb.ShowCollections
 	tr := timerecord.NewTimeRecorder("ShowCollections")
 
 	ts := getTravelTs(in)
-	log := log.Ctx(ctx).With(zap.String("dbname", in.GetDbName()), zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", ts))
+	log := log.Ctx(ctx).With(zap.String("dbname", in.GetDbName()),
+		zap.Uint64("ts", ts))
 
 	log.Info("received request to show collections")
 
@@ -1010,23 +1211,24 @@ func (c *Core) ShowCollections(ctx context.Context, in *milvuspb.ShowCollections
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to show collections", zap.Error(err))
+		log.Info("failed to enqueue request to show collections", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("ShowCollections", metrics.FailLabel).Inc()
 		return &milvuspb.ShowCollectionsResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "ShowCollections failed: "+err.Error()),
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to show collections", zap.Error(err))
+		log.Info("failed to show collections", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("ShowCollections", metrics.FailLabel).Inc()
 		return &milvuspb.ShowCollectionsResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "ShowCollections failed: "+err.Error()),
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("ShowCollections", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("ShowCollections").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("ShowCollections").Observe(float64(t.queueDur.Milliseconds()))
 
 	log.Info("done to show collections", zap.Int("num of collections", len(t.Rsp.GetCollectionNames()))) // maybe very large, print number instead.
 
@@ -1035,160 +1237,166 @@ func (c *Core) ShowCollections(ctx context.Context, in *milvuspb.ShowCollections
 
 func (c *Core) AlterCollection(ctx context.Context, in *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollection", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("AlterCollection")
 
-	log.Info("received request to alter collection", zap.String("role", typeutil.RootCoordRole),
-		zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to alter collection",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("name", in.GetCollectionName()))
 
 	t := &alterCollectionTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to alter collection", zap.String("role", typeutil.RootCoordRole),
+		log.Warn("failed to enqueue request to alter collection",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("name", in.GetCollectionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollection", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to alter collection", zap.String("role", typeutil.RootCoordRole),
+		log.Warn("failed to alter collection",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
 			zap.String("name", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollection", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollection", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfCollections.Dec()
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("AlterCollection").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Info("done to alter collection", zap.String("role", typeutil.RootCoordRole),
-		zap.String("name", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()),
+	log.Info("done to alter collection",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("name", in.GetCollectionName()),
 		zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // CreatePartition create partition
 func (c *Core) CreatePartition(ctx context.Context, in *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("CreatePartition", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("CreatePartition")
 
-	log.Ctx(ctx).Info("received request to create partition", zap.String("role", typeutil.RootCoordRole),
-		zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to create partition",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("collection", in.GetCollectionName()),
+		zap.String("partition", in.GetPartitionName()))
 
 	t := &createPartitionTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Ctx(ctx).Error("failed to enqueue request to create partition", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to create partition",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("collection", in.GetCollectionName()),
+			zap.String("partition", in.GetPartitionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("CreatePartition", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Ctx(ctx).Error("failed to create partition", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to create partition",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.String("collection", in.GetCollectionName()),
+			zap.String("partition", in.GetPartitionName()),
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("CreatePartition", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("CreatePartition", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("CreatePartition").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("CreatePartition").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Ctx(ctx).Info("done to create partition", zap.String("role", typeutil.RootCoordRole),
-		zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+	log.Ctx(ctx).Info("done to create partition",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("collection", in.GetCollectionName()),
+		zap.String("partition", in.GetPartitionName()),
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
 }
 
 // DropPartition drop partition
 func (c *Core) DropPartition(ctx context.Context, in *milvuspb.DropPartitionRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropPartition", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("DropPartition")
 
-	log.Ctx(ctx).Info("received request to drop partition", zap.String("role", typeutil.RootCoordRole),
-		zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to drop partition",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("collection", in.GetCollectionName()),
+		zap.String("partition", in.GetPartitionName()))
 
 	t := &dropPartitionTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Ctx(ctx).Error("failed to enqueue request to drop partition", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to drop partition",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("collection", in.GetCollectionName()),
+			zap.String("partition", in.GetPartitionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DropPartition", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 	if err := t.WaitToFinish(); err != nil {
-		log.Ctx(ctx).Error("failed to drop partition", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to drop partition",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.String("collection", in.GetCollectionName()),
+			zap.String("partition", in.GetPartitionName()),
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DropPartition", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropPartition", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("DropPartition").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("DropPartition").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Ctx(ctx).Info("done to drop partition", zap.String("role", typeutil.RootCoordRole),
-		zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+	log.Ctx(ctx).Info("done to drop partition",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("collection", in.GetCollectionName()),
+		zap.String("partition", in.GetPartitionName()),
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
 }
 
 // HasPartition check partition existence
 func (c *Core) HasPartition(ctx context.Context, in *milvuspb.HasPartitionRequest) (*milvuspb.BoolResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.BoolResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
-			Value:  false,
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
@@ -1197,7 +1405,9 @@ func (c *Core) HasPartition(ctx context.Context, in *milvuspb.HasPartitionReques
 
 	// TODO(longjiquan): why HasPartitionRequest doesn't contain Timestamp but other requests do.
 	ts := typeutil.MaxTimestamp
-	log := log.Ctx(ctx).With(zap.String("collection", in.GetCollectionName()), zap.String("partition", in.GetPartitionName()), zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", ts))
+	log := log.Ctx(ctx).With(zap.String("collection", in.GetCollectionName()),
+		zap.String("partition", in.GetPartitionName()),
+		zap.Uint64("ts", ts))
 
 	log.Info("received request to has partition")
 
@@ -1208,99 +1418,113 @@ func (c *Core) HasPartition(ctx context.Context, in *milvuspb.HasPartitionReques
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to has partition", zap.Error(err))
+		log.Info("failed to enqueue request to has partition", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("HasPartition", metrics.FailLabel).Inc()
 		return &milvuspb.BoolResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "HasPartition failed: "+err.Error()),
-			Value:  false,
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to has partition", zap.Error(err))
+		log.Info("failed to has partition", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("HasPartition", metrics.FailLabel).Inc()
 		return &milvuspb.BoolResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "HasPartition failed: "+err.Error()),
-			Value:  false,
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("HasPartition", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("HasPartition").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("HasPartition").Observe(float64(t.queueDur.Milliseconds()))
 
 	log.Info("done to has partition", zap.Bool("exist", t.Rsp.GetValue()))
 
 	return t.Rsp, nil
 }
 
-// ShowPartitions list all partition names
-func (c *Core) ShowPartitions(ctx context.Context, in *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
+func (c *Core) showPartitionsImpl(ctx context.Context, in *milvuspb.ShowPartitionsRequest, allowUnavailable bool) (*milvuspb.ShowPartitionsResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.ShowPartitionsResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("ShowPartitions", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("ShowPartitions")
 
-	log := log.Ctx(ctx).With(zap.String("collection", in.GetCollectionName()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log := log.Ctx(ctx).With(zap.String("collection", in.GetCollectionName()),
+		zap.Int64("collection_id", in.GetCollectionID()),
+		zap.Strings("partitions", in.GetPartitionNames()),
+		zap.Bool("allowUnavailable", allowUnavailable))
 
 	log.Info("received request to show partitions")
 
 	t := &showPartitionTask{
-		baseTask: newBaseTask(ctx, c),
-		Req:      in,
-		Rsp:      &milvuspb.ShowPartitionsResponse{},
+		baseTask:         newBaseTask(ctx, c),
+		Req:              in,
+		Rsp:              &milvuspb.ShowPartitionsResponse{},
+		allowUnavailable: allowUnavailable,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to show partitions", zap.Error(err))
+		log.Info("failed to enqueue request to show partitions", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("ShowPartitions", metrics.FailLabel).Inc()
 		return &milvuspb.ShowPartitionsResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "ShowPartitions failed: "+err.Error()),
+			Status: merr.Status(err),
+			// Status: common.StatusFromError(err),
 		}, nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to show partitions", zap.Error(err))
+		log.Info("failed to show partitions", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues("ShowPartitions", metrics.FailLabel).Inc()
 		return &milvuspb.ShowPartitionsResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "ShowPartitions failed: "+err.Error()),
+			Status: merr.Status(err),
+			// Status: common.StatusFromError(err),
 		}, nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("ShowPartitions", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("ShowPartitions").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("ShowPartitions").Observe(float64(t.queueDur.Milliseconds()))
 
 	log.Info("done to show partitions", zap.Strings("partitions", t.Rsp.GetPartitionNames()))
 
 	return t.Rsp, nil
 }
 
+// ShowPartitions list all partition names
+func (c *Core) ShowPartitions(ctx context.Context, in *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
+	return c.showPartitionsImpl(ctx, in, false)
+}
+
+// ShowPartitionsInternal same to ShowPartitions, only used in internal RPC.
+func (c *Core) ShowPartitionsInternal(ctx context.Context, in *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
+	return c.showPartitionsImpl(ctx, in, true)
+}
+
 // ShowSegments list all segments
 func (c *Core) ShowSegments(ctx context.Context, in *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error) {
 	// ShowSegments Only used in GetPersistentSegmentInfo, it's already deprecated for a long time.
 	// Though we continue to keep current logic, it's not right enough since RootCoord only contains indexed segments.
-	return &milvuspb.ShowSegmentsResponse{Status: succStatus()}, nil
+	return &milvuspb.ShowSegmentsResponse{Status: merr.Status(nil)}, nil
 }
 
 // AllocTimestamp alloc timestamp
 func (c *Core) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestampRequest) (*rootcoordpb.AllocTimestampResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &rootcoordpb.AllocTimestampResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
 	ts, err := c.tsoAllocator.GenerateTSO(in.GetCount())
 	if err != nil {
 		log.Ctx(ctx).Error("failed to allocate timestamp", zap.String("role", typeutil.RootCoordRole),
-			zap.Error(err),
-			zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.Error(err))
 
 		return &rootcoordpb.AllocTimestampResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "AllocTimestamp failed: "+err.Error()),
+			Status: merr.Status(err),
 		}, nil
 	}
 
@@ -1308,7 +1532,7 @@ func (c *Core) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestam
 	ts = ts - uint64(in.GetCount()) + 1
 	metrics.RootCoordTimestamp.Set(float64(ts))
 	return &rootcoordpb.AllocTimestampResponse{
-		Status:    succStatus(),
+		Status:    merr.Status(nil),
 		Timestamp: ts,
 		Count:     in.GetCount(),
 	}, nil
@@ -1318,24 +1542,24 @@ func (c *Core) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestam
 func (c *Core) AllocID(ctx context.Context, in *rootcoordpb.AllocIDRequest) (*rootcoordpb.AllocIDResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &rootcoordpb.AllocIDResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 	start, _, err := c.idAllocator.Alloc(in.Count)
 	if err != nil {
-		log.Ctx(ctx).Error("failed to allocate id", zap.String("role", typeutil.RootCoordRole),
-			zap.Error(err),
-			zap.Int64("msgID", in.GetBase().GetMsgID()))
+		log.Ctx(ctx).Error("failed to allocate id",
+			zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err))
 
 		return &rootcoordpb.AllocIDResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "AllocID failed: "+err.Error()),
+			Status: merr.Status(err),
 			Count:  in.Count,
 		}, nil
 	}
 
 	metrics.RootCoordIDAllocCounter.Add(float64(in.Count))
 	return &rootcoordpb.AllocIDResponse{
-		Status: succStatus(),
+		Status: merr.Status(nil),
 		ID:     start,
 		Count:  in.Count,
 	}, nil
@@ -1343,53 +1567,66 @@ func (c *Core) AllocID(ctx context.Context, in *rootcoordpb.AllocIDRequest) (*ro
 
 // UpdateChannelTimeTick used to handle ChannelTimeTickMsg
 func (c *Core) UpdateChannelTimeTick(ctx context.Context, in *internalpb.ChannelTimeTickMsg) (*commonpb.Status, error) {
+	log := log.Ctx(ctx)
 	if code, ok := c.checkHealthy(); !ok {
 		log.Warn("failed to updateTimeTick because rootcoord is not healthy", zap.Any("state", code))
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 	if in.Base.MsgType != commonpb.MsgType_TimeTick {
 		log.Warn("failed to updateTimeTick because base messasge is not timetick, state", zap.Any("base message type", in.Base.MsgType))
-		msgTypeName := commonpb.MsgType_name[int32(in.Base.GetMsgType())]
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "invalid message type "+msgTypeName), nil
+		return merr.Status(merr.WrapErrParameterInvalid(commonpb.MsgType_TimeTick.String(), in.Base.MsgType.String(), "invalid message type")), nil
 	}
 	err := c.chanTimeTick.updateTimeTick(in, "gRPC")
 	if err != nil {
-		log.Warn("failed to updateTimeTick", zap.String("role", typeutil.RootCoordRole),
-			zap.Int64("msgID", in.Base.MsgID), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "UpdateTimeTick failed: "+err.Error()), nil
+		log.Warn("failed to updateTimeTick",
+			zap.String("role", typeutil.RootCoordRole),
+			zap.Error(err))
+		return merr.Status(err), nil
 	}
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // InvalidateCollectionMetaCache notifies RootCoord to release the collection cache in Proxies.
 func (c *Core) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.InvalidateCollMetaCacheRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 	err := c.proxyClientManager.InvalidateCollectionMetaCache(ctx, in)
 	if err != nil {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // ShowConfigurations returns the configurations of RootCoord matching req.Pattern
 func (c *Core) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &internalpb.ShowConfigurationsResponse{
-			Status:        failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status:        merr.Status(merr.WrapErrServiceNotReady(code.String())),
 			Configuations: nil,
 		}, nil
 	}
 
-	return getComponentConfigurations(ctx, req), nil
+	configList := make([]*commonpb.KeyValuePair, 0)
+	for key, value := range Params.GetComponentConfigurations("rootcoord", req.Pattern) {
+		configList = append(configList,
+			&commonpb.KeyValuePair{
+				Key:   key,
+				Value: value,
+			})
+	}
+
+	return &internalpb.ShowConfigurationsResponse{
+		Status:        merr.Status(nil),
+		Configuations: configList,
+	}, nil
 }
 
 // GetMetrics get metrics
 func (c *Core) GetMetrics(ctx context.Context, in *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.GetMetricsResponse{
-			Status:   failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status:   merr.Status(merr.WrapErrServiceNotReady(code.String())),
 			Response: "",
 		}, nil
 	}
@@ -1397,44 +1634,39 @@ func (c *Core) GetMetrics(ctx context.Context, in *milvuspb.GetMetricsRequest) (
 	metricType, err := metricsinfo.ParseMetricType(in.Request)
 	if err != nil {
 		log.Warn("ParseMetricType failed", zap.String("role", typeutil.RootCoordRole),
-			zap.Int64("node_id", c.session.ServerID), zap.String("req", in.Request), zap.Error(err))
+			zap.Int64("nodeID", c.session.ServerID), zap.String("req", in.Request), zap.Error(err))
 		return &milvuspb.GetMetricsResponse{
-			Status:   failStatus(commonpb.ErrorCode_UnexpectedError, "ParseMetricType failed: "+err.Error()),
+			Status:   merr.Status(err),
 			Response: "",
 		}, nil
 	}
 
-	log.Debug("GetMetrics success", zap.String("role", typeutil.RootCoordRole),
-		zap.String("metric_type", metricType), zap.Int64("msgID", in.GetBase().GetMsgID()))
-
 	if metricType == metricsinfo.SystemInfoMetrics {
-		ret, err := c.metricsCacheManager.GetSystemInfoMetrics()
-		if err == nil && ret != nil {
-			return ret, nil
+		metrics, err := c.metricsCacheManager.GetSystemInfoMetrics()
+		if err != nil {
+			metrics, err = c.getSystemInfoMetrics(ctx, in)
 		}
 
-		log.Warn("GetSystemInfoMetrics from cache failed", zap.String("role", typeutil.RootCoordRole),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Error(err))
-
-		systemInfoMetrics, err := c.getSystemInfoMetrics(ctx, in)
 		if err != nil {
-			log.Warn("GetSystemInfoMetrics failed", zap.String("role", typeutil.RootCoordRole),
-				zap.String("metric_type", metricType), zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Error(err))
+			log.Warn("GetSystemInfoMetrics failed",
+				zap.String("role", typeutil.RootCoordRole),
+				zap.String("metricType", metricType),
+				zap.Error(err))
 			return &milvuspb.GetMetricsResponse{
-				Status:   failStatus(commonpb.ErrorCode_UnexpectedError, fmt.Sprintf("getSystemInfoMetrics failed: %s", err.Error())),
+				Status:   merr.Status(err),
 				Response: "",
 			}, nil
 		}
 
-		c.metricsCacheManager.UpdateSystemInfoMetrics(systemInfoMetrics)
-		return systemInfoMetrics, err
+		c.metricsCacheManager.UpdateSystemInfoMetrics(metrics)
+		return metrics, err
 	}
 
-	log.Warn("GetMetrics failed, metric type not implemented", zap.String("role", typeutil.RootCoordRole),
-		zap.String("metric_type", metricType), zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.RatedWarn(60, "GetMetrics failed, metric type not implemented", zap.String("role", typeutil.RootCoordRole),
+		zap.String("metricType", metricType))
 
 	return &milvuspb.GetMetricsResponse{
-		Status:   failStatus(commonpb.ErrorCode_UnexpectedError, metricsinfo.MsgUnimplementedMetric),
+		Status:   merr.Status(merr.WrapErrMetricNotFound(metricType)),
 		Response: "",
 	}, nil
 }
@@ -1442,189 +1674,239 @@ func (c *Core) GetMetrics(ctx context.Context, in *milvuspb.GetMetricsRequest) (
 // CreateAlias create collection alias
 func (c *Core) CreateAlias(ctx context.Context, in *milvuspb.CreateAliasRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("CreateAlias", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("CreateAlias")
 
-	log.Info("received request to create alias", zap.String("role", typeutil.RootCoordRole),
-		zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to create alias",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("alias", in.GetAlias()),
+		zap.String("collection", in.GetCollectionName()))
 
 	t := &createAliasTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to create alias", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to create alias",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("alias", in.GetAlias()),
+			zap.String("collection", in.GetCollectionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("CreateAlias", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to create alias", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to create alias",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.String("alias", in.GetAlias()),
+			zap.String("collection", in.GetCollectionName()),
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("CreateAlias", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("CreateAlias", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("CreateAlias").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("CreateAlias").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Info("done to create alias", zap.String("role", typeutil.RootCoordRole),
-		zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+	log.Ctx(ctx).Info("done to create alias",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("alias", in.GetAlias()),
+		zap.String("collection", in.GetCollectionName()),
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
 }
 
 // DropAlias drop collection alias
 func (c *Core) DropAlias(ctx context.Context, in *milvuspb.DropAliasRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropAlias", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("DropAlias")
 
-	log.Info("received request to drop alias", zap.String("role", typeutil.RootCoordRole),
-		zap.String("alias", in.GetAlias()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to drop alias",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("alias", in.GetAlias()))
 
 	t := &dropAliasTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to drop alias", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to drop alias",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("alias", in.GetAlias()), zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("alias", in.GetAlias()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DropAlias", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to drop alias", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to drop alias",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
 			zap.String("alias", in.GetAlias()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("DropAlias", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropAlias", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("DropAlias").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("DropAlias").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Info("done to drop alias", zap.String("role", typeutil.RootCoordRole),
+	log.Ctx(ctx).Info("done to drop alias",
+		zap.String("role", typeutil.RootCoordRole),
 		zap.String("alias", in.GetAlias()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
 }
 
 // AlterAlias alter collection alias
 func (c *Core) AlterAlias(ctx context.Context, in *milvuspb.AlterAliasRequest) (*commonpb.Status, error) {
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("DropAlias", metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder("AlterAlias")
 
-	log.Info("received request to alter alias", zap.String("role", typeutil.RootCoordRole),
-		zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()))
+	log.Ctx(ctx).Info("received request to alter alias",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("alias", in.GetAlias()),
+		zap.String("collection", in.GetCollectionName()))
 
 	t := &alterAliasTask{
-		baseTask: baseTask{
-			ctx:  ctx,
-			core: c,
-			done: make(chan error, 1),
-		},
-		Req: in,
+		baseTask: newBaseTask(ctx, c),
+		Req:      in,
 	}
 
 	if err := c.scheduler.AddTask(t); err != nil {
-		log.Error("failed to enqueue request to alter alias", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to enqueue request to alter alias",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()))
+			zap.String("alias", in.GetAlias()),
+			zap.String("collection", in.GetCollectionName()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("AlterAlias", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	if err := t.WaitToFinish(); err != nil {
-		log.Error("failed to alter alias", zap.String("role", typeutil.RootCoordRole),
+		log.Ctx(ctx).Info("failed to alter alias",
+			zap.String("role", typeutil.RootCoordRole),
 			zap.Error(err),
-			zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-			zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
+			zap.String("alias", in.GetAlias()),
+			zap.String("collection", in.GetCollectionName()),
+			zap.Uint64("ts", t.GetTs()))
 
 		metrics.RootCoordDDLReqCounter.WithLabelValues("AlterAlias", metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UnexpectedError, err.Error()), nil
+		return merr.Status(err), nil
 	}
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterAlias", metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterAlias").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	metrics.RootCoordDDLReqLatencyInQueue.WithLabelValues("AlterAlias").Observe(float64(t.queueDur.Milliseconds()))
 
-	log.Info("done to alter alias", zap.String("role", typeutil.RootCoordRole),
-		zap.String("alias", in.GetAlias()), zap.String("collection", in.GetCollectionName()),
-		zap.Int64("msgID", in.GetBase().GetMsgID()), zap.Uint64("ts", t.GetTs()))
-	return succStatus(), nil
+	log.Info("done to alter alias",
+		zap.String("role", typeutil.RootCoordRole),
+		zap.String("alias", in.GetAlias()),
+		zap.String("collection", in.GetCollectionName()),
+		zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
 }
 
 // Import imports large files (json, numpy, etc.) on MinIO/S3 storage into Milvus storage.
 func (c *Core) Import(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.ImportResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 
 	// Get collection/partition ID from collection/partition name.
 	var colInfo *model.Collection
 	var err error
-	if colInfo, err = c.meta.GetCollectionByName(ctx, req.GetCollectionName(), typeutil.MaxTimestamp); err != nil {
+	if colInfo, err = c.meta.GetCollectionByName(ctx, req.GetDbName(), req.GetCollectionName(), typeutil.MaxTimestamp); err != nil {
 		log.Error("failed to find collection ID from its name",
-			zap.String("collection name", req.GetCollectionName()),
+			zap.String("collectionName", req.GetCollectionName()),
 			zap.Error(err))
 		return nil, err
 	}
+
+	isBackUp := importutil.IsBackup(req.GetOptions())
 	cID := colInfo.CollectionID
 	req.ChannelNames = c.meta.GetCollectionVirtualChannels(cID)
-	if req.GetPartitionName() == "" {
-		req.PartitionName = Params.CommonCfg.DefaultPartitionName
+
+	hasPartitionKey := false
+	for _, field := range colInfo.Fields {
+		if field.IsPartitionKey {
+			hasPartitionKey = true
+			break
+		}
 	}
+
+	// Get partition ID by partition name
 	var pID UniqueID
-	if pID, err = c.meta.GetPartitionByName(cID, req.GetPartitionName(), typeutil.MaxTimestamp); err != nil {
-		log.Error("failed to get partition ID from its name",
-			zap.String("partition name", req.GetPartitionName()),
-			zap.Error(err))
-		return nil, err
+	if isBackUp {
+		// Currently, Backup tool call import must with a partition name, each time restore a partition
+		if req.GetPartitionName() != "" {
+			if pID, err = c.meta.GetPartitionByName(cID, req.GetPartitionName(), typeutil.MaxTimestamp); err != nil {
+				log.Warn("failed to get partition ID from its name", zap.String("partitionName", req.GetPartitionName()), zap.Error(err))
+				return &milvuspb.ImportResponse{
+					Status: merr.Status(merr.WrapErrPartitionNotFound(req.GetPartitionName())),
+				}, nil
+			}
+		} else {
+			log.Info("partition name not specified when backup recovery",
+				zap.String("collectionName", req.GetCollectionName()))
+			return &milvuspb.ImportResponse{
+				Status: merr.Status(merr.WrapErrParameterInvalidMsg("partition not specified")),
+			}, nil
+		}
+	} else {
+		if hasPartitionKey {
+			if req.GetPartitionName() != "" {
+				msg := "not allow to set partition name for collection with partition key"
+				log.Warn(msg, zap.String("collectionName", req.GetCollectionName()))
+				return &milvuspb.ImportResponse{
+					Status: merr.Status(merr.WrapErrParameterInvalidMsg(msg)),
+				}, nil
+			}
+		} else {
+			if req.GetPartitionName() == "" {
+				req.PartitionName = Params.CommonCfg.DefaultPartitionName.GetValue()
+			}
+			if pID, err = c.meta.GetPartitionByName(cID, req.GetPartitionName(), typeutil.MaxTimestamp); err != nil {
+				log.Warn("failed to get partition ID from its name",
+					zap.String("partition name", req.GetPartitionName()),
+					zap.Error(err))
+				return &milvuspb.ImportResponse{
+					Status: merr.Status(merr.WrapErrPartitionNotFound(req.GetPartitionName())),
+				}, nil
+			}
+		}
 	}
+
 	log.Info("RootCoord receive import request",
-		zap.String("collection name", req.GetCollectionName()),
-		zap.Int64("collection ID", cID),
-		zap.String("partition name", req.GetPartitionName()),
-		zap.Strings("virtual channel names", req.GetChannelNames()),
-		zap.Int64("partition ID", pID),
+		zap.String("collectionName", req.GetCollectionName()),
+		zap.Int64("collectionID", cID),
+		zap.String("partitionName", req.GetPartitionName()),
+		zap.Strings("virtualChannelNames", req.GetChannelNames()),
+		zap.Int64("partitionID", pID),
 		zap.Int("# of files = ", len(req.GetFiles())),
 	)
 	importJobResp := c.importManager.importJob(ctx, req, cID, pID)
@@ -1635,7 +1917,7 @@ func (c *Core) Import(ctx context.Context, req *milvuspb.ImportRequest) (*milvus
 func (c *Core) GetImportState(ctx context.Context, req *milvuspb.GetImportStateRequest) (*milvuspb.GetImportStateResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.GetImportStateResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
 		}, nil
 	}
 	return c.importManager.getTaskState(req.GetTask()), nil
@@ -1645,15 +1927,40 @@ func (c *Core) GetImportState(ctx context.Context, req *milvuspb.GetImportStateR
 func (c *Core) ListImportTasks(ctx context.Context, req *milvuspb.ListImportTasksRequest) (*milvuspb.ListImportTasksResponse, error) {
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.ListImportTasksResponse{
-			Status: failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]),
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
+		}, nil
+	}
+
+	colID := int64(-1)
+	collectionName := req.GetCollectionName()
+	if len(collectionName) != 0 {
+		// if the collection name is specified but not found, user may input a wrong name, the collection doesn't exist or has been dropped.
+		// we will return error to notify user the name is incorrect.
+		colInfo, err := c.meta.GetCollectionByName(ctx, req.GetDbName(), req.GetCollectionName(), typeutil.MaxTimestamp)
+		if err != nil {
+			err = fmt.Errorf("failed to find collection ID from its name: '%s', error: %w", req.GetCollectionName(), err)
+			log.Error("ListImportTasks failed", zap.Error(err))
+			status := merr.Status(err)
+			return &milvuspb.ListImportTasksResponse{
+				Status: status,
+			}, nil
+		}
+		colID = colInfo.CollectionID
+	}
+
+	// if the collection name is not specified, the colID is -1, listAllTasks will return all tasks
+	tasks, err := c.importManager.listAllTasks(colID, req.GetLimit())
+	if err != nil {
+		err = fmt.Errorf("failed to list import tasks, collection name: '%s', error: %w", req.GetCollectionName(), err)
+		log.Error("ListImportTasks failed", zap.Error(err))
+		return &milvuspb.ListImportTasksResponse{
+			Status: merr.Status(err),
 		}, nil
 	}
 
 	resp := &milvuspb.ListImportTasksResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
-		Tasks: c.importManager.listAllTasks(req.GetCollectionName(), req.GetLimit()),
+		Status: merr.Status(nil),
+		Tasks:  tasks,
 	}
 	return resp, nil
 }
@@ -1664,29 +1971,7 @@ func (c *Core) ReportImport(ctx context.Context, ir *rootcoordpb.ImportResult) (
 		zap.Int64("task ID", ir.GetTaskId()),
 		zap.Any("import state", ir.GetState()))
 	if code, ok := c.checkHealthy(); !ok {
-		return failStatus(commonpb.ErrorCode_UnexpectedError, "StateCode="+commonpb.StateCode_name[int32(code)]), nil
-	}
-	// If setting ImportState_ImportCompleted, simply update the state and return directly.
-	if ir.GetState() == commonpb.ImportState_ImportCompleted {
-		if err := c.importManager.setImportTaskState(ir.GetTaskId(), commonpb.ImportState_ImportCompleted); err != nil {
-			errMsg := "failed to set import task as ImportState_ImportCompleted"
-			log.Error(errMsg, zap.Error(err))
-			return &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    fmt.Sprintf("%s %s", errMsg, err.Error()),
-			}, nil
-		}
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		}, nil
-	}
-	// Upon receiving ReportImport request, update the related task's state in task store.
-	ti, err := c.importManager.updateTaskInfo(ir)
-	if err != nil {
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_UpdateImportTaskFailure,
-			Reason:    err.Error(),
-		}, nil
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	// This method update a busy node to idle node, and send import task to idle node
@@ -1698,12 +1983,21 @@ func (c *Core) ReportImport(ctx context.Context, ir *rootcoordpb.ImportResult) (
 			log.Info("a DataNode is no longer busy after processing task",
 				zap.Int64("dataNode ID", ir.GetDatanodeId()),
 				zap.Int64("task ID", ir.GetTaskId()))
-
 		}()
 		err := c.importManager.sendOutTasks(c.importManager.ctx)
 		if err != nil {
 			log.Error("fail to send out import task to datanodes")
 		}
+	}
+
+	// If setting ImportState_ImportCompleted, simply update the state and return directly.
+	if ir.GetState() == commonpb.ImportState_ImportCompleted {
+		log.Warn("this should not be called!")
+	}
+	// Upon receiving ReportImport request, update the related task's state in task store.
+	ti, err := c.importManager.updateTaskInfo(ir)
+	if err != nil {
+		return merr.Status(err), nil
 	}
 
 	// If task failed, send task to idle datanode
@@ -1712,37 +2006,32 @@ func (c *Core) ReportImport(ctx context.Context, ir *rootcoordpb.ImportResult) (
 		log.Info("an import task has failed, marking DataNode available and resending import task",
 			zap.Int64("task ID", ir.GetTaskId()))
 		resendTaskFunc()
-	} else if ir.GetState() != commonpb.ImportState_ImportPersisted {
-		log.Debug("unexpected import task state reported, return immediately (this should not happen)",
-			zap.Any("task ID", ir.GetTaskId()),
-			zap.Any("import state", ir.GetState()))
+	} else if ir.GetState() == commonpb.ImportState_ImportCompleted {
+		// When a DataNode completes importing, remove this DataNode from the busy node list and send out import tasks again.
+		log.Info("an import task has completed, marking DataNode available and resending import task",
+			zap.Int64("task ID", ir.GetTaskId()))
 		resendTaskFunc()
-	} else {
+	} else if ir.GetState() == commonpb.ImportState_ImportPersisted {
 		// Here ir.GetState() == commonpb.ImportState_ImportPersisted
-		// When a DataNode finishes importing, remove this DataNode from the busy node list and send out import tasks again.
-		resendTaskFunc()
-		// Flush all import data segments.
+		// Seal these import segments, so they can be auto-flushed later.
+		log.Info("an import task turns to persisted state, flush segments to be sealed",
+			zap.Any("task ID", ir.GetTaskId()), zap.Any("segments", ir.GetSegments()))
 		if err := c.broker.Flush(ctx, ti.GetCollectionId(), ir.GetSegments()); err != nil {
 			log.Error("failed to call Flush on bulk insert segments",
 				zap.Int64("task ID", ir.GetTaskId()))
-			return &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    err.Error(),
-			}, nil
+			return merr.Status(err), nil
 		}
 	}
 
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-	}, nil
+	return merr.Status(nil), nil
 }
 
 // ExpireCredCache will call invalidate credential cache
 func (c *Core) ExpireCredCache(ctx context.Context, username string) error {
 	req := proxypb.InvalidateCredCacheRequest{
 		Base: commonpbutil.NewMsgBase(
-			commonpbutil.WithMsgType(0), //TODO, msg type
-			commonpbutil.WithMsgID(0),   //TODO, msg id
+			commonpbutil.WithMsgType(0), // TODO, msg type
+			commonpbutil.WithMsgID(0),   // TODO, msg id
 			commonpbutil.WithSourceID(c.session.ServerID),
 		),
 		Username: username,
@@ -1754,8 +2043,8 @@ func (c *Core) ExpireCredCache(ctx context.Context, username string) error {
 func (c *Core) UpdateCredCache(ctx context.Context, credInfo *internalpb.CredentialInfo) error {
 	req := proxypb.UpdateCredCacheRequest{
 		Base: commonpbutil.NewMsgBase(
-			commonpbutil.WithMsgType(0), //TODO, msg type
-			commonpbutil.WithMsgID(0),   //TODO, msg id
+			commonpbutil.WithMsgType(0), // TODO, msg type
+			commonpbutil.WithMsgID(0),   // TODO, msg id
 			commonpbutil.WithSourceID(c.session.ServerID),
 		),
 		Username: credInfo.Username,
@@ -1772,22 +2061,23 @@ func (c *Core) CreateCredential(ctx context.Context, credInfo *internalpb.Creden
 	method := "CreateCredential"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	log.Debug("CreateCredential", zap.String("role", typeutil.RootCoordRole),
-		zap.String("username", credInfo.Username))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.String("username", credInfo.Username))
+	ctxLog.Debug(method)
+	if code, ok := c.checkHealthy(); !ok {
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
+	}
 
 	// insert to db
 	err := c.meta.AddCredential(credInfo)
 	if err != nil {
-		log.Error("CreateCredential save credential failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", credInfo.Username), zap.Error(err))
+		ctxLog.Warn("CreateCredential save credential failed", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_CreateCredentialFailure, "CreateCredential failed: "+err.Error()), nil
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_CreateCredentialFailure), nil
 	}
 	// update proxy's local cache
 	err = c.UpdateCredCache(ctx, credInfo)
 	if err != nil {
-		log.Warn("CreateCredential add cache failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", credInfo.Username), zap.Error(err))
+		ctxLog.Warn("CreateCredential add cache failed", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
 	}
 	log.Debug("CreateCredential success", zap.String("role", typeutil.RootCoordRole),
@@ -1796,7 +2086,7 @@ func (c *Core) CreateCredential(ctx context.Context, credInfo *internalpb.Creden
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfCredentials.Inc()
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // GetCredential get credential by username
@@ -1804,25 +2094,26 @@ func (c *Core) GetCredential(ctx context.Context, in *rootcoordpb.GetCredentialR
 	method := "GetCredential"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	log.Debug("GetCredential", zap.String("role", typeutil.RootCoordRole),
-		zap.String("username", in.Username))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.String("username", in.Username))
+	ctxLog.Debug(method)
+	if code, ok := c.checkHealthy(); !ok {
+		return &rootcoordpb.GetCredentialResponse{Status: merr.Status(merr.WrapErrServiceNotReady(code.String()))}, nil
+	}
 
 	credInfo, err := c.meta.GetCredential(in.Username)
 	if err != nil {
-		log.Error("GetCredential query credential failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", in.Username), zap.Error(err))
+		ctxLog.Warn("GetCredential query credential failed", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
 		return &rootcoordpb.GetCredentialResponse{
-			Status: failStatus(commonpb.ErrorCode_GetCredentialFailure, "GetCredential failed: "+err.Error()),
-		}, err
+			Status: merr.StatusWithErrorCode(err, commonpb.ErrorCode_GetCredentialFailure),
+		}, nil
 	}
-	log.Debug("GetCredential success", zap.String("role", typeutil.RootCoordRole),
-		zap.String("username", in.Username))
+	ctxLog.Debug("GetCredential success")
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return &rootcoordpb.GetCredentialResponse{
-		Status:   succStatus(),
+		Status:   merr.Status(nil),
 		Username: credInfo.Username,
 		Password: credInfo.EncryptedPassword,
 	}, nil
@@ -1833,30 +2124,30 @@ func (c *Core) UpdateCredential(ctx context.Context, credInfo *internalpb.Creden
 	method := "UpdateCredential"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	log.Debug("UpdateCredential", zap.String("role", typeutil.RootCoordRole),
-		zap.String("username", credInfo.Username))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.String("username", credInfo.Username))
+	ctxLog.Debug(method)
+	if code, ok := c.checkHealthy(); !ok {
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
+	}
 	// update data on storage
 	err := c.meta.AlterCredential(credInfo)
 	if err != nil {
-		log.Error("UpdateCredential save credential failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", credInfo.Username), zap.Error(err))
+		ctxLog.Warn("UpdateCredential save credential failed", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UpdateCredentialFailure, "UpdateCredential failed: "+err.Error()), nil
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_UpdateCredentialFailure), nil
 	}
 	// update proxy's local cache
 	err = c.UpdateCredCache(ctx, credInfo)
 	if err != nil {
-		log.Error("UpdateCredential update cache failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", credInfo.Username), zap.Error(err))
+		ctxLog.Warn("UpdateCredential update cache failed", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_UpdateCredentialFailure, "UpdateCredential failed: "+err.Error()), nil
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_UpdateCredentialFailure), nil
 	}
-	log.Debug("UpdateCredential success", zap.String("role", typeutil.RootCoordRole),
-		zap.String("username", credInfo.Username))
+	log.Debug("UpdateCredential success")
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // DeleteCredential delete a user
@@ -1864,30 +2155,58 @@ func (c *Core) DeleteCredential(ctx context.Context, in *milvuspb.DeleteCredenti
 	method := "DeleteCredential"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.String("username", in.Username))
+	ctxLog.Debug(method)
+	if code, ok := c.checkHealthy(); !ok {
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
+	}
+	var status *commonpb.Status
+	defer func() {
+		if status.Code != 0 {
+			metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
+		}
+	}()
 
-	// delete data on storage
-	err := c.meta.DeleteCredential(in.Username)
+	redoTask := newBaseRedoTask(c.stepExecutor)
+	redoTask.AddSyncStep(NewSimpleStep("delete credential meta data", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.meta.DeleteCredential(in.Username)
+		if err != nil {
+			ctxLog.Warn("delete credential meta data failed", zap.Error(err))
+		}
+		return nil, err
+	}))
+	redoTask.AddAsyncStep(NewSimpleStep("delete credential cache", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.ExpireCredCache(ctx, in.Username)
+		if err != nil {
+			ctxLog.Warn("delete credential cache failed", zap.Error(err))
+		}
+		return nil, err
+	}))
+	redoTask.AddAsyncStep(NewSimpleStep("delete user role cache for the user", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
+			OpType: int32(typeutil.CacheDeleteUser),
+			OpKey:  in.Username,
+		})
+		if err != nil {
+			ctxLog.Warn("delete user role cache failed for the user", zap.Error(err))
+		}
+		return nil, err
+	}))
+
+	err := redoTask.Execute(ctx)
 	if err != nil {
-		log.Error("DeleteCredential remove credential failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", in.Username), zap.Error(err))
-		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_DeleteCredentialFailure, "DeleteCredential failed: "+err.Error()), err
+		errMsg := "fail to execute task when deleting the user"
+		ctxLog.Warn(errMsg, zap.Error(err))
+		status = merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_DeleteCredentialFailure)
+		return status, nil
 	}
-	// invalidate proxy's local cache
-	err = c.ExpireCredCache(ctx, in.Username)
-	if err != nil {
-		log.Error("DeleteCredential expire credential cache failed", zap.String("role", typeutil.RootCoordRole),
-			zap.String("username", in.Username), zap.Error(err))
-		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
-		return failStatus(commonpb.ErrorCode_DeleteCredentialFailure, "DeleteCredential failed: "+err.Error()), nil
-	}
-	log.Debug("DeleteCredential success", zap.String("role", typeutil.RootCoordRole),
-		zap.String("username", in.Username))
+	ctxLog.Debug("DeleteCredential success")
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfCredentials.Dec()
-	return succStatus(), nil
+	status = merr.Status(nil)
+	return status, nil
 }
 
 // ListCredUsers list all usernames
@@ -1895,22 +2214,26 @@ func (c *Core) ListCredUsers(ctx context.Context, in *milvuspb.ListCredUsersRequ
 	method := "ListCredUsers"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole))
+	ctxLog.Debug(method)
+	if code, ok := c.checkHealthy(); !ok {
+		return &milvuspb.ListCredUsersResponse{Status: merr.Status(merr.WrapErrServiceNotReady(code.String()))}, nil
+	}
 
 	credInfo, err := c.meta.ListCredentialUsernames()
 	if err != nil {
-		log.Error("ListCredUsers query usernames failed", zap.String("role", typeutil.RootCoordRole),
-			zap.Int64("msgID", in.Base.MsgID), zap.Error(err))
+		ctxLog.Warn("ListCredUsers query usernames failed", zap.Error(err))
 		metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.FailLabel).Inc()
-		return &milvuspb.ListCredUsersResponse{
-			Status: failStatus(commonpb.ErrorCode_ListCredUsersFailure, "ListCredUsers failed: "+err.Error()),
-		}, err
+
+		status := merr.Status(err)
+		return &milvuspb.ListCredUsersResponse{Status: status}, nil
 	}
-	log.Debug("ListCredUsers success", zap.String("role", typeutil.RootCoordRole))
+	ctxLog.Debug("ListCredUsers success")
 
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return &milvuspb.ListCredUsersResponse{
-		Status:    succStatus(),
+		Status:    merr.Status(nil),
 		Usernames: credInfo.Usernames,
 	}, nil
 }
@@ -1924,26 +2247,27 @@ func (c *Core) CreateRole(ctx context.Context, in *milvuspb.CreateRoleRequest) (
 	method := "CreateRole"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method + " begin")
 
 	if code, ok := c.checkHealthy(); !ok {
-		return errorutil.UnhealthyStatus(code), errorutil.UnhealthyError()
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 	entity := in.Entity
 
 	err := c.meta.CreateRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: entity.Name})
 	if err != nil {
 		errMsg := "fail to create role"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_CreateRoleFailure, errMsg), nil
+		ctxLog.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_CreateRoleFailure), nil
 	}
 
-	logger.Debug(method+" success", zap.String("role_name", entity.Name))
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfRoles.Inc()
 
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // DropRole drop role
@@ -1957,15 +2281,16 @@ func (c *Core) DropRole(ctx context.Context, in *milvuspb.DropRoleRequest) (*com
 	method := "DropRole"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.String("role_name", in.RoleName))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
-		return errorutil.UnhealthyStatus(code), errorutil.UnhealthyError()
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 	if _, err := c.meta.SelectRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: in.RoleName}, false); err != nil {
-		errMsg := "the role isn't existed"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_DropRoleFailure, errMsg), nil
+		errMsg := "not found the role, maybe the role isn't existed or internal system error"
+		ctxLog.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_DropRoleFailure), nil
 	}
 
 	grantEntities, err := c.meta.SelectGrant(util.DefaultTenant, &milvuspb.GrantEntity{
@@ -1973,46 +2298,39 @@ func (c *Core) DropRole(ctx context.Context, in *milvuspb.DropRoleRequest) (*com
 	})
 	if len(grantEntities) != 0 {
 		errMsg := "fail to drop the role that it has privileges. Use REVOKE API to revoke privileges"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_DropRoleFailure, errMsg), nil
+		ctxLog.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_DropRoleFailure), nil
 	}
-	roleResults, err := c.meta.SelectRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: in.RoleName}, true)
-	if err != nil {
-		errMsg := "fail to select a role by role name"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_DropRoleFailure, errMsg), nil
-	}
-	logger.Debug("role to user info", zap.Int("counter", len(roleResults)))
-	for _, roleResult := range roleResults {
-		for index, userEntity := range roleResult.Users {
-			if err = c.meta.OperateUserRole(util.DefaultTenant,
-				&milvuspb.UserEntity{Name: userEntity.Name},
-				&milvuspb.RoleEntity{Name: roleResult.Role.Name}, milvuspb.OperateUserRoleType_RemoveUserFromRole); err != nil {
-				if common.IsIgnorableError(err) {
-					continue
-				}
-				errMsg := "fail to remove user from role"
-				log.Error(errMsg, zap.Any("in", in), zap.String("role_name", roleResult.Role.Name), zap.String("username", userEntity.Name), zap.Int("current_index", index), zap.Error(err))
-				return failStatus(commonpb.ErrorCode_OperateUserRoleFailure, errMsg), nil
-			}
+	redoTask := newBaseRedoTask(c.stepExecutor)
+	redoTask.AddSyncStep(NewSimpleStep("drop role meta data", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.meta.DropRole(util.DefaultTenant, in.RoleName)
+		if err != nil {
+			ctxLog.Warn("drop role mata data failed", zap.Error(err))
 		}
-	}
-	if err = c.meta.DropGrant(util.DefaultTenant, &milvuspb.RoleEntity{Name: in.RoleName}); err != nil {
-		errMsg := "fail to drop the grant"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_DropRoleFailure, errMsg), nil
-	}
-	if err = c.meta.DropRole(util.DefaultTenant, in.RoleName); err != nil {
-		errMsg := "fail to drop the role"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_DropRoleFailure, errMsg), nil
+		return nil, err
+	}))
+	redoTask.AddAsyncStep(NewSimpleStep("drop role cache", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
+			OpType: int32(typeutil.CacheDropRole),
+			OpKey:  in.RoleName,
+		})
+		if err != nil {
+			ctxLog.Warn("delete user role cache failed for the role", zap.Error(err))
+		}
+		return nil, err
+	}))
+	err = redoTask.Execute(ctx)
+	if err != nil {
+		errMsg := "fail to execute task when dropping the role"
+		ctxLog.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_DropRoleFailure), nil
 	}
 
-	logger.Debug(method+" success", zap.String("role_name", in.RoleName))
+	ctxLog.Debug(method+" success", zap.String("role_name", in.RoleName))
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	metrics.RootCoordNumOfRoles.Dec()
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // OperateUserRole operate the relationship between a user and a role
@@ -2025,33 +2343,36 @@ func (c *Core) OperateUserRole(ctx context.Context, in *milvuspb.OperateUserRole
 	method := "OperateUserRole-" + in.Type.String()
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
-		return errorutil.UnhealthyStatus(code), errorutil.UnhealthyError()
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 
 	if _, err := c.meta.SelectRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: in.RoleName}, false); err != nil {
-		errMsg := "fail to check the role name"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_OperateUserRoleFailure, errMsg), nil
+		errMsg := "not found the role, maybe the role isn't existed or internal system error"
+		ctxLog.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_OperateUserRoleFailure), nil
 	}
-	if _, err := c.meta.SelectUser(util.DefaultTenant, &milvuspb.UserEntity{Name: in.Username}, false); err != nil {
-		errMsg := "fail to check the username"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-		return failStatus(commonpb.ErrorCode_OperateUserRoleFailure, errMsg), nil
-	}
-	updateCache := true
-	if err := c.meta.OperateUserRole(util.DefaultTenant, &milvuspb.UserEntity{Name: in.Username}, &milvuspb.RoleEntity{Name: in.RoleName}, in.Type); err != nil {
-		if !common.IsIgnorableError(err) {
-			errMsg := "fail to operate user to role"
-			log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-			return failStatus(commonpb.ErrorCode_OperateUserRoleFailure, errMsg), nil
+	if in.Type != milvuspb.OperateUserRoleType_RemoveUserFromRole {
+		if _, err := c.meta.SelectUser(util.DefaultTenant, &milvuspb.UserEntity{Name: in.Username}, false); err != nil {
+			errMsg := "not found the user, maybe the user isn't existed or internal system error"
+			ctxLog.Warn(errMsg, zap.Error(err))
+			return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_OperateUserRoleFailure), nil
 		}
-		updateCache = false
 	}
 
-	if updateCache {
+	redoTask := newBaseRedoTask(c.stepExecutor)
+	redoTask.AddSyncStep(NewSimpleStep("operate user role meta data", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.meta.OperateUserRole(util.DefaultTenant, &milvuspb.UserEntity{Name: in.Username}, &milvuspb.RoleEntity{Name: in.RoleName}, in.Type)
+		if err != nil && !common.IsIgnorableError(err) {
+			log.Warn("operate user role mata data failed", zap.Error(err))
+			return nil, err
+		}
+		return nil, nil
+	}))
+	redoTask.AddAsyncStep(NewSimpleStep("operate user role cache", func(ctx context.Context) ([]nestedStep, error) {
 		var opType int32
 		switch in.Type {
 		case milvuspb.OperateUserRoleType_AddUserToRole:
@@ -2060,23 +2381,29 @@ func (c *Core) OperateUserRole(ctx context.Context, in *milvuspb.OperateUserRole
 			opType = int32(typeutil.CacheRemoveUserFromRole)
 		default:
 			errMsg := "invalid operate type for the OperateUserRole api"
-			log.Error(errMsg, zap.Any("in", in))
-			return failStatus(commonpb.ErrorCode_OperateUserRoleFailure, errMsg), nil
+			log.Warn(errMsg, zap.Any("in", in))
+			return nil, nil
 		}
 		if err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
 			OpType: opType,
 			OpKey:  funcutil.EncodeUserRoleCache(in.Username, in.RoleName),
 		}); err != nil {
-			errMsg := "fail to refresh policy info cache"
-			log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-			return failStatus(commonpb.ErrorCode_OperateUserRoleFailure, errMsg), nil
+			log.Warn("fail to refresh policy info cache", zap.Any("in", in), zap.Error(err))
+			return nil, err
 		}
+		return nil, nil
+	}))
+	err := redoTask.Execute(ctx)
+	if err != nil {
+		errMsg := "fail to execute task when operate the user and role"
+		log.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_OperateUserRoleFailure), nil
 	}
 
-	logger.Debug(method + " success")
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // SelectRole select role
@@ -2087,40 +2414,41 @@ func (c *Core) SelectRole(ctx context.Context, in *milvuspb.SelectRoleRequest) (
 	method := "SelectRole"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
-		return &milvuspb.SelectRoleResponse{Status: errorutil.UnhealthyStatus(code)}, errorutil.UnhealthyError()
+		return &milvuspb.SelectRoleResponse{Status: merr.Status(merr.WrapErrServiceNotReady(code.String()))}, nil
 	}
 
 	if in.Role != nil {
 		if _, err := c.meta.SelectRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: in.Role.Name}, false); err != nil {
 			if common.IsKeyNotExistError(err) {
 				return &milvuspb.SelectRoleResponse{
-					Status: succStatus(),
+					Status: merr.Status(nil),
 				}, nil
 			}
 			errMsg := "fail to select the role to check the role name"
-			log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+			ctxLog.Warn(errMsg, zap.Error(err))
 			return &milvuspb.SelectRoleResponse{
-				Status: failStatus(commonpb.ErrorCode_SelectRoleFailure, errMsg),
+				Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_SelectRoleFailure),
 			}, nil
 		}
 	}
 	roleResults, err := c.meta.SelectRole(util.DefaultTenant, in.Role, in.IncludeUserInfo)
 	if err != nil {
 		errMsg := "fail to select the role"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+		ctxLog.Warn(errMsg, zap.Error(err))
 		return &milvuspb.SelectRoleResponse{
-			Status: failStatus(commonpb.ErrorCode_SelectRoleFailure, errMsg),
+			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_SelectRoleFailure),
 		}, nil
 	}
 
-	logger.Debug(method + " success")
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return &milvuspb.SelectRoleResponse{
-		Status:  succStatus(),
+		Status:  merr.Status(nil),
 		Results: roleResults,
 	}, nil
 }
@@ -2133,40 +2461,41 @@ func (c *Core) SelectUser(ctx context.Context, in *milvuspb.SelectUserRequest) (
 	method := "SelectUser"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
-		return &milvuspb.SelectUserResponse{Status: errorutil.UnhealthyStatus(code)}, errorutil.UnhealthyError()
+		return &milvuspb.SelectUserResponse{Status: merr.Status(merr.WrapErrServiceNotReady(code.String()))}, nil
 	}
 
 	if in.User != nil {
 		if _, err := c.meta.SelectUser(util.DefaultTenant, &milvuspb.UserEntity{Name: in.User.Name}, false); err != nil {
 			if common.IsKeyNotExistError(err) {
 				return &milvuspb.SelectUserResponse{
-					Status: succStatus(),
+					Status: merr.Status(nil),
 				}, nil
 			}
 			errMsg := "fail to select the user to check the username"
-			log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+			ctxLog.Warn(errMsg, zap.Any("in", in), zap.Error(err))
 			return &milvuspb.SelectUserResponse{
-				Status: failStatus(commonpb.ErrorCode_SelectUserFailure, errMsg),
+				Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_SelectUserFailure),
 			}, nil
 		}
 	}
 	userResults, err := c.meta.SelectUser(util.DefaultTenant, in.User, in.IncludeRoleInfo)
 	if err != nil {
 		errMsg := "fail to select the user"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+		ctxLog.Warn(errMsg, zap.Error(err))
 		return &milvuspb.SelectUserResponse{
-			Status: failStatus(commonpb.ErrorCode_SelectUserFailure, errMsg),
+			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_SelectUserFailure),
 		}, nil
 	}
 
-	logger.Debug(method + " success")
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return &milvuspb.SelectUserResponse{
-		Status:  succStatus(),
+		Status:  merr.Status(nil),
 		Results: userResults,
 	}, nil
 }
@@ -2179,7 +2508,8 @@ func (c *Core) isValidRole(entity *milvuspb.RoleEntity) error {
 		return errors.New("the name in the role entity is empty")
 	}
 	if _, err := c.meta.SelectRole(util.DefaultTenant, &milvuspb.RoleEntity{Name: entity.Name}, false); err != nil {
-		return err
+		log.Warn("fail to select the role", zap.String("role_name", entity.Name), zap.Error(err))
+		return errors.New("not found the role, maybe the role isn't existed or internal system error")
 	}
 	return nil
 }
@@ -2189,7 +2519,7 @@ func (c *Core) isValidObject(entity *milvuspb.ObjectEntity) error {
 		return errors.New("the object entity is nil")
 	}
 	if _, ok := commonpb.ObjectType_value[entity.Name]; !ok {
-		return fmt.Errorf("the object type in the object entity[name: %s] is invalid", entity.Name)
+		return fmt.Errorf("not found the object type[name: %s], supported the object types: %v", entity.Name, lo.Keys(commonpb.ObjectType_value))
 	}
 	return nil
 }
@@ -2205,7 +2535,8 @@ func (c *Core) isValidGrantor(entity *milvuspb.GrantorEntity, object string) err
 		return errors.New("the name in the user entity of the grantor entity is empty")
 	}
 	if _, err := c.meta.SelectUser(util.DefaultTenant, &milvuspb.UserEntity{Name: entity.User.Name}, false); err != nil {
-		return err
+		log.Warn("fail to select the user", zap.String("username", entity.User.Name), zap.Error(err))
+		return errors.New("not found the user, maybe the user isn't existed or internal system error")
 	}
 	if entity.Privilege == nil {
 		return errors.New("the privilege entity in the grantor entity is nil")
@@ -2214,18 +2545,18 @@ func (c *Core) isValidGrantor(entity *milvuspb.GrantorEntity, object string) err
 		return nil
 	}
 	if privilegeName := util.PrivilegeNameForMetastore(entity.Privilege.Name); privilegeName == "" {
-		return fmt.Errorf("the privilege name[%s] in the privilege entity is invalid", entity.Privilege.Name)
+		return fmt.Errorf("not found the privilege name[%s]", entity.Privilege.Name)
 	}
 	privileges, ok := util.ObjectPrivileges[object]
 	if !ok {
-		return fmt.Errorf("the object type[%s] is invalid", object)
+		return fmt.Errorf("not found the object type[name: %s], supported the object types: %v", object, lo.Keys(commonpb.ObjectType_value))
 	}
 	for _, privilege := range privileges {
 		if privilege == entity.Privilege.Name {
 			return nil
 		}
 	}
-	return fmt.Errorf("the privilege name[%s] is invalid", entity.Privilege.Name)
+	return fmt.Errorf("not found the privilege name[%s]", entity.Privilege.Name)
 }
 
 // OperatePrivilege operate the privilege, including grant and revoke
@@ -2239,53 +2570,54 @@ func (c *Core) OperatePrivilege(ctx context.Context, in *milvuspb.OperatePrivile
 	method := "OperatePrivilege"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
-		return errorutil.UnhealthyStatus(code), errorutil.UnhealthyError()
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
 	}
 	if in.Type != milvuspb.OperatePrivilegeType_Grant && in.Type != milvuspb.OperatePrivilegeType_Revoke {
 		errMsg := fmt.Sprintf("invalid operate privilege type, current type: %s, valid value: [%s, %s]", in.Type, milvuspb.OperatePrivilegeType_Grant, milvuspb.OperatePrivilegeType_Revoke)
-		log.Error(errMsg, zap.Any("in", in))
-		return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, errMsg), nil
+		ctxLog.Warn(errMsg)
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_OperatePrivilegeFailure), nil
 	}
 	if in.Entity == nil {
 		errMsg := "the grant entity in the request is nil"
-		log.Error(errMsg, zap.Any("in", in))
-		return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, errMsg), nil
+		ctxLog.Error(errMsg)
+		return merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_OperatePrivilegeFailure), nil
 	}
 	if err := c.isValidObject(in.Entity.Object); err != nil {
-		log.Error("", zap.Error(err))
-		return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, err.Error()), nil
+		ctxLog.Warn("", zap.Error(err))
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_OperatePrivilegeFailure), nil
 	}
 	if err := c.isValidRole(in.Entity.Role); err != nil {
-		log.Error("", zap.Error(err))
-		return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, err.Error()), nil
+		ctxLog.Warn("", zap.Error(err))
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_OperatePrivilegeFailure), nil
 	}
 	if err := c.isValidGrantor(in.Entity.Grantor, in.Entity.Object.Name); err != nil {
-		log.Error("", zap.Error(err))
-		return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, err.Error()), nil
+		ctxLog.Error("", zap.Error(err))
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_OperatePrivilegeFailure), nil
 	}
 
-	logger.Debug("before PrivilegeNameForMetastore", zap.String("privilege", in.Entity.Grantor.Privilege.Name))
+	ctxLog.Debug("before PrivilegeNameForMetastore", zap.String("privilege", in.Entity.Grantor.Privilege.Name))
 	if !util.IsAnyWord(in.Entity.Grantor.Privilege.Name) {
 		in.Entity.Grantor.Privilege.Name = util.PrivilegeNameForMetastore(in.Entity.Grantor.Privilege.Name)
 	}
-	logger.Debug("after PrivilegeNameForMetastore", zap.String("privilege", in.Entity.Grantor.Privilege.Name))
+	ctxLog.Debug("after PrivilegeNameForMetastore", zap.String("privilege", in.Entity.Grantor.Privilege.Name))
 	if in.Entity.Object.Name == commonpb.ObjectType_Global.String() {
 		in.Entity.ObjectName = util.AnyWord
 	}
-	updateCache := true
-	if err := c.meta.OperatePrivilege(util.DefaultTenant, in.Entity, in.Type); err != nil {
-		if !common.IsIgnorableError(err) {
-			errMsg := "fail to operate the privilege"
-			log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-			return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, errMsg), nil
-		}
-		updateCache = false
-	}
 
-	if updateCache {
+	redoTask := newBaseRedoTask(c.stepExecutor)
+	redoTask.AddSyncStep(NewSimpleStep("operate privilege meta data", func(ctx context.Context) ([]nestedStep, error) {
+		err := c.meta.OperatePrivilege(util.DefaultTenant, in.Entity, in.Type)
+		if err != nil && !common.IsIgnorableError(err) {
+			log.Warn("fail to operate the privilege", zap.Any("in", in), zap.Error(err))
+			return nil, err
+		}
+		return nil, nil
+	}))
+	redoTask.AddAsyncStep(NewSimpleStep("operate privilege cache", func(ctx context.Context) ([]nestedStep, error) {
 		var opType int32
 		switch in.Type {
 		case milvuspb.OperatePrivilegeType_Grant:
@@ -2293,24 +2625,30 @@ func (c *Core) OperatePrivilege(ctx context.Context, in *milvuspb.OperatePrivile
 		case milvuspb.OperatePrivilegeType_Revoke:
 			opType = int32(typeutil.CacheRevokePrivilege)
 		default:
-			errMsg := "invalid operate type for the OperatePrivilege api"
-			log.Error(errMsg, zap.Any("in", in))
-			return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, errMsg), nil
+			log.Warn("invalid operate type for the OperatePrivilege api", zap.Any("in", in))
+			return nil, nil
 		}
 		if err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
 			OpType: opType,
-			OpKey:  funcutil.PolicyForPrivilege(in.Entity.Role.Name, in.Entity.Object.Name, in.Entity.ObjectName, in.Entity.Grantor.Privilege.Name),
+			OpKey:  funcutil.PolicyForPrivilege(in.Entity.Role.Name, in.Entity.Object.Name, in.Entity.ObjectName, in.Entity.Grantor.Privilege.Name, in.Entity.DbName),
 		}); err != nil {
-			errMsg := "fail to refresh policy info cache"
-			log.Error(errMsg, zap.Any("in", in), zap.Error(err))
-			return failStatus(commonpb.ErrorCode_OperatePrivilegeFailure, errMsg), nil
+			log.Warn("fail to refresh policy info cache", zap.Any("in", in), zap.Error(err))
+			return nil, err
 		}
+		return nil, nil
+	}))
+
+	err := redoTask.Execute(ctx)
+	if err != nil {
+		errMsg := "fail to execute task when operating the privilege"
+		log.Warn(errMsg, zap.Error(err))
+		return merr.StatusWithErrorCode(err, commonpb.ErrorCode_OperatePrivilegeFailure), nil
 	}
 
-	logger.Debug(method + " success")
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
-	return succStatus(), nil
+	return merr.Status(nil), nil
 }
 
 // SelectGrant select grant
@@ -2322,31 +2660,32 @@ func (c *Core) SelectGrant(ctx context.Context, in *milvuspb.SelectGrantRequest)
 	method := "SelectGrant"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
 		return &milvuspb.SelectGrantResponse{
-			Status: errorutil.UnhealthyStatus(code),
-		}, errorutil.UnhealthyError()
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
+		}, nil
 	}
 	if in.Entity == nil {
 		errMsg := "the grant entity in the request is nil"
-		log.Error(errMsg, zap.Any("in", in))
+		ctxLog.Warn(errMsg)
 		return &milvuspb.SelectGrantResponse{
-			Status: failStatus(commonpb.ErrorCode_SelectGrantFailure, errMsg),
+			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_SelectGrantFailure),
 		}, nil
 	}
 	if err := c.isValidRole(in.Entity.Role); err != nil {
-		log.Error("", zap.Any("in", in), zap.Error(err))
+		ctxLog.Warn("", zap.Error(err))
 		return &milvuspb.SelectGrantResponse{
-			Status: failStatus(commonpb.ErrorCode_SelectGrantFailure, err.Error()),
+			Status: merr.StatusWithErrorCode(err, commonpb.ErrorCode_SelectGrantFailure),
 		}, nil
 	}
 	if in.Entity.Object != nil {
 		if err := c.isValidObject(in.Entity.Object); err != nil {
-			log.Error("", zap.Any("in", in), zap.Error(err))
+			ctxLog.Warn("", zap.Error(err))
 			return &milvuspb.SelectGrantResponse{
-				Status: failStatus(commonpb.ErrorCode_SelectGrantFailure, err.Error()),
+				Status: merr.StatusWithErrorCode(err, commonpb.ErrorCode_SelectGrantFailure),
 			}, nil
 		}
 	}
@@ -2354,22 +2693,22 @@ func (c *Core) SelectGrant(ctx context.Context, in *milvuspb.SelectGrantRequest)
 	grantEntities, err := c.meta.SelectGrant(util.DefaultTenant, in.Entity)
 	if common.IsKeyNotExistError(err) {
 		return &milvuspb.SelectGrantResponse{
-			Status: succStatus(),
+			Status: merr.Status(nil),
 		}, nil
 	}
 	if err != nil {
 		errMsg := "fail to select the grant"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+		ctxLog.Warn(errMsg, zap.Error(err))
 		return &milvuspb.SelectGrantResponse{
-			Status: failStatus(commonpb.ErrorCode_SelectGrantFailure, errMsg),
+			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_SelectGrantFailure),
 		}, nil
 	}
 
-	logger.Debug(method + " success")
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return &milvuspb.SelectGrantResponse{
-		Status:   succStatus(),
+		Status:   merr.Status(nil),
 		Entities: grantEntities,
 	}, nil
 }
@@ -2378,45 +2717,84 @@ func (c *Core) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest)
 	method := "PolicyList"
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.TotalLabel).Inc()
 	tr := timerecord.NewTimeRecorder(method)
-	logger.Debug(method, zap.Any("in", in))
+	ctxLog := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole), zap.Any("in", in))
+	ctxLog.Debug(method)
 
 	if code, ok := c.checkHealthy(); !ok {
 		return &internalpb.ListPolicyResponse{
-			Status: errorutil.UnhealthyStatus(code),
-		}, errorutil.UnhealthyError()
+			Status: merr.Status(merr.WrapErrServiceNotReady(code.String())),
+		}, nil
 	}
 
 	policies, err := c.meta.ListPolicy(util.DefaultTenant)
 	if err != nil {
 		errMsg := "fail to list policy"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+		ctxLog.Warn(errMsg, zap.Error(err))
 		return &internalpb.ListPolicyResponse{
-			Status: failStatus(commonpb.ErrorCode_ListPolicyFailure, errMsg),
+			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_ListPolicyFailure),
 		}, nil
 	}
 	userRoles, err := c.meta.ListUserRole(util.DefaultTenant)
 	if err != nil {
 		errMsg := "fail to list user-role"
-		log.Error(errMsg, zap.Any("in", in), zap.Error(err))
+		ctxLog.Warn(errMsg, zap.Any("in", in), zap.Error(err))
 		return &internalpb.ListPolicyResponse{
-			Status: failStatus(commonpb.ErrorCode_ListPolicyFailure, "fail to list user-role"),
+			Status: merr.StatusWithErrorCode(errors.New(errMsg), commonpb.ErrorCode_ListPolicyFailure),
 		}, nil
 	}
 
-	logger.Debug(method + " success")
+	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return &internalpb.ListPolicyResponse{
-		Status:      succStatus(),
+		Status:      merr.Status(nil),
 		PolicyInfos: policies,
 		UserRoles:   userRoles,
 	}, nil
 }
 
+func (c *Core) RenameCollection(ctx context.Context, req *milvuspb.RenameCollectionRequest) (*commonpb.Status, error) {
+	if code, ok := c.checkHealthy(); !ok {
+		return merr.Status(merr.WrapErrServiceNotReady(code.String())), nil
+	}
+
+	log := log.Ctx(ctx).With(zap.String("oldCollectionName", req.GetOldName()), zap.String("newCollectionName", req.GetNewName()))
+	log.Info("received request to rename collection")
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("RenameCollection", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("RenameCollection")
+	t := &renameCollectionTask{
+		baseTask: newBaseTask(ctx, c),
+		Req:      req,
+	}
+
+	if err := c.scheduler.AddTask(t); err != nil {
+		log.Warn("failed to enqueue request to rename collection", zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues("RenameCollection", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	if err := t.WaitToFinish(); err != nil {
+		log.Warn("failed to rename collection", zap.Uint64("ts", t.GetTs()), zap.Error(err))
+		metrics.RootCoordDDLReqCounter.WithLabelValues("RenameCollection", metrics.FailLabel).Inc()
+		return merr.Status(err), nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("RenameCollection", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("RenameCollection").Observe(float64(tr.ElapseSpan().Milliseconds()))
+
+	log.Info("done to rename collection", zap.Uint64("ts", t.GetTs()))
+	return merr.Status(nil), nil
+}
+
 func (c *Core) CheckHealth(ctx context.Context, in *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error) {
-	if _, ok := c.checkHealthy(); !ok {
+	if code, ok := c.checkHealthy(); !ok {
 		reason := errorutil.UnHealthReason("rootcoord", c.session.ServerID, "rootcoord is unhealthy")
-		return &milvuspb.CheckHealthResponse{IsHealthy: false, Reasons: []string{reason}}, nil
+		return &milvuspb.CheckHealthResponse{
+			Status:    merr.Status(merr.WrapErrServiceNotReady(code.String())),
+			IsHealthy: false,
+			Reasons:   []string{reason},
+		}, nil
 	}
 
 	mu := &sync.Mutex{}
@@ -2427,7 +2805,7 @@ func (c *Core) CheckHealth(ctx context.Context, in *milvuspb.CheckHealthRequest)
 		nodeID := nodeID
 		proxyClient := proxyClient
 		group.Go(func() error {
-			sta, err := proxyClient.GetComponentStates(ctx)
+			sta, err := proxyClient.GetComponentStates(ctx, &milvuspb.GetComponentStatesRequest{})
 			isHealthy, reason := errorutil.UnHealthReasonWithComponentStatesOrErr("proxy", nodeID, sta, err)
 			if !isHealthy {
 				mu.Lock()
@@ -2440,8 +2818,12 @@ func (c *Core) CheckHealth(ctx context.Context, in *milvuspb.CheckHealthRequest)
 
 	err := group.Wait()
 	if err != nil || len(errReasons) != 0 {
-		return &milvuspb.CheckHealthResponse{IsHealthy: false, Reasons: errReasons}, nil
+		return &milvuspb.CheckHealthResponse{
+			Status:    merr.Status(nil),
+			IsHealthy: false,
+			Reasons:   errReasons,
+		}, nil
 	}
 
-	return &milvuspb.CheckHealthResponse{IsHealthy: true, Reasons: errReasons}, nil
+	return &milvuspb.CheckHealthResponse{Status: merr.Status(nil), IsHealthy: true, Reasons: errReasons}, nil
 }

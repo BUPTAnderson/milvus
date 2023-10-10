@@ -18,25 +18,29 @@ package rmq
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/apache/pulsar-client-go/pulsar"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	rocksmqimplclient "github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/client"
 	rocksmqimplserver "github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/server"
-
-	"github.com/apache/pulsar-client-go/pulsar"
-
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
-	pulsarwrapper "github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper/pulsar"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	pulsarwrapper "github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/pulsar"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-var Params paramtable.BaseTable
-
 func TestMain(m *testing.M) {
+	paramtable.Init()
+	pt := paramtable.Get()
+	pt.Save(pt.ServiceParam.MQCfg.EnablePursuitMode.Key, "false")
+
+	rand.Seed(time.Now().UnixNano())
 	path := "/tmp/milvus/rdb_data"
 	defer os.RemoveAll(path)
 	_ = rocksmqimplserver.InitRocksMQ(path)
@@ -48,7 +52,7 @@ func TestMain(m *testing.M) {
 func Test_NewRmqClient(t *testing.T) {
 	client, err := createRmqClient()
 	defer client.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
 }
 
@@ -56,7 +60,7 @@ func TestRmqClient_CreateProducer(t *testing.T) {
 	opts := rocksmqimplclient.Options{}
 	client, err := NewClient(opts)
 	defer client.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
 
 	topic := "TestRmqClient_CreateProducer"
@@ -64,7 +68,7 @@ func TestRmqClient_CreateProducer(t *testing.T) {
 	producer, err := client.CreateProducer(proOpts)
 
 	defer producer.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, producer)
 
 	rmqProducer := producer.(*rmqProducer)
@@ -76,7 +80,7 @@ func TestRmqClient_CreateProducer(t *testing.T) {
 		Properties: nil,
 	}
 	_, err = rmqProducer.Send(context.TODO(), msg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	invalidOpts := mqwrapper.ProducerOptions{Topic: ""}
 	producer, e := client.CreateProducer(invalidOpts)
@@ -86,13 +90,13 @@ func TestRmqClient_CreateProducer(t *testing.T) {
 
 func TestRmqClient_GetLatestMsg(t *testing.T) {
 	client, err := createRmqClient()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer client.Close()
 
-	topic := "t2GetLatestMsg"
+	topic := fmt.Sprintf("t2GetLatestMsg-%d", rand.Int())
 	proOpts := mqwrapper.ProducerOptions{Topic: topic}
 	producer, err := client.CreateProducer(proOpts)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer producer.Close()
 
 	for i := 0; i < 10; i++ {
@@ -101,7 +105,7 @@ func TestRmqClient_GetLatestMsg(t *testing.T) {
 			Properties: nil,
 		}
 		_, err = producer.Send(context.TODO(), msg)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 
 	subName := "subName"
@@ -113,57 +117,69 @@ func TestRmqClient_GetLatestMsg(t *testing.T) {
 	}
 
 	consumer, err := client.Subscribe(consumerOpts)
-	assert.Nil(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
+	assert.NoError(t, err)
 
 	expectLastMsg, err := consumer.GetLatestMsgID()
-	assert.Nil(t, err)
-	var actualLastMsg mqwrapper.Message
+	assert.NoError(t, err)
 
-	for {
+	var actualLastMsg mqwrapper.Message
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	for i := 0; i < 10; i++ {
 		select {
 		case <-ctx.Done():
-			ret, err := expectLastMsg.LessOrEqualThan(actualLastMsg.ID().Serialize())
-			assert.Nil(t, err)
-			assert.True(t, ret)
-			return
+			fmt.Println(i)
+			assert.FailNow(t, "consumer failed to yield message in 100 milliseconds")
 		case msg := <-consumer.Chan():
 			consumer.Ack(msg)
 			actualLastMsg = msg
 		}
 	}
+	require.NotNil(t, actualLastMsg)
+	ret, err := expectLastMsg.LessOrEqualThan(actualLastMsg.ID().Serialize())
+	assert.NoError(t, err)
+	assert.True(t, ret)
 }
 
 func TestRmqClient_Subscribe(t *testing.T) {
 	client, err := createRmqClient()
 	defer client.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
 
 	topic := "TestRmqClient_Subscribe"
 	proOpts := mqwrapper.ProducerOptions{Topic: topic}
 	producer, err := client.CreateProducer(proOpts)
 	defer producer.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, producer)
 
 	subName := "subName"
 	consumerOpts := mqwrapper.ConsumerOptions{
+		Topic:                       subName,
+		SubscriptionName:            subName,
+		SubscriptionInitialPosition: mqwrapper.SubscriptionPositionEarliest,
+		BufSize:                     0,
+	}
+	consumer, err := client.Subscribe(consumerOpts)
+	assert.Error(t, err)
+	assert.Nil(t, consumer)
+
+	consumerOpts = mqwrapper.ConsumerOptions{
 		Topic:                       "",
 		SubscriptionName:            subName,
 		SubscriptionInitialPosition: mqwrapper.SubscriptionPositionEarliest,
 		BufSize:                     1024,
 	}
 
-	consumer, err := client.Subscribe(consumerOpts)
-	assert.NotNil(t, err)
+	consumer, err = client.Subscribe(consumerOpts)
+	assert.Error(t, err)
 	assert.Nil(t, consumer)
 
 	consumerOpts.Topic = topic
 	consumer, err = client.Subscribe(consumerOpts)
 	defer consumer.Close()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
 	assert.Equal(t, consumer.Subscription(), subName)
 
@@ -172,27 +188,25 @@ func TestRmqClient_Subscribe(t *testing.T) {
 		Properties: nil,
 	}
 	_, err = producer.Send(context.TODO(), msg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-consumer.Chan():
-			consumer.Ack(msg)
-			rmqmsg := msg.(*rmqMessage)
-			msgPayload := rmqmsg.Payload()
-			assert.NotEmpty(t, msgPayload)
-			msgTopic := rmqmsg.Topic()
-			assert.Equal(t, msgTopic, topic)
-			msgProp := rmqmsg.Properties()
-			assert.Empty(t, msgProp)
-			msgID := rmqmsg.ID()
-			rID := msgID.(*rmqID)
-			assert.NotZero(t, rID)
-		}
+	select {
+	case <-ctx.Done():
+		assert.FailNow(t, "consumer failed to yield message in 100 milliseconds")
+	case msg := <-consumer.Chan():
+		consumer.Ack(msg)
+		rmqmsg := msg.(*rmqMessage)
+		msgPayload := rmqmsg.Payload()
+		assert.NotEmpty(t, msgPayload)
+		msgTopic := rmqmsg.Topic()
+		assert.Equal(t, msgTopic, topic)
+		msgProp := rmqmsg.Properties()
+		assert.Empty(t, msgProp)
+		msgID := rmqmsg.ID()
+		rID := msgID.(*rmqID)
+		assert.NotZero(t, rID)
 	}
 }
 
@@ -210,13 +224,13 @@ func TestRmqClient_StringToMsgID(t *testing.T) {
 
 	str := "5"
 	res, err := client.StringToMsgID(str)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, res)
 
 	str = "X"
 	res, err = client.StringToMsgID(str)
 	assert.Nil(t, res)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
 
 func TestRmqClient_BytesToMsgID(t *testing.T) {
@@ -227,7 +241,7 @@ func TestRmqClient_BytesToMsgID(t *testing.T) {
 	binary := pulsarwrapper.SerializePulsarMsgID(mid)
 
 	res, err := client.BytesToMsgID(binary)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, res)
 }
 

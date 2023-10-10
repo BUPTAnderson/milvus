@@ -12,10 +12,15 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include "AckResponder.h"
 #include "common/Schema.h"
+#include "common/Types.h"
 #include "segcore/Record.h"
 #include "ConcurrentVector.h"
 
@@ -32,7 +37,9 @@ struct DeletedRecord {
     };
     static constexpr int64_t deprecated_size_per_chunk = 32 * 1024;
     DeletedRecord()
-        : lru_(std::make_shared<TmpBitmap>()), timestamps_(deprecated_size_per_chunk), pks_(deprecated_size_per_chunk) {
+        : lru_(std::make_shared<TmpBitmap>()),
+          timestamps_(deprecated_size_per_chunk),
+          pks_(deprecated_size_per_chunk) {
         lru_->bitmap_ptr = std::make_shared<BitsetType>();
     }
 
@@ -43,12 +50,16 @@ struct DeletedRecord {
     }
 
     std::shared_ptr<TmpBitmap>
-    clone_lru_entry(int64_t insert_barrier, int64_t del_barrier, int64_t& old_del_barrier, bool& hit_cache) {
+    clone_lru_entry(int64_t insert_barrier,
+                    int64_t del_barrier,
+                    int64_t& old_del_barrier,
+                    bool& hit_cache) {
         std::shared_lock lck(shared_mutex_);
         auto res = lru_->clone(insert_barrier);
         old_del_barrier = lru_->del_barrier;
 
-        if (lru_->bitmap_ptr->size() == insert_barrier && lru_->del_barrier == del_barrier) {
+        if (lru_->bitmap_ptr->size() == insert_barrier &&
+            lru_->del_barrier == del_barrier) {
             hit_cache = true;
         } else {
             res->del_barrier = del_barrier;
@@ -61,7 +72,8 @@ struct DeletedRecord {
     insert_lru_entry(std::shared_ptr<TmpBitmap> new_entry, bool force = false) {
         std::lock_guard lck(shared_mutex_);
         if (new_entry->del_barrier <= lru_->del_barrier) {
-            if (!force || new_entry->bitmap_ptr->size() <= lru_->bitmap_ptr->size()) {
+            if (!force ||
+                new_entry->bitmap_ptr->size() <= lru_->bitmap_ptr->size()) {
                 // DO NOTHING
                 return;
             }
@@ -69,19 +81,60 @@ struct DeletedRecord {
         lru_ = std::move(new_entry);
     }
 
- public:
-    std::atomic<int64_t> reserved = 0;
-    AckResponder ack_responder_;
-    ConcurrentVector<Timestamp> timestamps_;
-    ConcurrentVector<PkType> pks_;
+    void
+    push(const std::vector<PkType>& pks, const Timestamp* timestamps) {
+        std::lock_guard lck(buffer_mutex_);
+
+        auto size = pks.size();
+        ssize_t divide_point = 0;
+        auto n = n_.load();
+        // Truncate the overlapping prefix
+        if (n > 0) {
+            auto last = timestamps_[n - 1];
+            divide_point =
+                std::lower_bound(timestamps, timestamps + size, last + 1) -
+                timestamps;
+        }
+
+        // All these delete records have been applied
+        if (divide_point == size) {
+            return;
+        }
+
+        size -= divide_point;
+        pks_.set_data_raw(n, pks.data() + divide_point, size);
+        timestamps_.set_data_raw(n, timestamps + divide_point, size);
+        n_ += size;
+    }
+
+    const ConcurrentVector<Timestamp>&
+    timestamps() const {
+        return timestamps_;
+    }
+
+    const ConcurrentVector<PkType>&
+    pks() const {
+        return pks_;
+    }
+
+    int64_t
+    size() const {
+        return n_.load();
+    }
 
  private:
     std::shared_ptr<TmpBitmap> lru_;
     std::shared_mutex shared_mutex_;
+
+    std::shared_mutex buffer_mutex_;
+    std::atomic<int64_t> n_ = 0;
+    ConcurrentVector<Timestamp> timestamps_;
+    ConcurrentVector<PkType> pks_;
 };
 
 inline auto
-DeletedRecord::TmpBitmap::clone(int64_t capacity) -> std::shared_ptr<TmpBitmap> {
+DeletedRecord::TmpBitmap::clone(int64_t capacity)
+    -> std::shared_ptr<TmpBitmap> {
     auto res = std::make_shared<TmpBitmap>();
     res->del_barrier = this->del_barrier;
     res->bitmap_ptr = std::make_shared<BitsetType>();

@@ -14,9 +14,9 @@ package client
 import (
 	"sync"
 
-	"github.com/milvus-io/milvus/internal/log"
-
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 type consumer struct {
@@ -140,6 +140,10 @@ func (c *consumer) GetLatestMsgID() (int64, error) {
 	if err != nil {
 		return msgID, err
 	}
-
 	return msgID, nil
+}
+
+func (c *consumer) CheckTopicValid(topic string) error {
+	err := c.client.server.CheckTopicValid(topic)
+	return err
 }

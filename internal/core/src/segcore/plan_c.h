@@ -23,12 +23,12 @@ typedef void* CSearchPlan;
 typedef void* CPlaceholderGroup;
 typedef void* CRetrievePlan;
 
-CStatus
-CreateSearchPlan(CCollection col, const char* dsl, CSearchPlan* res_plan);
-
 // Note: serialized_expr_plan is of binary format
 CStatus
-CreateSearchPlanByExpr(CCollection col, const void* serialized_expr_plan, const int64_t size, CSearchPlan* res_plan);
+CreateSearchPlanByExpr(CCollection col,
+                       const void* serialized_expr_plan,
+                       const int64_t size,
+                       CSearchPlan* res_plan);
 
 CStatus
 ParsePlaceholderGroup(CSearchPlan plan,
@@ -47,6 +47,9 @@ GetFieldID(CSearchPlan plan, int64_t* field_id);
 
 const char*
 GetMetricType(CSearchPlan plan);
+
+void
+SetMetricType(CSearchPlan plan, const char* metric_type);
 
 void
 DeleteSearchPlan(CSearchPlan plan);

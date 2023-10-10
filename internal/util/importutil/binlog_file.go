@@ -18,12 +18,14 @@ package importutil
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 // BinlogFile class is a wrapper of storage.BinlogReader, to read binlog file, block by block.
@@ -37,7 +39,7 @@ type BinlogFile struct {
 
 func NewBinlogFile(chunkManager storage.ChunkManager) (*BinlogFile, error) {
 	if chunkManager == nil {
-		log.Error("Binlog file: chunk manager pointer is nil")
+		log.Warn("Binlog file: chunk manager pointer is nil")
 		return nil, errors.New("chunk manager pointer is nil")
 	}
 
@@ -51,21 +53,21 @@ func NewBinlogFile(chunkManager storage.ChunkManager) (*BinlogFile, error) {
 func (p *BinlogFile) Open(filePath string) error {
 	p.Close()
 	if len(filePath) == 0 {
-		log.Error("Binlog file: binlog path is empty")
+		log.Warn("Binlog file: binlog path is empty")
 		return errors.New("binlog path is empty")
 	}
 
 	// TODO add context
 	bytes, err := p.chunkManager.Read(context.TODO(), filePath)
 	if err != nil {
-		log.Error("Binlog file: failed to open binlog", zap.String("filePath", filePath), zap.Error(err))
-		return err
+		log.Warn("Binlog file: failed to open binlog", zap.String("filePath", filePath), zap.Error(err))
+		return fmt.Errorf("failed to open binlog %s", filePath)
 	}
 
 	p.reader, err = storage.NewBinlogReader(bytes)
 	if err != nil {
-		log.Error("Binlog file: failed to initialize binlog reader", zap.String("filePath", filePath), zap.Error(err))
-		return err
+		log.Warn("Binlog file: failed to initialize binlog reader", zap.String("filePath", filePath), zap.Error(err))
+		return fmt.Errorf("failed to initialize binlog reader for binlog %s, error: %w", filePath, err)
 	}
 
 	log.Info("Binlog file: open binlog successfully", zap.String("filePath", filePath))
@@ -92,7 +94,7 @@ func (p *BinlogFile) DataType() schemapb.DataType {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadBool() ([]bool, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -100,8 +102,8 @@ func (p *BinlogFile) ReadBool() ([]bool, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -110,19 +112,19 @@ func (p *BinlogFile) ReadBool() ([]bool, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Bool {
-			log.Error("Binlog file: binlog data type is not bool")
+			log.Warn("Binlog file: binlog data type is not bool")
 			return nil, errors.New("binlog data type is not bool")
 		}
 
 		data, err := event.PayloadReaderInterface.GetBoolFromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read bool data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read bool data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read bool data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -135,7 +137,7 @@ func (p *BinlogFile) ReadBool() ([]bool, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadInt8() ([]int8, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -143,8 +145,8 @@ func (p *BinlogFile) ReadInt8() ([]int8, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -153,19 +155,19 @@ func (p *BinlogFile) ReadInt8() ([]int8, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Int8 {
-			log.Error("Binlog file: binlog data type is not int8")
+			log.Warn("Binlog file: binlog data type is not int8")
 			return nil, errors.New("binlog data type is not int8")
 		}
 
 		data, err := event.PayloadReaderInterface.GetInt8FromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read int8 data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read int8 data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read int8 data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -178,7 +180,7 @@ func (p *BinlogFile) ReadInt8() ([]int8, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadInt16() ([]int16, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -186,8 +188,8 @@ func (p *BinlogFile) ReadInt16() ([]int16, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -196,19 +198,19 @@ func (p *BinlogFile) ReadInt16() ([]int16, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Int16 {
-			log.Error("Binlog file: binlog data type is not int16")
+			log.Warn("Binlog file: binlog data type is not int16")
 			return nil, errors.New("binlog data type is not int16")
 		}
 
 		data, err := event.PayloadReaderInterface.GetInt16FromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read int16 data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read int16 data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read int16 data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -221,7 +223,7 @@ func (p *BinlogFile) ReadInt16() ([]int16, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadInt32() ([]int32, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -229,8 +231,8 @@ func (p *BinlogFile) ReadInt32() ([]int32, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -239,19 +241,19 @@ func (p *BinlogFile) ReadInt32() ([]int32, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Int32 {
-			log.Error("Binlog file: binlog data type is not int32")
+			log.Warn("Binlog file: binlog data type is not int32")
 			return nil, errors.New("binlog data type is not int32")
 		}
 
 		data, err := event.PayloadReaderInterface.GetInt32FromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read int32 data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read int32 data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read int32 data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -264,7 +266,7 @@ func (p *BinlogFile) ReadInt32() ([]int32, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadInt64() ([]int64, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -272,8 +274,8 @@ func (p *BinlogFile) ReadInt64() ([]int64, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -282,19 +284,19 @@ func (p *BinlogFile) ReadInt64() ([]int64, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Int64 {
-			log.Error("Binlog file: binlog data type is not int64")
+			log.Warn("Binlog file: binlog data type is not int64")
 			return nil, errors.New("binlog data type is not int64")
 		}
 
 		data, err := event.PayloadReaderInterface.GetInt64FromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read int64 data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read int64 data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read int64 data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -307,7 +309,7 @@ func (p *BinlogFile) ReadInt64() ([]int64, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadFloat() ([]float32, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -315,8 +317,8 @@ func (p *BinlogFile) ReadFloat() ([]float32, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -325,19 +327,19 @@ func (p *BinlogFile) ReadFloat() ([]float32, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Float {
-			log.Error("Binlog file: binlog data type is not float")
+			log.Warn("Binlog file: binlog data type is not float")
 			return nil, errors.New("binlog data type is not float")
 		}
 
 		data, err := event.PayloadReaderInterface.GetFloatFromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read float data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read float data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read float data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -350,7 +352,7 @@ func (p *BinlogFile) ReadFloat() ([]float32, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadDouble() ([]float64, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -358,8 +360,8 @@ func (p *BinlogFile) ReadDouble() ([]float64, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -368,19 +370,19 @@ func (p *BinlogFile) ReadDouble() ([]float64, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_Double {
-			log.Error("Binlog file: binlog data type is not double")
+			log.Warn("Binlog file: binlog data type is not double")
 			return nil, errors.New("binlog data type is not double")
 		}
 
 		data, err := event.PayloadReaderInterface.GetDoubleFromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read double data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read double data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read double data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -393,7 +395,7 @@ func (p *BinlogFile) ReadDouble() ([]float64, error) {
 // A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
 func (p *BinlogFile) ReadVarchar() ([]string, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, errors.New("binlog reader not yet initialized")
 	}
 
@@ -401,8 +403,8 @@ func (p *BinlogFile) ReadVarchar() ([]string, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -412,19 +414,62 @@ func (p *BinlogFile) ReadVarchar() ([]string, error) {
 
 		// special case: delete event data type is varchar
 		if event.TypeCode != storage.InsertEventType && event.TypeCode != storage.DeleteEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, errors.New("binlog file is not insert log")
 		}
 
 		if (p.DataType() != schemapb.DataType_VarChar) && (p.DataType() != schemapb.DataType_String) {
-			log.Error("Binlog file: binlog data type is not varchar")
+			log.Warn("Binlog file: binlog data type is not varchar")
 			return nil, errors.New("binlog data type is not varchar")
 		}
 
 		data, err := event.PayloadReaderInterface.GetStringFromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read varchar data", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog file: failed to read varchar data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read varchar data, error: %w", err)
+		}
+
+		result = append(result, data...)
+	}
+
+	return result, nil
+}
+
+// ReadJSON method reads all the blocks of a binlog by a data type.
+// A binlog is designed to support multiple blocks, but so far each binlog always contains only one block.
+func (p *BinlogFile) ReadJSON() ([][]byte, error) {
+	if p.reader == nil {
+		log.Warn("Binlog file: binlog reader not yet initialized")
+		return nil, errors.New("binlog reader not yet initialized")
+	}
+
+	result := make([][]byte, 0)
+	for {
+		event, err := p.reader.NextEventReader()
+		if err != nil {
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, fmt.Errorf("failed to iterate events reader, error: %w", err)
+		}
+
+		// end of the file
+		if event == nil {
+			break
+		}
+
+		if event.TypeCode != storage.InsertEventType {
+			log.Warn("Binlog file: binlog file is not insert log")
+			return nil, errors.New("binlog file is not insert log")
+		}
+
+		if p.DataType() != schemapb.DataType_JSON {
+			log.Warn("Binlog file: binlog data type is not JSON")
+			return nil, errors.New("binlog data type is not JSON")
+		}
+
+		data, err := event.PayloadReaderInterface.GetJSONFromPayload()
+		if err != nil {
+			log.Warn("Binlog file: failed to read JSON data", zap.Error(err))
+			return nil, fmt.Errorf("failed to read JSON data, error: %w", err)
 		}
 
 		result = append(result, data...)
@@ -438,7 +483,7 @@ func (p *BinlogFile) ReadVarchar() ([]string, error) {
 // return vectors data and the dimension
 func (p *BinlogFile) ReadBinaryVector() ([]byte, int, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, 0, errors.New("binlog reader not yet initialized")
 	}
 
@@ -447,8 +492,8 @@ func (p *BinlogFile) ReadBinaryVector() ([]byte, int, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, 0, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, 0, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -457,19 +502,62 @@ func (p *BinlogFile) ReadBinaryVector() ([]byte, int, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, 0, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_BinaryVector {
-			log.Error("Binlog file: binlog data type is not binary vector")
+			log.Warn("Binlog file: binlog data type is not binary vector")
 			return nil, 0, errors.New("binlog data type is not binary vector")
 		}
 
 		data, dimenson, err := event.PayloadReaderInterface.GetBinaryVectorFromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read binary vector data", zap.Error(err))
-			return nil, 0, err
+			log.Warn("Binlog file: failed to read binary vector data", zap.Error(err))
+			return nil, 0, fmt.Errorf("failed to read binary vector data, error: %w", err)
+		}
+
+		dim = dimenson
+		result = append(result, data...)
+	}
+
+	return result, dim, nil
+}
+
+func (p *BinlogFile) ReadFloat16Vector() ([]byte, int, error) {
+	if p.reader == nil {
+		log.Warn("Binlog file: binlog reader not yet initialized")
+		return nil, 0, errors.New("binlog reader not yet initialized")
+	}
+
+	dim := 0
+	result := make([]byte, 0)
+	for {
+		event, err := p.reader.NextEventReader()
+		if err != nil {
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, 0, fmt.Errorf("failed to iterate events reader, error: %w", err)
+		}
+
+		// end of the file
+		if event == nil {
+			break
+		}
+
+		if event.TypeCode != storage.InsertEventType {
+			log.Warn("Binlog file: binlog file is not insert log")
+			return nil, 0, errors.New("binlog file is not insert log")
+		}
+
+		if p.DataType() != schemapb.DataType_Float16Vector {
+			log.Warn("Binlog file: binlog data type is not float16 vector")
+			return nil, 0, errors.New("binlog data type is not float16 vector")
+		}
+
+		data, dimenson, err := event.PayloadReaderInterface.GetFloat16VectorFromPayload()
+		if err != nil {
+			log.Warn("Binlog file: failed to read float16 vector data", zap.Error(err))
+			return nil, 0, fmt.Errorf("failed to read float16 vector data, error: %w", err)
 		}
 
 		dim = dimenson
@@ -484,7 +572,7 @@ func (p *BinlogFile) ReadBinaryVector() ([]byte, int, error) {
 // return vectors data and the dimension
 func (p *BinlogFile) ReadFloatVector() ([]float32, int, error) {
 	if p.reader == nil {
-		log.Error("Binlog file: binlog reader not yet initialized")
+		log.Warn("Binlog file: binlog reader not yet initialized")
 		return nil, 0, errors.New("binlog reader not yet initialized")
 	}
 
@@ -493,8 +581,8 @@ func (p *BinlogFile) ReadFloatVector() ([]float32, int, error) {
 	for {
 		event, err := p.reader.NextEventReader()
 		if err != nil {
-			log.Error("Binlog file: failed to iterate events reader", zap.Error(err))
-			return nil, 0, err
+			log.Warn("Binlog file: failed to iterate events reader", zap.Error(err))
+			return nil, 0, fmt.Errorf("failed to iterate events reader, error: %w", err)
 		}
 
 		// end of the file
@@ -503,19 +591,19 @@ func (p *BinlogFile) ReadFloatVector() ([]float32, int, error) {
 		}
 
 		if event.TypeCode != storage.InsertEventType {
-			log.Error("Binlog file: binlog file is not insert log")
+			log.Warn("Binlog file: binlog file is not insert log")
 			return nil, 0, errors.New("binlog file is not insert log")
 		}
 
 		if p.DataType() != schemapb.DataType_FloatVector {
-			log.Error("Binlog file: binlog data type is not float vector")
+			log.Warn("Binlog file: binlog data type is not float vector")
 			return nil, 0, errors.New("binlog data type is not float vector")
 		}
 
 		data, dimension, err := event.PayloadReaderInterface.GetFloatVectorFromPayload()
 		if err != nil {
-			log.Error("Binlog file: failed to read float vector data", zap.Error(err))
-			return nil, 0, err
+			log.Warn("Binlog file: failed to read float vector data", zap.Error(err))
+			return nil, 0, fmt.Errorf("failed to read float vector data, error: %w", err)
 		}
 
 		dim = dimension

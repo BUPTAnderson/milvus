@@ -1,21 +1,37 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rootcoord
 
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	ms "github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	ms "github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
 )
 
-//go:generate mockery --name=GarbageCollector --outpkg=mockrootcoord
+//go:generate mockery --name=GarbageCollector --outpkg=mockrootcoord --filename=garbage_collector.go --with-expecter --testonly
 type GarbageCollector interface {
 	ReDropCollection(collMeta *model.Collection, ts Timestamp)
 	RemoveCreatingCollection(collMeta *model.Collection)
-	ReDropPartition(pChannels []string, partition *model.Partition, ts Timestamp)
+	ReDropPartition(dbID int64, pChannels []string, partition *model.Partition, ts Timestamp)
+	RemoveCreatingPartition(dbID int64, partition *model.Partition, ts Timestamp)
 	GcCollectionData(ctx context.Context, coll *model.Collection) (ddlTs Timestamp, err error)
 	GcPartitionData(ctx context.Context, pChannels []string, partition *model.Partition) (ddlTs Timestamp, err error)
 }
@@ -31,16 +47,8 @@ func newBgGarbageCollector(s *Core) *bgGarbageCollector {
 func (c *bgGarbageCollector) ReDropCollection(collMeta *model.Collection, ts Timestamp) {
 	// TODO: remove this after data gc can be notified by rpc.
 	c.s.chanTimeTick.addDmlChannels(collMeta.PhysicalChannelNames...)
-	aliases := c.s.meta.ListAliasesByID(collMeta.CollectionID)
 
 	redo := newBaseRedoTask(c.s.stepExecutor)
-	redo.AddAsyncStep(&expireCacheStep{
-		baseStep:        baseStep{core: c.s},
-		collectionNames: append(aliases, collMeta.Name),
-		collectionID:    collMeta.CollectionID,
-		ts:              ts,
-		opts:            []expireCacheOpt{expireCacheWithDropFlag()},
-	})
 	redo.AddAsyncStep(&releaseCollectionStep{
 		baseStep:     baseStep{core: c.s},
 		collectionID: collMeta.CollectionID,
@@ -58,6 +66,7 @@ func (c *bgGarbageCollector) ReDropCollection(collMeta *model.Collection, ts Tim
 		baseStep:  baseStep{core: c.s},
 		pChannels: collMeta.PhysicalChannelNames,
 	})
+	redo.AddAsyncStep(newConfirmGCStep(c.s, collMeta.CollectionID, allPartition))
 	redo.AddAsyncStep(&deleteCollectionMetaStep{
 		baseStep:     baseStep{core: c.s},
 		collectionID: collMeta.CollectionID,
@@ -99,16 +108,11 @@ func (c *bgGarbageCollector) RemoveCreatingCollection(collMeta *model.Collection
 	_ = redo.Execute(context.Background())
 }
 
-func (c *bgGarbageCollector) ReDropPartition(pChannels []string, partition *model.Partition, ts Timestamp) {
+func (c *bgGarbageCollector) ReDropPartition(dbID int64, pChannels []string, partition *model.Partition, ts Timestamp) {
 	// TODO: remove this after data gc can be notified by rpc.
 	c.s.chanTimeTick.addDmlChannels(pChannels...)
 
 	redo := newBaseRedoTask(c.s.stepExecutor)
-	redo.AddAsyncStep(&expireCacheStep{
-		baseStep:     baseStep{core: c.s},
-		collectionID: partition.CollectionID,
-		ts:           ts,
-	})
 	redo.AddAsyncStep(&deletePartitionDataStep{
 		baseStep:  baseStep{core: c.s},
 		pchans:    pChannels,
@@ -118,13 +122,10 @@ func (c *bgGarbageCollector) ReDropPartition(pChannels []string, partition *mode
 		baseStep:  baseStep{core: c.s},
 		pChannels: pChannels,
 	})
-	redo.AddAsyncStep(&dropIndexStep{
-		baseStep: baseStep{core: c.s},
-		collID:   partition.CollectionID,
-		partIDs:  []UniqueID{partition.PartitionID},
-	})
+	redo.AddAsyncStep(newConfirmGCStep(c.s, partition.CollectionID, partition.PartitionID))
 	redo.AddAsyncStep(&removePartitionMetaStep{
 		baseStep:     baseStep{core: c.s},
+		dbID:         dbID,
 		collectionID: partition.CollectionID,
 		partitionID:  partition.PartitionID,
 		// This ts is less than the ts when we notify data nodes to drop partition, but it's OK since we have already
@@ -137,6 +138,27 @@ func (c *bgGarbageCollector) ReDropPartition(pChannels []string, partition *mode
 	_ = redo.Execute(context.Background())
 }
 
+func (c *bgGarbageCollector) RemoveCreatingPartition(dbID int64, partition *model.Partition, ts Timestamp) {
+	redoTask := newBaseRedoTask(c.s.stepExecutor)
+
+	redoTask.AddAsyncStep(&releasePartitionsStep{
+		baseStep:     baseStep{core: c.s},
+		collectionID: partition.CollectionID,
+		partitionIDs: []int64{partition.PartitionID},
+	})
+
+	redoTask.AddAsyncStep(&removePartitionMetaStep{
+		baseStep:     baseStep{core: c.s},
+		dbID:         dbID,
+		collectionID: partition.CollectionID,
+		partitionID:  partition.PartitionID,
+		ts:           ts,
+	})
+
+	// err is ignored since no sync steps will be executed.
+	_ = redoTask.Execute(context.Background())
+}
+
 func (c *bgGarbageCollector) notifyCollectionGc(ctx context.Context, coll *model.Collection) (ddlTs Timestamp, err error) {
 	ts, err := c.s.tsoAllocator.GenerateTSO(1)
 	if err != nil {
@@ -144,15 +166,14 @@ func (c *bgGarbageCollector) notifyCollectionGc(ctx context.Context, coll *model
 	}
 
 	msgPack := ms.MsgPack{}
-	baseMsg := ms.BaseMsg{
-		Ctx:            ctx,
-		BeginTimestamp: ts,
-		EndTimestamp:   ts,
-		HashValues:     []uint32{0},
-	}
 	msg := &ms.DropCollectionMsg{
-		BaseMsg: baseMsg,
-		DropCollectionRequest: internalpb.DropCollectionRequest{
+		BaseMsg: ms.BaseMsg{
+			Ctx:            ctx,
+			BeginTimestamp: ts,
+			EndTimestamp:   ts,
+			HashValues:     []uint32{0},
+		},
+		DropCollectionRequest: msgpb.DropCollectionRequest{
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithMsgType(commonpb.MsgType_DropCollection),
 				commonpbutil.WithTimeStamp(ts),
@@ -177,15 +198,14 @@ func (c *bgGarbageCollector) notifyPartitionGc(ctx context.Context, pChannels []
 	}
 
 	msgPack := ms.MsgPack{}
-	baseMsg := ms.BaseMsg{
-		Ctx:            ctx,
-		BeginTimestamp: ts,
-		EndTimestamp:   ts,
-		HashValues:     []uint32{0},
-	}
 	msg := &ms.DropPartitionMsg{
-		BaseMsg: baseMsg,
-		DropPartitionRequest: internalpb.DropPartitionRequest{
+		BaseMsg: ms.BaseMsg{
+			Ctx:            ctx,
+			BeginTimestamp: ts,
+			EndTimestamp:   ts,
+			HashValues:     []uint32{0},
+		},
+		DropPartitionRequest: msgpb.DropPartitionRequest{
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithMsgType(commonpb.MsgType_DropPartition),
 				commonpbutil.WithTimeStamp(ts),

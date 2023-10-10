@@ -18,31 +18,30 @@ package importutil
 
 import (
 	"context"
-	"errors"
-	"strings"
+	"encoding/json"
+	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 type mockIDAllocator struct {
 	allocErr error
 }
 
-func (a *mockIDAllocator) AllocID(ctx context.Context, req *rootcoordpb.AllocIDRequest) (*rootcoordpb.AllocIDResponse, error) {
+func (a *mockIDAllocator) AllocID(ctx context.Context, req *rootcoordpb.AllocIDRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocIDResponse, error) {
 	return &rootcoordpb.AllocIDResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		ID:    int64(1),
-		Count: req.Count,
+		Status: merr.Status(nil),
+		ID:     int64(1),
+		Count:  req.Count,
 	}, a.allocErr
 }
 
@@ -52,351 +51,68 @@ func newIDAllocator(ctx context.Context, t *testing.T, allocErr error) *allocato
 	}
 
 	idAllocator, err := allocator.NewIDAllocator(ctx, mockIDAllocator, int64(1))
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = idAllocator.Start()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	return idAllocator
 }
 
-func Test_NewJSONRowValidator(t *testing.T) {
-	validator, err := NewJSONRowValidator(nil, nil)
-	assert.NotNil(t, err)
-	assert.Nil(t, validator)
+func Test_GetKeyValue(t *testing.T) {
+	fieldName := "dummy"
+	var obj1 interface{} = "aa"
+	val, err := getKeyValue(obj1, fieldName, true)
+	assert.Equal(t, val, "aa")
+	assert.NoError(t, err)
 
-	validator, err = NewJSONRowValidator(sampleSchema(), nil)
-	assert.NotNil(t, validator)
-	assert.Nil(t, err)
+	val, err = getKeyValue(obj1, fieldName, false)
+	assert.Empty(t, val)
+	assert.Error(t, err)
+
+	var obj2 interface{} = json.Number("10")
+	val, err = getKeyValue(obj2, fieldName, false)
+	assert.Equal(t, val, "10")
+	assert.NoError(t, err)
+
+	val, err = getKeyValue(obj2, fieldName, true)
+	assert.Empty(t, val)
+	assert.Error(t, err)
 }
 
-func Test_JSONRowValidator(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	schema := sampleSchema()
-	parser := NewJSONParser(ctx, schema)
-	assert.NotNil(t, parser)
-
-	// 0 row case
-	reader := strings.NewReader(`{
-		"rows":[]
-	}`)
-
-	validator, err := NewJSONRowValidator(schema, nil)
-	assert.NotNil(t, validator)
-	assert.Nil(t, err)
-
-	err = parser.ParseRows(reader, validator)
-	assert.NotNil(t, err)
-	assert.Equal(t, int64(0), validator.ValidateCount())
-
-	// missed some fields
-	reader = strings.NewReader(`{
-		"rows":[
-			{"field_bool": true, "field_int8": 10, "field_int16": 101, "field_int32": 1001, "field_int64": 10001, "field_float": 3.14, "field_double": 1.56, "field_string": "hello world", "field_binary_vector": [254, 0], "field_float_vector": [1.1, 1.2, 1.3, 1.4]},
-			{"field_int64": 10001, "field_float": 3.14, "field_double": 1.56, "field_string": "hello world", "field_binary_vector": [254, 0], "field_float_vector": [1.1, 1.2, 1.3, 1.4]}
-		]
-	}`)
-	err = parser.ParseRows(reader, validator)
-	assert.NotNil(t, err)
-
-	// invalid dimension
-	reader = strings.NewReader(`{
-		"rows":[
-			{"field_bool": true, "field_int8": true, "field_int16": 101, "field_int32": 1001, "field_int64": 10001, "field_float": 3.14, "field_double": 1.56, "field_string": "hello world", "field_binary_vector": [254, 0, 1, 66, 128, 0, 1, 66], "field_float_vector": [1.1, 1.2, 1.3, 1.4]}
-		]
-	}`)
-	err = parser.ParseRows(reader, validator)
-	assert.NotNil(t, err)
-
-	// invalid value type
-	reader = strings.NewReader(`{
-		"rows":[
-			{"field_bool": true, "field_int8": true, "field_int16": 101, "field_int32": 1001, "field_int64": 10001, "field_float": 3.14, "field_double": 1.56, "field_string": "hello world", "field_binary_vector": [254, 0], "field_float_vector": [1.1, 1.2, 1.3, 1.4]}
-		]
-	}`)
-	err = parser.ParseRows(reader, validator)
-	assert.NotNil(t, err)
-
-	// init failed
-	validator.validators = nil
-	err = validator.Handle(nil)
-	assert.NotNil(t, err)
-
-	// primary key is auto-generate, but user provide pk value, return error
-	schema = &schemapb.CollectionSchema{
-		Name:        "schema",
-		Description: "schema",
-		AutoID:      true,
-		Fields: []*schemapb.FieldSchema{
-			{
-				FieldID:      101,
-				Name:         "ID",
-				IsPrimaryKey: true,
-				AutoID:       true,
-				DataType:     schemapb.DataType_Int64,
-			},
-			{
-				FieldID:      102,
-				Name:         "Age",
-				IsPrimaryKey: false,
-				DataType:     schemapb.DataType_Int64,
-			},
-		},
-	}
-
-	validator, err = NewJSONRowValidator(schema, nil)
-	assert.NotNil(t, validator)
-	assert.Nil(t, err)
-
-	reader = strings.NewReader(`{
-		"rows":[
-			{"ID": 1, "Age": 2}
-		]
-	}`)
-	parser = NewJSONParser(ctx, schema)
-	err = parser.ParseRows(reader, validator)
-	assert.NotNil(t, err)
-}
-
-func Test_NewJSONRowConsumer(t *testing.T) {
-	// nil schema
-	consumer, err := NewJSONRowConsumer(nil, nil, 2, 16, nil)
-	assert.NotNil(t, err)
-	assert.Nil(t, consumer)
-
-	// wrong schema
-	schema := &schemapb.CollectionSchema{
-		Name:   "schema",
-		AutoID: true,
-		Fields: []*schemapb.FieldSchema{
-			{
-				FieldID:      101,
-				Name:         "uid",
-				IsPrimaryKey: true,
-				AutoID:       false,
-				DataType:     schemapb.DataType_None,
-			},
-		},
-	}
-	consumer, err = NewJSONRowConsumer(schema, nil, 2, 16, nil)
-	assert.NotNil(t, err)
-	assert.Nil(t, consumer)
-
-	// no primary key
-	schema.Fields[0].IsPrimaryKey = false
-	schema.Fields[0].DataType = schemapb.DataType_Int64
-	consumer, err = NewJSONRowConsumer(schema, nil, 2, 16, nil)
-	assert.NotNil(t, err)
-	assert.Nil(t, consumer)
-
-	// primary key is autoid, but no IDAllocator
-	schema.Fields[0].IsPrimaryKey = true
-	schema.Fields[0].AutoID = true
-	consumer, err = NewJSONRowConsumer(schema, nil, 2, 16, nil)
-	assert.NotNil(t, err)
-	assert.Nil(t, consumer)
-
-	// success
-	consumer, err = NewJSONRowConsumer(sampleSchema(), nil, 2, 16, nil)
-	assert.NotNil(t, consumer)
-	assert.Nil(t, err)
-}
-
-func Test_JSONRowConsumer(t *testing.T) {
+func Test_JSONRowConsumerNew(t *testing.T) {
 	ctx := context.Background()
-	idAllocator := newIDAllocator(ctx, t, nil)
 
-	schema := sampleSchema()
-	parser := NewJSONParser(ctx, schema)
-	assert.NotNil(t, parser)
-
-	reader := strings.NewReader(`{
-		"rows":[
-			{"field_bool": true, "field_int8": 10, "field_int16": 101, "field_int32": 1001, "field_int64": 10001, "field_float": 3.14, "field_double": 1.56, "field_string": "hello world", "field_binary_vector": [254, 0], "field_float_vector": [1.1, 1.2, 1.3, 1.4]},
-			{"field_bool": false, "field_int8": 11, "field_int16": 102, "field_int32": 1002, "field_int64": 10002, "field_float": 3.15, "field_double": 2.56, "field_string": "hello world", "field_binary_vector": [253, 0], "field_float_vector": [2.1, 2.2, 2.3, 2.4]},
-			{"field_bool": true, "field_int8": 12, "field_int16": 103, "field_int32": 1003, "field_int64": 10003, "field_float": 3.16, "field_double": 3.56, "field_string": "hello world", "field_binary_vector": [252, 0], "field_float_vector": [3.1, 3.2, 3.3, 3.4]},
-			{"field_bool": false, "field_int8": 13, "field_int16": 104, "field_int32": 1004, "field_int64": 10004, "field_float": 3.17, "field_double": 4.56, "field_string": "hello world", "field_binary_vector": [251, 0], "field_float_vector": [4.1, 4.2, 4.3, 4.4]},
-			{"field_bool": true, "field_int8": 14, "field_int16": 105, "field_int32": 1005, "field_int64": 10005, "field_float": 3.18, "field_double": 5.56, "field_string": "hello world", "field_binary_vector": [250, 0], "field_float_vector": [5.1, 5.2, 5.3, 5.4]}
-		]
-	}`)
-
-	var shardNum int32 = 2
-	var callTime int32
-	var totalCount int
-	consumeFunc := func(fields map[storage.FieldID]storage.FieldData, shard int) error {
-		assert.Equal(t, int(callTime), shard)
-		callTime++
-		rowCount := 0
-		for _, data := range fields {
-			if rowCount == 0 {
-				rowCount = data.RowNum()
-			} else {
-				assert.Equal(t, rowCount, data.RowNum())
-			}
-		}
-		totalCount += rowCount
-		return nil
-	}
-
-	consumer, err := NewJSONRowConsumer(schema, idAllocator, shardNum, 1, consumeFunc)
-	assert.NotNil(t, consumer)
-	assert.Nil(t, err)
-
-	validator, err := NewJSONRowValidator(schema, consumer)
-	assert.NotNil(t, validator)
-	assert.Nil(t, err)
-
-	err = parser.ParseRows(reader, validator)
-	assert.Nil(t, err)
-	assert.Equal(t, int64(5), validator.ValidateCount())
-
-	assert.Equal(t, shardNum, callTime)
-	assert.Equal(t, 5, totalCount)
-}
-
-func Test_JSONRowConsumerFlush(t *testing.T) {
-	var callTime int32
-	var totalCount int
-	flushFunc := func(fields map[storage.FieldID]storage.FieldData, shard int) error {
-		callTime++
-		field, ok := fields[101]
-		assert.True(t, ok)
-		assert.Greater(t, field.RowNum(), 0)
-		totalCount += field.RowNum()
-		return nil
-	}
-
-	schema := &schemapb.CollectionSchema{
-		Name:   "schema",
-		AutoID: true,
-		Fields: []*schemapb.FieldSchema{
-			{
-				FieldID:      101,
-				Name:         "uid",
-				IsPrimaryKey: true,
-				AutoID:       false,
-				DataType:     schemapb.DataType_Int64,
-			},
-		},
-	}
-
-	var shardNum int32 = 4
-	var blockSize int64 = 1
-	consumer, err := NewJSONRowConsumer(schema, nil, shardNum, blockSize, flushFunc)
-	assert.NotNil(t, consumer)
-	assert.Nil(t, err)
-
-	// force flush
-	rowCountEachShard := 100
-	for i := 0; i < int(shardNum); i++ {
-		pkFieldData := consumer.segmentsData[i][101].(*storage.Int64FieldData)
-		for j := 0; j < rowCountEachShard; j++ {
-			pkFieldData.Data = append(pkFieldData.Data, int64(j))
-		}
-		pkFieldData.NumRows = []int64{int64(rowCountEachShard)}
-	}
-
-	err = consumer.flush(true)
-	assert.Nil(t, err)
-	assert.Equal(t, shardNum, callTime)
-	assert.Equal(t, rowCountEachShard*int(shardNum), totalCount)
-
-	// execeed block size trigger flush
-	callTime = 0
-	totalCount = 0
-	for i := 0; i < int(shardNum); i++ {
-		consumer.segmentsData[i] = initSegmentData(schema)
-		if i%2 == 0 {
-			continue
-		}
-		pkFieldData := consumer.segmentsData[i][101].(*storage.Int64FieldData)
-		for j := 0; j < rowCountEachShard; j++ {
-			pkFieldData.Data = append(pkFieldData.Data, int64(j))
-		}
-		pkFieldData.NumRows = []int64{int64(rowCountEachShard)}
-	}
-	err = consumer.flush(true)
-	assert.Nil(t, err)
-	assert.Equal(t, shardNum/2, callTime)
-	assert.Equal(t, rowCountEachShard*int(shardNum)/2, totalCount)
-}
-
-func Test_JSONRowConsumerHandle(t *testing.T) {
-	ctx := context.Background()
-	idAllocator := newIDAllocator(ctx, t, errors.New("error"))
-
-	var callTime int32
-	flushFunc := func(fields map[storage.FieldID]storage.FieldData, shard int) error {
-		callTime++
-		return errors.New("dummy error")
-	}
-
-	schema := &schemapb.CollectionSchema{
-		Name:   "schema",
-		AutoID: true,
-		Fields: []*schemapb.FieldSchema{
-			{
-				FieldID:      101,
-				Name:         "uid",
-				IsPrimaryKey: true,
-				AutoID:       true,
-				DataType:     schemapb.DataType_Int64,
-			},
-		},
-	}
-
-	t.Run("handle int64 pk", func(t *testing.T) {
-		consumer, err := NewJSONRowConsumer(schema, idAllocator, 1, 1, flushFunc)
-		assert.NotNil(t, consumer)
-		assert.Nil(t, err)
-
-		pkFieldData := consumer.segmentsData[0][101].(*storage.Int64FieldData)
-		for i := 0; i < 10; i++ {
-			pkFieldData.Data = append(pkFieldData.Data, int64(i))
-		}
-		pkFieldData.NumRows = []int64{int64(10)}
-
-		// nil input will trigger flush
-		err = consumer.Handle(nil)
-		assert.NotNil(t, err)
-		assert.Equal(t, int32(1), callTime)
-
-		// optional flush
-		callTime = 0
-		rowCount := 100
-		pkFieldData = consumer.segmentsData[0][101].(*storage.Int64FieldData)
-		for j := 0; j < rowCount; j++ {
-			pkFieldData.Data = append(pkFieldData.Data, int64(j))
-		}
-		pkFieldData.NumRows = []int64{int64(rowCount)}
-
-		input := make([]map[storage.FieldID]interface{}, rowCount)
-		for j := 0; j < rowCount; j++ {
-			input[j] = make(map[int64]interface{})
-			input[j][101] = int64(j)
-		}
-		err = consumer.Handle(input)
-		assert.NotNil(t, err)
-		assert.Equal(t, int32(1), callTime)
-
-		// failed to auto-generate pk
-		consumer.blockSize = 1024 * 1024
-		err = consumer.Handle(input)
-		assert.NotNil(t, err)
-
-		// hash int64 pk
-		consumer.rowIDAllocator = newIDAllocator(ctx, t, nil)
-		err = consumer.Handle(input)
-		assert.Nil(t, err)
-		assert.Equal(t, int64(rowCount), consumer.rowCounter)
-		assert.Equal(t, 2, len(consumer.autoIDRange))
-		assert.Equal(t, int64(1), consumer.autoIDRange[0])
-		assert.Equal(t, int64(1+rowCount), consumer.autoIDRange[1])
+	t.Run("nil schema", func(t *testing.T) {
+		consumer, err := NewJSONRowConsumer(ctx, nil, nil, 16, nil)
+		assert.Error(t, err)
+		assert.Nil(t, consumer)
 	})
 
-	t.Run("handle varchar pk", func(t *testing.T) {
-		schema = &schemapb.CollectionSchema{
+	t.Run("wrong schema", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Name:   "schema",
+			AutoID: true,
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      101,
+					Name:         "uid",
+					IsPrimaryKey: true,
+					AutoID:       false,
+					DataType:     schemapb.DataType_Int64,
+				},
+			},
+		}
+		collectionInfo, err := NewCollectionInfo(schema, 2, []int64{1})
+		assert.NoError(t, err)
+
+		schema.Fields[0].DataType = schemapb.DataType_None
+		consumer, err := NewJSONRowConsumer(ctx, collectionInfo, nil, 16, nil)
+		assert.Error(t, err)
+		assert.Nil(t, consumer)
+	})
+
+	t.Run("primary key is autoid but no IDAllocator", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
 			Name:   "schema",
 			AutoID: true,
 			Fields: []*schemapb.FieldSchema{
@@ -405,165 +121,543 @@ func Test_JSONRowConsumerHandle(t *testing.T) {
 					Name:         "uid",
 					IsPrimaryKey: true,
 					AutoID:       true,
-					DataType:     schemapb.DataType_VarChar,
-					TypeParams: []*commonpb.KeyValuePair{
-						{Key: "max_length", Value: "1024"},
-					},
+					DataType:     schemapb.DataType_Int64,
 				},
 			},
 		}
+		collectionInfo, err := NewCollectionInfo(schema, 2, []int64{1})
+		assert.NoError(t, err)
 
-		idAllocator := newIDAllocator(ctx, t, nil)
-		consumer, err := NewJSONRowConsumer(schema, idAllocator, 1, 1024*1024, flushFunc)
+		consumer, err := NewJSONRowConsumer(ctx, collectionInfo, nil, 16, nil)
+		assert.Error(t, err)
+		assert.Nil(t, consumer)
+	})
+
+	t.Run("succeed", func(t *testing.T) {
+		collectionInfo, err := NewCollectionInfo(sampleSchema(), 2, []int64{1})
+		assert.NoError(t, err)
+		consumer, err := NewJSONRowConsumer(ctx, collectionInfo, nil, 16, nil)
 		assert.NotNil(t, consumer)
-		assert.Nil(t, err)
-
-		rowCount := 100
-		input := make([]map[storage.FieldID]interface{}, rowCount)
-		for j := 0; j < rowCount; j++ {
-			input[j] = make(map[int64]interface{})
-			input[j][101] = "abc"
-		}
-
-		// varchar pk cannot be autoid
-		err = consumer.Handle(input)
-		assert.NotNil(t, err)
-
-		// hash varchar pk
-		schema.Fields[0].AutoID = false
-		consumer, err = NewJSONRowConsumer(schema, idAllocator, 1, 1024*1024, flushFunc)
-		assert.NotNil(t, consumer)
-		assert.Nil(t, err)
-
-		err = consumer.Handle(input)
-		assert.Nil(t, err)
-		assert.Equal(t, int64(rowCount), consumer.rowCounter)
-		assert.Equal(t, 0, len(consumer.autoIDRange))
+		assert.NoError(t, err)
 	})
 }
 
-func Test_JSONRowConsumerStringKey(t *testing.T) {
+func Test_JSONRowConsumerHandleIntPK(t *testing.T) {
 	ctx := context.Background()
-	idAllocator := newIDAllocator(ctx, t, nil)
 
-	schema := strKeySchema()
-	parser := NewJSONParser(ctx, schema)
-	assert.NotNil(t, parser)
+	t.Run("nil input", func(t *testing.T) {
+		var consumer *JSONRowConsumer
+		err := consumer.Handle(nil)
+		assert.Error(t, err)
+	})
 
-	reader := strings.NewReader(`{
-		"rows": [{
-				"uid": "Dm4aWrbNzhmjwCTEnCJ9LDPO2N09sqysxgVfbH9Zmn3nBzmwsmk0eZN6x7wSAoPQ",
-				"int_scalar": 9070353,
-				"float_scalar": 0.9798043638085004,
-				"string_scalar": "ShQ44OX0z8kGpRPhaXmfSsdH7JHq5DsZzu0e2umS1hrWG0uONH2RIIAdOECaaXir",
-				"bool_scalar": true,
-				"vectors": [0.5040062902126952, 0.8297619818664708, 0.20248342801564806, 0.12834786423659314]
+	schema := &schemapb.CollectionSchema{
+		Name: "schema",
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      101,
+				Name:         "FieldInt64",
+				IsPrimaryKey: true,
+				AutoID:       true,
+				DataType:     schemapb.DataType_Int64,
 			},
 			{
-				"uid": "RP50U0d2napRjXu94a8oGikWgklvVsXFurp8RR4tHGw7N0gk1b7opm59k3FCpyPb",
-				"int_scalar": 8505288,
-				"float_scalar": 0.937913432198687,
-				"string_scalar": "Ld4b0avxathBdNvCrtm3QsWO1pYktUVR7WgAtrtozIwrA8vpeactNhJ85CFGQnK5",
-				"bool_scalar": false,
-				"vectors": [0.528232122836893, 0.6916116750653186, 0.41443762522548705, 0.26624344144792056]
+				FieldID:  102,
+				Name:     "FieldVarchar",
+				DataType: schemapb.DataType_VarChar,
 			},
 			{
-				"uid": "oxhFkQitWPPw0Bjmj7UQcn4iwvS0CU7RLAC81uQFFQjWtOdiB329CPyWkfGSeYfE",
-				"int_scalar": 4392660,
-				"float_scalar": 0.32381232630490264,
-				"string_scalar": "EmAlB0xdQcxeBtwlZJQnLgKodiuRinynoQtg0eXrjkq24dQohzSm7Bx3zquHd3kO",
-				"bool_scalar": false,
-				"vectors": [0.7978693027281338, 0.12394906726785092, 0.42431962903815285, 0.4098707807351914]
+				FieldID:  103,
+				Name:     "FieldFloat",
+				DataType: schemapb.DataType_Float,
 			},
-			{
-				"uid": "sxoEL4Mpk1LdsyXhbNm059UWJ3CvxURLCQczaVI5xtBD4QcVWTDFUW7dBdye6nbn",
-				"int_scalar": 7927425,
-				"float_scalar": 0.31074026464844895,
-				"string_scalar": "fdY2beCvs1wSws0Gb9ySD92xwfEfJpX5DQgsWoISylBAoYOcXpRaqIJoXYS4g269",
-				"bool_scalar": true,
-				"vectors": [0.3716157812069954, 0.006981281113265229, 0.9007003458552365, 0.22492634316191004]
-			},
-			{
-				"uid": "g33Rqq2UQSHPRHw5FvuXxf5uGEhIAetxE6UuXXCJj0hafG8WuJr1ueZftsySCqAd",
-				"int_scalar": 9288807,
-				"float_scalar": 0.4953578200336135,
-				"string_scalar": "6f8Iv1zQAGksj5XxMbbI5evTrYrB8fSFQ58jl0oU7Z4BpA81VsD2tlWqkhfoBNa7",
-				"bool_scalar": false,
-				"vectors": [0.5921374209648096, 0.04234832587925662, 0.7803878096531548, 0.1964045837884633]
-			},
-			{
-				"uid": "ACIJd7lTXkRgUNmlQk6AbnWIKEEV8Z6OS3vDcm0w9psmt9sH3z1JLg1fNVCqiX3d",
-				"int_scalar": 1173595,
-				"float_scalar": 0.9000745450802002,
-				"string_scalar": "gpj9YctF2ig1l1APkvRzHbVE8PZVKRbk7nvW73qS2uQbY5l7MeIeTPwRBjasbY8z",
-				"bool_scalar": true,
-				"vectors": [0.4655121736168688, 0.6195496905333787, 0.5316616196326639, 0.3417492053890768]
-			},
-			{
-				"uid": "f0wRVZZ9u1bEKrAjLeZj3oliEnUjBiUl6TiermeczceBmGe6M2RHONgz3qEogrd5",
-				"int_scalar": 3722368,
-				"float_scalar": 0.7212299175768438,
-				"string_scalar": "xydiejGUlvS49BfBuy1EuYRKt3v2oKwC6pqy7Ga4dGWn3BnQigV4XAGawixDAGHN",
-				"bool_scalar": false,
-				"vectors": [0.6173164237304075, 0.374107748459483, 0.3686321416317251, 0.585725336391797]
-			},
-			{
-				"uid": "uXq9q96vUqnDebcUISFkRFT27OjD89DWhok6urXIjTuLzaSWnCVTJkrJXxFctSg0",
-				"int_scalar": 1940731,
-				"float_scalar": 0.9524404085944204,
-				"string_scalar": "ZXSNzR5V3t62fjop7b7DHK56ByAF0INYwycKsu6OxGP4p2j0Obs6l0NUqukypGXd",
-				"bool_scalar": false,
-				"vectors": [0.07178869784465443, 0.4208459174227864, 0.5882811425075762, 0.6867753592116734]
-			},
-			{
-				"uid": "EXDDklLvQIfeCJN8cES3b9mdCYDQVhq2iLj8WWA3TPtZ1SZ4Jpidj7OXJidSD7Wn",
-				"int_scalar": 2158426,
-				"float_scalar": 0.23770219927963454,
-				"string_scalar": "9TNeKVSMqTP8Zxs90kaAcB7n6JbIcvFWInzi9JxZQgmYxD5xLYwaCoeUzRiNAxAg",
-				"bool_scalar": false,
-				"vectors": [0.5659468293534021, 0.6275816433340369, 0.3978846871291008, 0.3571179679645908]
-			},
-			{
-				"uid": "mlaXOgYvB88WWRpXNyWv6UqpmvIHrC6pRo03AtaPLMpVymu0L9ioO8GWa1XgGyj0",
-				"int_scalar": 198279,
-				"float_scalar": 0.020343767010139513,
-				"string_scalar": "AblYGRZJiMAwDbMEkungG0yKTeuya4FgyliakWWqSOJ5TvQWB9Ki2WXbnvSsYIDF",
-				"bool_scalar": true,
-				"vectors": [0.5374636140212398, 0.7655373567912009, 0.05491796821609715, 0.349384366747262]
-			}
-		]
-	}`)
-
-	var shardNum int32 = 2
-	var callTime int32
-	var totalCount int
-	consumeFunc := func(fields map[storage.FieldID]storage.FieldData, shard int) error {
-		assert.Equal(t, int(callTime), shard)
-		callTime++
-		rowCount := 0
-		for _, data := range fields {
-			if rowCount == 0 {
-				rowCount = data.RowNum()
-			} else {
-				assert.Equal(t, rowCount, data.RowNum())
-			}
-		}
-		totalCount += rowCount
-		return nil
+		},
 	}
 
-	consumer, err := NewJSONRowConsumer(schema, idAllocator, shardNum, 1, consumeFunc)
+	createConsumeFunc := func(shardNum int32, partitionIDs []int64, flushFunc ImportFlushFunc) *JSONRowConsumer {
+		collectionInfo, err := NewCollectionInfo(schema, shardNum, partitionIDs)
+		assert.NoError(t, err)
+
+		idAllocator := newIDAllocator(ctx, t, nil)
+		consumer, err := NewJSONRowConsumer(ctx, collectionInfo, idAllocator, 1, flushFunc)
+		assert.NotNil(t, consumer)
+		assert.NoError(t, err)
+
+		return consumer
+	}
+
+	t.Run("auto pk no partition key", func(t *testing.T) {
+		flushErrFunc := func(fields BlockData, shard int, partID int64) error {
+			return errors.New("dummy error")
+		}
+
+		// rows to input
+		intputRowCount := 100
+		input := make([]map[storage.FieldID]interface{}, intputRowCount)
+		for j := 0; j < intputRowCount; j++ {
+			input[j] = map[int64]interface{}{
+				102: "string",
+				103: json.Number("6.18"),
+			}
+		}
+
+		shardNum := int32(2)
+		partitionID := int64(1)
+		consumer := createConsumeFunc(shardNum, []int64{partitionID}, flushErrFunc)
+		consumer.rowIDAllocator = newIDAllocator(ctx, t, errors.New("error"))
+
+		waitFlushRowCount := 10
+		fieldsData := createFieldsData(schema, waitFlushRowCount)
+		consumer.shardsData = createShardsData(schema, fieldsData, shardNum, []int64{partitionID})
+
+		// nil input will trigger force flush, flushErrFunc returns error
+		err := consumer.Handle(nil)
+		assert.Error(t, err)
+
+		// optional flush, flushErrFunc returns error
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+
+		// reset flushFunc
+		var callTime int32
+		var flushedRowCount int
+		consumer.callFlushFunc = func(fields BlockData, shard int, partID int64) error {
+			callTime++
+			assert.Less(t, int32(shard), shardNum)
+			assert.Equal(t, partitionID, partID)
+			assert.Greater(t, len(fields), 0)
+			for _, v := range fields {
+				assert.Greater(t, v.RowNum(), 0)
+			}
+			flushedRowCount += fields[102].RowNum()
+			return nil
+		}
+
+		// optional flush succeed, each shard has 10 rows, idErrAllocator returns error
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+		assert.Equal(t, waitFlushRowCount*int(shardNum), flushedRowCount)
+		assert.Equal(t, shardNum, callTime)
+
+		// optional flush again, large blockSize, nothing flushed, idAllocator returns error
+		callTime = int32(0)
+		flushedRowCount = 0
+		consumer.shardsData = createShardsData(schema, fieldsData, shardNum, []int64{partitionID})
+		consumer.rowIDAllocator = nil
+		consumer.blockSize = 8 * 1024 * 1024
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+		assert.Equal(t, 0, flushedRowCount)
+		assert.Equal(t, int32(0), callTime)
+
+		// idAllocator is ok, consume 100 rows, the previous shardsData(10 rows per shard) is flushed
+		callTime = int32(0)
+		flushedRowCount = 0
+		consumer.blockSize = 1
+		consumer.rowIDAllocator = newIDAllocator(ctx, t, nil)
+		err = consumer.Handle(input)
+		assert.NoError(t, err)
+		assert.Equal(t, waitFlushRowCount*int(shardNum), flushedRowCount)
+		assert.Equal(t, shardNum, callTime)
+		assert.Equal(t, int64(intputRowCount), consumer.RowCount())
+		assert.Equal(t, 2, len(consumer.IDRange()))
+		assert.Equal(t, int64(1), consumer.IDRange()[0])
+		assert.Equal(t, int64(1+intputRowCount), consumer.IDRange()[1])
+
+		// call handle again, the 100 rows are flushed
+		callTime = int32(0)
+		flushedRowCount = 0
+		err = consumer.Handle(nil)
+		assert.NoError(t, err)
+		assert.Equal(t, intputRowCount, flushedRowCount)
+		assert.Equal(t, shardNum, callTime)
+	})
+
+	schema.Fields[0].AutoID = false
+	t.Run("manual pk no partition key", func(t *testing.T) {
+		shardNum := int32(1)
+		partitionID := int64(100)
+
+		var callTime int32
+		var flushedRowCount int
+		flushFunc := func(fields BlockData, shard int, partID int64) error {
+			callTime++
+			assert.Less(t, int32(shard), shardNum)
+			assert.Equal(t, partitionID, partID)
+			assert.Greater(t, len(fields), 0)
+			flushedRowCount += fields[102].RowNum()
+			return nil
+		}
+
+		consumer := createConsumeFunc(shardNum, []int64{partitionID}, flushFunc)
+
+		// failed to parse primary key
+		input := make([]map[storage.FieldID]interface{}, 1)
+		input[0] = map[int64]interface{}{
+			101: int64(99),
+			102: "string",
+			103: 11.11,
+		}
+
+		err := consumer.Handle(input)
+		assert.Error(t, err)
+
+		// failed to convert pk to int value
+		input[0] = map[int64]interface{}{
+			101: json.Number("a"),
+			102: "string",
+			103: 11.11,
+		}
+
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+
+		// failed to hash to partition
+		input[0] = map[int64]interface{}{
+			101: json.Number("99"),
+			102: "string",
+			103: json.Number("4.56"),
+		}
+		consumer.collectionInfo.PartitionIDs = nil
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+		consumer.collectionInfo.PartitionIDs = []int64{partitionID}
+
+		// failed to convert value
+		input[0] = map[int64]interface{}{
+			101: json.Number("99"),
+			102: "string",
+			103: json.Number("abc.56"),
+		}
+
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+		consumer.shardsData = createShardsData(schema, nil, shardNum, []int64{partitionID}) // in-memory data is dirty, reset
+
+		// succeed, consume 1 row
+		input[0] = map[int64]interface{}{
+			101: json.Number("99"),
+			102: "string",
+			103: json.Number("4.56"),
+		}
+
+		err = consumer.Handle(input)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), consumer.RowCount())
+		assert.Equal(t, 0, len(consumer.IDRange()))
+
+		// call handle again, the 1 row is flushed
+		callTime = int32(0)
+		flushedRowCount = 0
+		err = consumer.Handle(nil)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, flushedRowCount)
+		assert.Equal(t, shardNum, callTime)
+	})
+
+	schema.Fields[1].IsPartitionKey = true
+	t.Run("manual pk with partition key", func(t *testing.T) {
+		// 10 partitions
+		partitionIDs := make([]int64, 0)
+		for j := 0; j < 10; j++ {
+			partitionIDs = append(partitionIDs, int64(j))
+		}
+
+		shardNum := int32(2)
+		var flushedRowCount int
+		flushFunc := func(fields BlockData, shard int, partID int64) error {
+			assert.Less(t, int32(shard), shardNum)
+			assert.Contains(t, partitionIDs, partID)
+			assert.Greater(t, len(fields), 0)
+			flushedRowCount += fields[102].RowNum()
+			return nil
+		}
+
+		consumer := createConsumeFunc(shardNum, partitionIDs, flushFunc)
+
+		// rows to input
+		intputRowCount := 100
+		input := make([]map[storage.FieldID]interface{}, intputRowCount)
+		for j := 0; j < intputRowCount; j++ {
+			input[j] = map[int64]interface{}{
+				101: json.Number(strconv.Itoa(j)),
+				102: "partitionKey_" + strconv.Itoa(j),
+				103: json.Number("6.18"),
+			}
+		}
+
+		// 100 rows are consumed to different partitions
+		err := consumer.Handle(input)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(intputRowCount), consumer.RowCount())
+
+		// call handle again, 100 rows are flushed
+		flushedRowCount = 0
+		err = consumer.Handle(nil)
+		assert.NoError(t, err)
+		assert.Equal(t, intputRowCount, flushedRowCount)
+	})
+}
+
+func Test_JSONRowConsumerHandleVarcharPK(t *testing.T) {
+	ctx := context.Background()
+
+	schema := &schemapb.CollectionSchema{
+		Name: "schema",
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      101,
+				Name:         "FieldVarchar",
+				IsPrimaryKey: true,
+				AutoID:       false,
+				DataType:     schemapb.DataType_VarChar,
+			},
+			{
+				FieldID:  102,
+				Name:     "FieldInt64",
+				DataType: schemapb.DataType_Int64,
+			},
+			{
+				FieldID:  103,
+				Name:     "FieldFloat",
+				DataType: schemapb.DataType_Float,
+			},
+		},
+	}
+
+	createConsumeFunc := func(shardNum int32, partitionIDs []int64, flushFunc ImportFlushFunc) *JSONRowConsumer {
+		collectionInfo, err := NewCollectionInfo(schema, shardNum, partitionIDs)
+		assert.NoError(t, err)
+
+		idAllocator := newIDAllocator(ctx, t, nil)
+		consumer, err := NewJSONRowConsumer(ctx, collectionInfo, idAllocator, 1, flushFunc)
+		assert.NotNil(t, consumer)
+		assert.NoError(t, err)
+
+		return consumer
+	}
+
+	t.Run("no partition key", func(t *testing.T) {
+		shardNum := int32(2)
+		partitionID := int64(1)
+		var callTime int32
+		var flushedRowCount int
+		flushFunc := func(fields BlockData, shard int, partID int64) error {
+			callTime++
+			assert.Less(t, int32(shard), shardNum)
+			assert.Equal(t, partitionID, partID)
+			assert.Greater(t, len(fields), 0)
+			for _, v := range fields {
+				assert.Greater(t, v.RowNum(), 0)
+			}
+			flushedRowCount += fields[102].RowNum()
+			return nil
+		}
+
+		consumer := createConsumeFunc(shardNum, []int64{partitionID}, flushFunc)
+		consumer.shardsData = createShardsData(schema, nil, shardNum, []int64{partitionID})
+
+		// string type primary key cannot be auto-generated
+		input := make([]map[storage.FieldID]interface{}, 1)
+		input[0] = map[int64]interface{}{
+			101: true,
+			102: json.Number("1"),
+			103: json.Number("1.56"),
+		}
+		consumer.collectionInfo.PrimaryKey.AutoID = true
+		err := consumer.Handle(input)
+		assert.Error(t, err)
+		consumer.collectionInfo.PrimaryKey.AutoID = false
+
+		// failed to parse primary key
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+
+		// failed to hash to partition
+		input[0] = map[int64]interface{}{
+			101: "primaryKey_0",
+			102: json.Number("1"),
+			103: json.Number("1.56"),
+		}
+		consumer.collectionInfo.PartitionIDs = nil
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+		consumer.collectionInfo.PartitionIDs = []int64{partitionID}
+
+		// rows to input
+		intputRowCount := 100
+		input = make([]map[storage.FieldID]interface{}, intputRowCount)
+		for j := 0; j < intputRowCount; j++ {
+			input[j] = map[int64]interface{}{
+				101: "primaryKey_" + strconv.Itoa(j),
+				102: json.Number(strconv.Itoa(j)),
+				103: json.Number("0.618"),
+			}
+		}
+
+		// rows are consumed
+		err = consumer.Handle(input)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(intputRowCount), consumer.RowCount())
+		assert.Equal(t, 0, len(consumer.IDRange()))
+
+		// call handle again, 100 rows are flushed
+		err = consumer.Handle(nil)
+		assert.NoError(t, err)
+		assert.Equal(t, intputRowCount, flushedRowCount)
+		assert.Equal(t, shardNum, callTime)
+	})
+
+	schema.Fields[1].IsPartitionKey = true
+	t.Run("has partition key", func(t *testing.T) {
+		// 10 partitions
+		partitionIDs := make([]int64, 0)
+		for j := 0; j < 10; j++ {
+			partitionIDs = append(partitionIDs, int64(j))
+		}
+
+		shardNum := int32(2)
+		var flushedRowCount int
+		flushFunc := func(fields BlockData, shard int, partID int64) error {
+			assert.Less(t, int32(shard), shardNum)
+			assert.Contains(t, partitionIDs, partID)
+			assert.Greater(t, len(fields), 0)
+			flushedRowCount += fields[102].RowNum()
+			return nil
+		}
+
+		consumer := createConsumeFunc(shardNum, partitionIDs, flushFunc)
+
+		// rows to input
+		intputRowCount := 100
+		input := make([]map[storage.FieldID]interface{}, intputRowCount)
+		for j := 0; j < intputRowCount; j++ {
+			input[j] = map[int64]interface{}{
+				101: "primaryKey_" + strconv.Itoa(j),
+				102: json.Number(strconv.Itoa(j)),
+				103: json.Number("0.618"),
+			}
+		}
+
+		// 100 rows are consumed to different partitions
+		err := consumer.Handle(input)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(intputRowCount), consumer.RowCount())
+
+		// call handle again, 100 rows are flushed
+		flushedRowCount = 0
+		err = consumer.Handle(nil)
+		assert.NoError(t, err)
+		assert.Equal(t, intputRowCount, flushedRowCount)
+
+		// string type primary key cannot be auto-generated
+		consumer.validators[101].autoID = true
+		err = consumer.Handle(input)
+		assert.Error(t, err)
+	})
+}
+
+func Test_JSONRowHashToPartition(t *testing.T) {
+	ctx := context.Background()
+
+	schema := &schemapb.CollectionSchema{
+		Name: "schema",
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      100,
+				Name:         "ID",
+				IsPrimaryKey: true,
+				AutoID:       false,
+				DataType:     schemapb.DataType_Int64,
+			},
+			{
+				FieldID:  101,
+				Name:     "FieldVarchar",
+				DataType: schemapb.DataType_VarChar,
+			},
+			{
+				FieldID:  102,
+				Name:     "FieldInt64",
+				DataType: schemapb.DataType_Int64,
+			},
+		},
+	}
+
+	partitionID := int64(1)
+	collectionInfo, err := NewCollectionInfo(schema, 2, []int64{partitionID})
+	assert.NoError(t, err)
+	consumer, err := NewJSONRowConsumer(ctx, collectionInfo, nil, 16, nil)
+	assert.NoError(t, err)
 	assert.NotNil(t, consumer)
-	assert.Nil(t, err)
 
-	validator, err := NewJSONRowValidator(schema, consumer)
-	assert.NotNil(t, validator)
-	assert.Nil(t, err)
+	input := make(map[int64]interface{})
+	input[100] = int64(1)
+	input[101] = "abc"
+	input[102] = int64(100)
 
-	err = parser.ParseRows(reader, validator)
-	assert.Nil(t, err)
-	assert.Equal(t, int64(10), validator.ValidateCount())
+	t.Run("no partition key", func(t *testing.T) {
+		partID, err := consumer.hashToPartition(input, 0)
+		assert.NoError(t, err)
+		assert.Equal(t, partitionID, partID)
+	})
 
-	assert.Equal(t, shardNum, callTime)
-	assert.Equal(t, 10, totalCount)
+	t.Run("partition list is empty", func(t *testing.T) {
+		collectionInfo.PartitionIDs = []int64{}
+		partID, err := consumer.hashToPartition(input, 0)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), partID)
+		collectionInfo.PartitionIDs = []int64{partitionID}
+	})
+
+	schema.Fields[1].IsPartitionKey = true
+	err = collectionInfo.resetSchema(schema)
+	assert.NoError(t, err)
+	collectionInfo.PartitionIDs = []int64{1, 2, 3}
+
+	t.Run("varchar partition key", func(t *testing.T) {
+		input := make(map[int64]interface{})
+		input[100] = int64(1)
+		input[101] = true
+		input[102] = int64(100)
+
+		// getKeyValue failed
+		partID, err := consumer.hashToPartition(input, 0)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), partID)
+
+		// succeed
+		input[101] = "abc"
+		partID, err = consumer.hashToPartition(input, 0)
+		assert.NoError(t, err)
+		assert.Contains(t, collectionInfo.PartitionIDs, partID)
+	})
+
+	schema.Fields[1].IsPartitionKey = false
+	schema.Fields[2].IsPartitionKey = true
+	err = collectionInfo.resetSchema(schema)
+	assert.NoError(t, err)
+
+	t.Run("int64 partition key", func(t *testing.T) {
+		input := make(map[int64]interface{})
+		input[100] = int64(1)
+		input[101] = "abc"
+		input[102] = 100
+
+		// getKeyValue failed
+		partID, err := consumer.hashToPartition(input, 0)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), partID)
+
+		// parse int failed
+		input[102] = json.Number("d")
+		partID, err = consumer.hashToPartition(input, 0)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), partID)
+
+		// succeed
+		input[102] = json.Number("100")
+		partID, err = consumer.hashToPartition(input, 0)
+		assert.NoError(t, err)
+		assert.Contains(t, collectionInfo.PartitionIDs, partID)
+	})
 }

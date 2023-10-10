@@ -1,37 +1,48 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 package proxy
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/internal/util/autoindex"
-	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/types"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-
-	"github.com/milvus-io/milvus/internal/util/distance"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/timerecord"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-)
-
-const (
-	testShardsNum = int32(2)
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 func TestSearchTask_PostExecute(t *testing.T) {
@@ -45,26 +56,25 @@ func TestSearchTask_PostExecute(t *testing.T) {
 			SearchRequest: &internalpb.SearchRequest{
 				Base: &commonpb.MsgBase{
 					MsgType:  commonpb.MsgType_Search,
-					SourceID: Params.ProxyCfg.GetNodeID(),
+					SourceID: paramtable.GetNodeID(),
 				},
 			},
 			request: nil,
 			qc:      nil,
 			tr:      timerecord.NewTimeRecorder("search"),
 
-			resultBuf:       make(chan *internalpb.SearchResults, 10),
-			toReduceResults: make([]*internalpb.SearchResults, 0),
+			resultBuf: &typeutil.ConcurrentSet[*internalpb.SearchResults]{},
 		}
 		// no result
-		qt.resultBuf <- &internalpb.SearchResults{}
+		qt.resultBuf.Insert(&internalpb.SearchResults{})
 
 		err := qt.PostExecute(context.TODO())
 		assert.NoError(t, err)
-		assert.Equal(t, qt.result.Status.ErrorCode, commonpb.ErrorCode_Success)
+		assert.Equal(t, qt.result.GetStatus().GetErrorCode(), commonpb.ErrorCode_Success)
 	})
 }
 
-func createColl(t *testing.T, name string, rc types.RootCoord) {
+func createColl(t *testing.T, name string, rc types.RootCoordClient) {
 	schema := constructCollectionSchema(testInt64Field, testFloatVecField, testVecDim, name)
 	marshaledSchema, err := proto.Marshal(schema)
 	require.NoError(t, err)
@@ -75,7 +85,7 @@ func createColl(t *testing.T, name string, rc types.RootCoord) {
 		CreateCollectionRequest: &milvuspb.CreateCollectionRequest{
 			CollectionName: name,
 			Schema:         marshaledSchema,
-			ShardsNum:      testShardsNum,
+			ShardsNum:      common.DefaultShardsNum,
 		},
 		ctx:       ctx,
 		rootCoord: rc,
@@ -85,6 +95,19 @@ func createColl(t *testing.T, name string, rc types.RootCoord) {
 	require.NoError(t, createColT.PreExecute(ctx))
 	require.NoError(t, createColT.Execute(ctx))
 	require.NoError(t, createColT.PostExecute(ctx))
+}
+
+func getBaseSearchParams() []*commonpb.KeyValuePair {
+	return []*commonpb.KeyValuePair{
+		{
+			Key:   AnnsFieldKey,
+			Value: testFloatVecField,
+		},
+		{
+			Key:   TopKKey,
+			Value: "10",
+		},
+	}
 }
 
 func getValidSearchParams() []*commonpb.KeyValuePair {
@@ -99,7 +122,7 @@ func getValidSearchParams() []*commonpb.KeyValuePair {
 		},
 		{
 			Key:   common.MetricTypeKey,
-			Value: distance.L2,
+			Value: metric.L2,
 		},
 		{
 			Key:   SearchParamsKey,
@@ -108,36 +131,44 @@ func getValidSearchParams() []*commonpb.KeyValuePair {
 		{
 			Key:   RoundDecimalKey,
 			Value: "-1",
-		}}
+		},
+		{
+			Key:   IgnoreGrowingKey,
+			Value: "false",
+		},
+	}
+}
+
+func getInvalidSearchParams(invalidName string) []*commonpb.KeyValuePair {
+	kvs := getValidSearchParams()
+	for _, kv := range kvs {
+		if kv.GetKey() == invalidName {
+			kv.Value = "invalid"
+		}
+	}
+	return kvs
 }
 
 func TestSearchTask_PreExecute(t *testing.T) {
 	var err error
 
-	Params.InitOnce()
 	var (
 		rc  = NewRootCoordMock()
-		qc  = NewQueryCoordMock()
+		qc  = mocks.NewMockQueryCoordClient(t)
 		ctx = context.TODO()
-
-		collectionName = t.Name() + funcutil.GenRandomStr()
 	)
 
-	err = rc.Start()
-	defer rc.Stop()
+	defer rc.Close()
 	require.NoError(t, err)
 	mgr := newShardClientMgr()
 	err = InitMetaCache(ctx, rc, qc, mgr)
 	require.NoError(t, err)
 
-	err = qc.Start()
-	defer qc.Stop()
-	require.NoError(t, err)
-
 	getSearchTask := func(t *testing.T, collName string) *searchTask {
 		task := &searchTask{
-			ctx:           ctx,
-			SearchRequest: &internalpb.SearchRequest{},
+			ctx:            ctx,
+			collectionName: collName,
+			SearchRequest:  &internalpb.SearchRequest{},
 			request: &milvuspb.SearchRequest{
 				CollectionName: collName,
 				Nq:             1,
@@ -149,12 +180,13 @@ func TestSearchTask_PreExecute(t *testing.T) {
 		return task
 	}
 
-	getSearchTaskWithNq := func(t *testing.T, nq int64) *searchTask {
+	getSearchTaskWithNq := func(t *testing.T, collName string, nq int64) *searchTask {
 		task := &searchTask{
-			ctx:           ctx,
-			SearchRequest: &internalpb.SearchRequest{},
+			ctx:            ctx,
+			collectionName: collName,
+			SearchRequest:  &internalpb.SearchRequest{},
 			request: &milvuspb.SearchRequest{
-				CollectionName: "collection name",
+				CollectionName: collName,
 				Nq:             nq,
 			},
 			qc: qc,
@@ -165,105 +197,44 @@ func TestSearchTask_PreExecute(t *testing.T) {
 	}
 
 	t.Run("bad nq 0", func(t *testing.T) {
+		collName := "test_bad_nq0_error" + funcutil.GenRandomStr()
+		createColl(t, collName, rc)
 		// Nq must be in range [1, 16384].
-		task := getSearchTaskWithNq(t, 0)
+		task := getSearchTaskWithNq(t, collName, 0)
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
 
 	t.Run("bad nq 16385", func(t *testing.T) {
+		collName := "test_bad_nq16385_error" + funcutil.GenRandomStr()
+		createColl(t, collName, rc)
+
 		// Nq must be in range [1, 16384].
-		task := getSearchTaskWithNq(t, 16384+1)
+		task := getSearchTaskWithNq(t, collName, 16384+1)
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
 
 	t.Run("collection not exist", func(t *testing.T) {
-		task := getSearchTask(t, collectionName)
+		collName := "test_collection_not_exist" + funcutil.GenRandomStr()
+		task := getSearchTask(t, collName)
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
 
-	t.Run("invalid collection name", func(t *testing.T) {
-		task := getSearchTask(t, collectionName)
-		createColl(t, collectionName, rc)
-
-		invalidCollNameTests := []struct {
-			inCollName  string
-			description string
-		}{
-			{"$", "invalid collection name $"},
-			{"0", "invalid collection name 0"},
-		}
-
-		for _, test := range invalidCollNameTests {
-			t.Run(test.description, func(t *testing.T) {
-				task.request.CollectionName = test.inCollName
-				assert.Error(t, task.PreExecute(context.TODO()))
-			})
-		}
-	})
-
-	t.Run("invalid partition names", func(t *testing.T) {
-		task := getSearchTask(t, collectionName)
-		createColl(t, collectionName, rc)
-
-		invalidCollNameTests := []struct {
-			inPartNames []string
-			description string
-		}{
-			{[]string{"$"}, "invalid partition name $"},
-			{[]string{"0"}, "invalid collection name 0"},
-			{[]string{"default", "$"}, "invalid empty partition name"},
-		}
-
-		for _, test := range invalidCollNameTests {
-			t.Run(test.description, func(t *testing.T) {
-				task.request.PartitionNames = test.inPartNames
-				assert.Error(t, task.PreExecute(context.TODO()))
-			})
-		}
-	})
-
-	t.Run("test checkIfLoaded error", func(t *testing.T) {
-		collName := "test_checkIfLoaded_error" + funcutil.GenRandomStr()
+	t.Run("invalid IgnoreGrowing param", func(t *testing.T) {
+		collName := "test_invalid_param" + funcutil.GenRandomStr()
 		createColl(t, collName, rc)
-		_, err := globalMetaCache.GetCollectionID(context.TODO(), collName)
-		require.NoError(t, err)
+
 		task := getSearchTask(t, collName)
-		task.collectionName = collName
-
-		t.Run("show collection status unexpected error", func(t *testing.T) {
-			qc.SetShowCollectionsFunc(func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-				return &querypb.ShowCollectionsResponse{
-					Status: &commonpb.Status{
-						ErrorCode: commonpb.ErrorCode_UnexpectedError,
-						Reason:    "mock",
-					},
-				}, nil
-			})
-
-			assert.Error(t, task.PreExecute(ctx))
-			qc.ResetShowCollectionsFunc()
-		})
-
-		qc.ResetShowCollectionsFunc()
-		qc.ResetShowPartitionsFunc()
+		task.request.SearchParams = getInvalidSearchParams(IgnoreGrowingKey)
+		err = task.PreExecute(ctx)
+		assert.Error(t, err)
 	})
 
 	t.Run("search with timeout", func(t *testing.T) {
 		collName := "search_with_timeout" + funcutil.GenRandomStr()
 		createColl(t, collName, rc)
-		collID, err := globalMetaCache.GetCollectionID(context.TODO(), collName)
-		require.NoError(t, err)
-		status, err := qc.LoadCollection(ctx, &querypb.LoadCollectionRequest{
-			Base: &commonpb.MsgBase{
-				MsgType: commonpb.MsgType_LoadCollection,
-			},
-			CollectionID: collID,
-		})
-		require.NoError(t, err)
-		require.Equal(t, commonpb.ErrorCode_Success, status.GetErrorCode())
 
 		task := getSearchTask(t, collName)
 		task.request.SearchParams = getValidSearchParams()
@@ -284,33 +255,52 @@ func TestSearchTask_PreExecute(t *testing.T) {
 
 		// contain vector field
 		task.request.OutputFields = []string{testFloatVecField}
-		assert.Error(t, task.PreExecute(ctx))
+		assert.NoError(t, task.PreExecute(ctx))
 	})
 }
 
-func TestSearchTaskV2_Execute(t *testing.T) {
-	Params.InitOnce()
+func getQueryCoord() *mocks.MockQueryCoord {
+	qc := &mocks.MockQueryCoord{}
+	qc.EXPECT().Start().Return(nil)
+	qc.EXPECT().Stop().Return(nil)
+	return qc
+}
 
+func getQueryCoordClient() *mocks.MockQueryCoordClient {
+	qc := &mocks.MockQueryCoordClient{}
+	qc.EXPECT().Close().Return(nil)
+	return qc
+}
+
+func getQueryNode() *mocks.MockQueryNode {
+	qn := &mocks.MockQueryNode{}
+
+	return qn
+}
+
+func getQueryNodeClient() *mocks.MockQueryNodeClient {
+	qn := &mocks.MockQueryNodeClient{}
+
+	return qn
+}
+
+func TestSearchTaskV2_Execute(t *testing.T) {
 	var (
 		err error
 
 		rc  = NewRootCoordMock()
-		qc  = NewQueryCoordMock()
+		qc  = getQueryCoordClient()
 		ctx = context.TODO()
 
 		collectionName = t.Name() + funcutil.GenRandomStr()
 	)
 
-	err = rc.Start()
-	require.NoError(t, err)
-	defer rc.Stop()
+	defer rc.Close()
 	mgr := newShardClientMgr()
 	err = InitMetaCache(ctx, rc, qc, mgr)
 	require.NoError(t, err)
 
-	err = qc.Start()
-	require.NoError(t, err)
-	defer qc.Stop()
+	defer qc.Close()
 
 	task := &searchTask{
 		ctx: ctx,
@@ -351,7 +341,6 @@ func genSearchResultData(nq int64, topk int64, ids []int64, scores []float32) *s
 }
 
 func TestSearchTask_Ts(t *testing.T) {
-	Params.InitOnce()
 	task := &searchTask{
 		SearchRequest: &internalpb.SearchRequest{},
 
@@ -380,7 +369,7 @@ func TestSearchTask_Reduce(t *testing.T) {
 	//     dataArray = append(dataArray, data1)
 	//     dataArray = append(dataArray, data2)
 	//     res, err := reduceSearchResultData(dataArray, nq, topk, metricType)
-	//     assert.Nil(t, err)
+	//     assert.NoError(t, err)
 	//     assert.Equal(t, ids, res.Results.Ids.GetIntId().Data)
 	//     assert.Equal(t, []float32{1.0, 2.0, 3.0, 4.0}, res.Results.Scores)
 	// })
@@ -395,7 +384,7 @@ func TestSearchTask_Reduce(t *testing.T) {
 	//     dataArray = append(dataArray, data1)
 	//     dataArray = append(dataArray, data2)
 	//     res, err := reduceSearchResultData(dataArray, nq, topk, metricType)
-	//     assert.Nil(t, err)
+	//     assert.NoError(t, err)
 	//     assert.ElementsMatch(t, []int64{1, 5, 2, 3}, res.Results.Ids.GetIntId().Data)
 	// })
 }
@@ -403,7 +392,6 @@ func TestSearchTask_Reduce(t *testing.T) {
 func TestSearchTaskWithInvalidRoundDecimal(t *testing.T) {
 	// var err error
 	//
-	// Params.Init()
 	// Params.ProxyCfg.SearchResultChannelNames = []string{funcutil.GenRandomStr()}
 	//
 	// rc := NewRootCoordMock()
@@ -475,7 +463,7 @@ func TestSearchTaskWithInvalidRoundDecimal(t *testing.T) {
 	//         MsgType:   commonpb.MsgType_LoadCollection,
 	//         MsgID:     0,
 	//         Timestamp: 0,
-	//         SourceID:  Params.ProxyCfg.GetNodeID(),
+	//         SourceID:  paramtable.GetNodeID(),
 	//     },
 	//     DbID:         0,
 	//     CollectionID: collectionID,
@@ -496,9 +484,9 @@ func TestSearchTaskWithInvalidRoundDecimal(t *testing.T) {
 	//             MsgType:   commonpb.MsgType_Search,
 	//             MsgID:     0,
 	//             Timestamp: 0,
-	//             SourceID:  Params.ProxyCfg.GetNodeID(),
+	//             SourceID:  paramtable.GetNodeID(),
 	//         },
-	//         ResultChannelID:    strconv.FormatInt(Params.ProxyCfg.GetNodeID(), 10),
+	//         ResultChannelID:    strconv.FormatInt(paramtable.GetNodeID(), 10),
 	//         DbID:               0,
 	//         CollectionID:       0,
 	//         PartitionIDs:       nil,
@@ -646,7 +634,6 @@ func TestSearchTaskWithInvalidRoundDecimal(t *testing.T) {
 func TestSearchTaskV2_all(t *testing.T) {
 	// var err error
 	//
-	// Params.Init()
 	// Params.ProxyCfg.SearchResultChannelNames = []string{funcutil.GenRandomStr()}
 	//
 	// rc := NewRootCoordMock()
@@ -719,7 +706,7 @@ func TestSearchTaskV2_all(t *testing.T) {
 	//         MsgType:   commonpb.MsgType_LoadCollection,
 	//         MsgID:     0,
 	//         Timestamp: 0,
-	//         SourceID:  Params.ProxyCfg.GetNodeID(),
+	//         SourceID:  paramtable.GetNodeID(),
 	//     },
 	//     DbID:         0,
 	//     CollectionID: collectionID,
@@ -740,9 +727,9 @@ func TestSearchTaskV2_all(t *testing.T) {
 	//             MsgType:   commonpb.MsgType_Search,
 	//             MsgID:     0,
 	//             Timestamp: 0,
-	//             SourceID:  Params.ProxyCfg.GetNodeID(),
+	//             SourceID:  paramtable.GetNodeID(),
 	//         },
-	//         ResultChannelID:    strconv.FormatInt(Params.ProxyCfg.GetNodeID(), 10),
+	//         ResultChannelID:    strconv.FormatInt(paramtable.GetNodeID(), 10),
 	//         DbID:               0,
 	//         CollectionID:       0,
 	//         PartitionIDs:       nil,
@@ -891,7 +878,6 @@ func TestSearchTaskV2_all(t *testing.T) {
 func TestSearchTaskV2_7803_reduce(t *testing.T) {
 	// var err error
 	//
-	// Params.Init()
 	// Params.ProxyCfg.SearchResultChannelNames = []string{funcutil.GenRandomStr()}
 	//
 	// rc := NewRootCoordMock()
@@ -957,7 +943,7 @@ func TestSearchTaskV2_7803_reduce(t *testing.T) {
 	//         MsgType:   commonpb.MsgType_LoadCollection,
 	//         MsgID:     0,
 	//         Timestamp: 0,
-	//         SourceID:  Params.ProxyCfg.GetNodeID(),
+	//         SourceID:  paramtable.GetNodeID(),
 	//     },
 	//     DbID:         0,
 	//     CollectionID: collectionID,
@@ -978,9 +964,9 @@ func TestSearchTaskV2_7803_reduce(t *testing.T) {
 	//             MsgType:   commonpb.MsgType_Search,
 	//             MsgID:     0,
 	//             Timestamp: 0,
-	//             SourceID:  Params.ProxyCfg.GetNodeID(),
+	//             SourceID:  paramtable.GetNodeID(),
 	//         },
-	//         ResultChannelID:    strconv.FormatInt(Params.ProxyCfg.GetNodeID(), 10),
+	//         ResultChannelID:    strconv.FormatInt(paramtable.GetNodeID(), 10),
 	//         DbID:               0,
 	//         CollectionID:       0,
 	//         PartitionIDs:       nil,
@@ -1141,62 +1127,79 @@ func Test_checkSearchResultData(t *testing.T) {
 
 		args args
 	}{
-		{"data.NumQueries != nq", true,
+		{
+			"data.NumQueries != nq", true,
 			args{
 				data: &schemapb.SearchResultData{NumQueries: 100},
 				nq:   10,
-			}},
-		{"data.TopK != topk", true,
+			},
+		},
+		{
+			"data.TopK != topk", true,
 			args{
 				data: &schemapb.SearchResultData{NumQueries: 1, TopK: 1},
 				nq:   1,
 				topk: 10,
-			}},
-		{"size of IntId != NumQueries * TopK", true,
+			},
+		},
+		{
+			"size of IntId != NumQueries * TopK", true,
 			args{
 				data: &schemapb.SearchResultData{
 					NumQueries: 1,
 					TopK:       1,
 					Ids: &schemapb.IDs{
-						IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1, 2}}}},
+						IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1, 2}}},
+					},
 				},
 				nq:   1,
 				topk: 1,
-			}},
-		{"size of StrID != NumQueries * TopK", true,
+			},
+		},
+		{
+			"size of StrID != NumQueries * TopK", true,
 			args{
 				data: &schemapb.SearchResultData{
 					NumQueries: 1,
 					TopK:       1,
 					Ids: &schemapb.IDs{
-						IdField: &schemapb.IDs_StrId{StrId: &schemapb.StringArray{Data: []string{"1", "2"}}}},
+						IdField: &schemapb.IDs_StrId{StrId: &schemapb.StringArray{Data: []string{"1", "2"}}},
+					},
 				},
 				nq:   1,
 				topk: 1,
-			}},
-		{"size of score != nq * topK", true,
+			},
+		},
+		{
+			"size of score != nq * topK", true,
 			args{
 				data: &schemapb.SearchResultData{
 					NumQueries: 1,
 					TopK:       1,
 					Ids: &schemapb.IDs{
-						IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1}}}},
+						IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1}}},
+					},
 					Scores: []float32{0.99, 0.98},
 				},
 				nq:   1,
 				topk: 1,
-			}},
-		{"correct params", false,
+			},
+		},
+		{
+			"correct params", false,
 			args{
 				data: &schemapb.SearchResultData{
 					NumQueries: 1,
 					TopK:       1,
 					Ids: &schemapb.IDs{
-						IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1}}}},
-					Scores: []float32{0.99}},
+						IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1}}},
+					},
+					Scores: []float32{0.99},
+				},
 				nq:   1,
 				topk: 1,
-			}},
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -1274,6 +1277,68 @@ func TestTaskSearch_selectHighestScoreIndex(t *testing.T) {
 			})
 		}
 	})
+
+	//t.Run("Integer ID with bad score", func(t *testing.T) {
+	//	type args struct {
+	//		subSearchResultData []*schemapb.SearchResultData
+	//		subSearchNqOffset   [][]int64
+	//		cursors             []int64
+	//		topk                int64
+	//		nq                  int64
+	//	}
+	//	tests := []struct {
+	//		description string
+	//		args        args
+	//
+	//		expectedIdx     []int
+	//		expectedDataIdx []int
+	//	}{
+	//		{
+	//			description: "reduce 2 subSearchResultData",
+	//			args: args{
+	//				subSearchResultData: []*schemapb.SearchResultData{
+	//					{
+	//						Ids: &schemapb.IDs{
+	//							IdField: &schemapb.IDs_IntId{
+	//								IntId: &schemapb.LongArray{
+	//									Data: []int64{11, 9, 8, 5, 3, 1},
+	//								},
+	//							},
+	//						},
+	//						Scores: []float32{-math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32},
+	//						Topks:  []int64{2, 2, 2},
+	//					},
+	//					{
+	//						Ids: &schemapb.IDs{
+	//							IdField: &schemapb.IDs_IntId{
+	//								IntId: &schemapb.LongArray{
+	//									Data: []int64{12, 10, 7, 6, 4, 2},
+	//								},
+	//							},
+	//						},
+	//						Scores: []float32{-math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32, -math.MaxFloat32},
+	//						Topks:  []int64{2, 2, 2},
+	//					},
+	//				},
+	//				subSearchNqOffset: [][]int64{{0, 2, 4}, {0, 2, 4}},
+	//				cursors:           []int64{0, 0},
+	//				topk:              2,
+	//				nq:                3,
+	//			},
+	//			expectedIdx:     []int{-1, -1, -1},
+	//			expectedDataIdx: []int{-1, -1, -1},
+	//		},
+	//	}
+	//	for _, test := range tests {
+	//		t.Run(test.description, func(t *testing.T) {
+	//			for nqNum := int64(0); nqNum < test.args.nq; nqNum++ {
+	//				idx, dataIdx := selectHighestScoreIndex(test.args.subSearchResultData, test.args.subSearchNqOffset, test.args.cursors, nqNum)
+	//				assert.NotEqual(t, test.expectedIdx[nqNum], idx)
+	//				assert.NotEqual(t, test.expectedDataIdx[nqNum], int(dataIdx))
+	//			}
+	//		})
+	//	}
+	//})
 
 	t.Run("String ID", func(t *testing.T) {
 		type args struct {
@@ -1371,21 +1436,31 @@ func TestTaskSearch_reduceSearchResultData(t *testing.T) {
 			outScore []float32
 			outData  []int64
 		}{
-			{"offset 0, limit 5", 0, 5,
+			{
+				"offset 0, limit 5", 0, 5,
 				[]float32{-50, -49, -48, -47, -46, -45, -44, -43, -42, -41},
-				[]int64{50, 49, 48, 47, 46, 45, 44, 43, 42, 41}},
-			{"offset 1, limit 4", 1, 4,
+				[]int64{50, 49, 48, 47, 46, 45, 44, 43, 42, 41},
+			},
+			{
+				"offset 1, limit 4", 1, 4,
 				[]float32{-49, -48, -47, -46, -44, -43, -42, -41},
-				[]int64{49, 48, 47, 46, 44, 43, 42, 41}},
-			{"offset 2, limit 3", 2, 3,
+				[]int64{49, 48, 47, 46, 44, 43, 42, 41},
+			},
+			{
+				"offset 2, limit 3", 2, 3,
 				[]float32{-48, -47, -46, -43, -42, -41},
-				[]int64{48, 47, 46, 43, 42, 41}},
-			{"offset 3, limit 2", 3, 2,
+				[]int64{48, 47, 46, 43, 42, 41},
+			},
+			{
+				"offset 3, limit 2", 3, 2,
 				[]float32{-47, -46, -42, -41},
-				[]int64{47, 46, 42, 41}},
-			{"offset 4, limit 1", 4, 1,
+				[]int64{47, 46, 42, 41},
+			},
+			{
+				"offset 4, limit 1", 4, 1,
 				[]float32{-46, -41},
-				[]int64{46, 41}},
+				[]int64{46, 41},
+			},
 		}
 
 		var results []*schemapb.SearchResultData
@@ -1401,7 +1476,7 @@ func TestTaskSearch_reduceSearchResultData(t *testing.T) {
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, distance.L2, schemapb.DataType_Int64, test.offset)
+				reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, metric.L2, schemapb.DataType_Int64, test.offset)
 				assert.NoError(t, err)
 				assert.Equal(t, test.outData, reduced.GetResults().GetIds().GetIntId().GetData())
 				assert.Equal(t, []int64{test.limit, test.limit}, reduced.GetResults().GetTopks())
@@ -1419,29 +1494,41 @@ func TestTaskSearch_reduceSearchResultData(t *testing.T) {
 			outScore []float32
 			outData  []int64
 		}{
-			{"offset 0, limit 6", 0, 6, 5,
+			{
+				"offset 0, limit 6", 0, 6, 5,
 				[]float32{-50, -49, -48, -47, -46, -45, -44, -43, -42, -41},
-				[]int64{50, 49, 48, 47, 46, 45, 44, 43, 42, 41}},
-			{"offset 1, limit 5", 1, 5, 4,
+				[]int64{50, 49, 48, 47, 46, 45, 44, 43, 42, 41},
+			},
+			{
+				"offset 1, limit 5", 1, 5, 4,
 				[]float32{-49, -48, -47, -46, -44, -43, -42, -41},
-				[]int64{49, 48, 47, 46, 44, 43, 42, 41}},
-			{"offset 2, limit 4", 2, 4, 3,
+				[]int64{49, 48, 47, 46, 44, 43, 42, 41},
+			},
+			{
+				"offset 2, limit 4", 2, 4, 3,
 				[]float32{-48, -47, -46, -43, -42, -41},
-				[]int64{48, 47, 46, 43, 42, 41}},
-			{"offset 3, limit 3", 3, 3, 2,
+				[]int64{48, 47, 46, 43, 42, 41},
+			},
+			{
+				"offset 3, limit 3", 3, 3, 2,
 				[]float32{-47, -46, -42, -41},
-				[]int64{47, 46, 42, 41}},
-			{"offset 4, limit 2", 4, 2, 1,
+				[]int64{47, 46, 42, 41},
+			},
+			{
+				"offset 4, limit 2", 4, 2, 1,
 				[]float32{-46, -41},
-				[]int64{46, 41}},
-			{"offset 5, limit 1", 5, 1, 0,
+				[]int64{46, 41},
+			},
+			{
+				"offset 5, limit 1", 5, 1, 0,
 				[]float32{},
-				[]int64{}},
+				[]int64{},
+			},
 		}
 
 		for _, test := range lessThanLimitTests {
 			t.Run(test.description, func(t *testing.T) {
-				reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, distance.L2, schemapb.DataType_Int64, test.offset)
+				reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, metric.L2, schemapb.DataType_Int64, test.offset)
 				assert.NoError(t, err)
 				assert.Equal(t, test.outData, reduced.GetResults().GetIds().GetIntId().GetData())
 				assert.Equal(t, []int64{test.outLimit, test.outLimit}, reduced.GetResults().GetTopks())
@@ -1465,7 +1552,7 @@ func TestTaskSearch_reduceSearchResultData(t *testing.T) {
 			results = append(results, r)
 		}
 
-		reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, distance.L2, schemapb.DataType_Int64, 0)
+		reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, metric.L2, schemapb.DataType_Int64, 0)
 
 		assert.NoError(t, err)
 		assert.Equal(t, resultData, reduced.GetResults().GetIds().GetIntId().GetData())
@@ -1492,7 +1579,7 @@ func TestTaskSearch_reduceSearchResultData(t *testing.T) {
 			results = append(results, r)
 		}
 
-		reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, distance.L2, schemapb.DataType_VarChar, 0)
+		reduced, err := reduceSearchResultData(context.TODO(), results, nq, topk, metric.L2, schemapb.DataType_VarChar, 0)
 
 		assert.NoError(t, err)
 		assert.Equal(t, resultData, reduced.GetResults().GetIds().GetStrId().GetData())
@@ -1502,175 +1589,27 @@ func TestTaskSearch_reduceSearchResultData(t *testing.T) {
 	})
 }
 
-func Test_checkIfLoaded(t *testing.T) {
-	t.Run("failed to get collection info", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return nil, errors.New("mock")
-		})
-		globalMetaCache = cache
-		var qc types.QueryCoord
-		_, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{})
-		assert.Error(t, err)
-	})
-
-	t.Run("collection loaded", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: true}, nil
-		})
-		globalMetaCache = cache
-		var qc types.QueryCoord
-		loaded, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{})
-		assert.NoError(t, err)
-		assert.True(t, loaded)
-	})
-
-	t.Run("show partitions failed", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return nil, errors.New("mock")
-		})
-		_, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{1, 2})
-		assert.Error(t, err)
-	})
-
-	t.Run("show partitions but didn't success", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return &querypb.ShowPartitionsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_CollectionNotExists}}, nil
-		})
-		_, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{1, 2})
-		assert.Error(t, err)
-	})
-
-	t.Run("partitions loaded", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return &querypb.ShowPartitionsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, InMemoryPercentages: []int64{100, 100}}, nil
-		})
-		loaded, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{1, 2})
-		assert.NoError(t, err)
-		assert.True(t, loaded)
-	})
-
-	t.Run("partitions loaded, some patitions not fully loaded", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return &querypb.ShowPartitionsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, InMemoryPercentages: []int64{100, 50}}, nil
-		})
-		loaded, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{1, 2})
-		assert.NoError(t, err)
-		assert.False(t, loaded)
-	})
-
-	t.Run("no specified partitions, show partitions failed", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return nil, errors.New("mock")
-		})
-		_, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{1, 2})
-		assert.Error(t, err)
-	})
-
-	t.Run("no specified partitions, show partitions but didn't succeed", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return &querypb.ShowPartitionsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_CollectionNotExists}}, nil
-		})
-		_, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{1, 2})
-		assert.Error(t, err)
-	})
-
-	t.Run("not fully loaded", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return &querypb.ShowPartitionsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, PartitionIDs: []UniqueID{1, 2}}, nil
-		})
-		loaded, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{})
-		assert.NoError(t, err)
-		assert.False(t, loaded)
-	})
-
-	t.Run("not loaded", func(t *testing.T) {
-		cache := newMockCache()
-		cache.setGetInfoFunc(func(ctx context.Context, collectionName string) (*collectionInfo, error) {
-			return &collectionInfo{isLoaded: false}, nil
-		})
-		globalMetaCache = cache
-		qc := NewQueryCoordMock()
-		qc.SetShowPartitionsFunc(func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error) {
-			return &querypb.ShowPartitionsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, PartitionIDs: []UniqueID{}}, nil
-		})
-		loaded, err := checkIfLoaded(context.Background(), qc, "test", []UniqueID{})
-		assert.NoError(t, err)
-		assert.False(t, loaded)
-	})
-}
-
 func TestSearchTask_ErrExecute(t *testing.T) {
-	Params.Init()
-
 	var (
 		err error
 		ctx = context.TODO()
 
 		rc = NewRootCoordMock()
-		qc = NewQueryCoordMock(withValidShardLeaders())
-		qn = &QueryNodeMock{}
+		qc = getQueryCoordClient()
+		qn = getQueryNodeClient()
 
 		shardsNum      = int32(2)
 		collectionName = t.Name() + funcutil.GenRandomStr()
-		errPolicy      = func(context.Context, *shardClientMgr, func(context.Context, int64, types.QueryNode, []string) error, map[string][]nodeInfo) error {
-			return fmt.Errorf("fake error")
-		}
 	)
 
-	mockCreator := func(ctx context.Context, address string) (types.QueryNode, error) {
-		return qn, nil
-	}
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 
-	mgr := newShardClientMgr(withShardClientCreator(mockCreator))
+	mgr := NewMockShardClientManager(t)
+	mgr.EXPECT().GetClient(mock.Anything, mock.Anything).Return(qn, nil).Maybe()
+	mgr.EXPECT().UpdateShardLeaders(mock.Anything, mock.Anything).Return(nil).Maybe()
+	lb := NewLBPolicyImpl(mgr)
 
-	rc.Start()
-	defer rc.Stop()
-	qc.Start()
-	defer qc.Stop()
+	defer qc.Close()
 
 	err = InitMetaCache(ctx, rc, qc, mgr)
 	assert.NoError(t, err)
@@ -1707,13 +1646,30 @@ func TestSearchTask_ErrExecute(t *testing.T) {
 	require.NoError(t, createColT.Execute(ctx))
 	require.NoError(t, createColT.PostExecute(ctx))
 
-	collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+	collectionID, err := globalMetaCache.GetCollectionID(ctx, GetCurDBNameFromContextOrDefault(ctx), collectionName)
 	assert.NoError(t, err)
 
+	successStatus := &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}
+	qc.EXPECT().LoadCollection(mock.Anything, mock.Anything).Return(successStatus, nil)
+	qc.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
+		Status: successStatus,
+		Shards: []*querypb.ShardLeadersList{
+			{
+				ChannelName: "channel-1",
+				NodeIds:     []int64{1, 2, 3},
+				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
+			},
+		},
+	}, nil)
+	qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+		Status:              successStatus,
+		CollectionIDs:       []int64{collectionID},
+		InMemoryPercentages: []int64{100},
+	}, nil)
 	status, err := qc.LoadCollection(ctx, &querypb.LoadCollectionRequest{
 		Base: &commonpb.MsgBase{
 			MsgType:  commonpb.MsgType_LoadCollection,
-			SourceID: Params.ProxyCfg.GetNodeID(),
+			SourceID: paramtable.GetNodeID(),
 		},
 		CollectionID: collectionID,
 	})
@@ -1726,27 +1682,25 @@ func TestSearchTask_ErrExecute(t *testing.T) {
 		SearchRequest: &internalpb.SearchRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:  commonpb.MsgType_Retrieve,
-				SourceID: Params.ProxyCfg.GetNodeID(),
+				SourceID: paramtable.GetNodeID(),
 			},
 			CollectionID:   collectionID,
 			OutputFieldsId: make([]int64, len(fieldName2Types)),
 		},
 		ctx: ctx,
 		result: &milvuspb.SearchResults{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			},
+			Status: merr.Status(nil),
 		},
 		request: &milvuspb.SearchRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:  commonpb.MsgType_Retrieve,
-				SourceID: Params.ProxyCfg.GetNodeID(),
+				SourceID: paramtable.GetNodeID(),
 			},
 			CollectionName: collectionName,
 			Nq:             2,
 		},
-		qc:       qc,
-		shardMgr: mgr,
+		qc: qc,
+		lb: lb,
 	}
 	for i := 0; i < len(fieldName2Types); i++ {
 		task.SearchRequest.OutputFieldsId[i] = int64(common.StartOfUserFieldID + i)
@@ -1755,37 +1709,35 @@ func TestSearchTask_ErrExecute(t *testing.T) {
 	assert.NoError(t, task.OnEnqueue())
 
 	task.ctx = ctx
-
 	assert.NoError(t, task.PreExecute(ctx))
 
-	task.searchShardPolicy = errPolicy
+	qn.EXPECT().Search(mock.Anything, mock.Anything).Return(nil, errors.New("mock error"))
 	assert.Error(t, task.Execute(ctx))
 
-	task.searchShardPolicy = mergeRoundRobinPolicy
-	qn.searchError = fmt.Errorf("mock error")
-	assert.Error(t, task.Execute(ctx))
-
-	qn.searchError = nil
-	qn.withSearchResult = &internalpb.SearchResults{
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Search(mock.Anything, mock.Anything).Return(&internalpb.SearchResults{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_NotShardLeader,
 		},
-	}
-	assert.Equal(t, task.Execute(ctx), errInvalidShardLeaders)
+	}, nil)
+	err = task.Execute(ctx)
+	assert.True(t, strings.Contains(err.Error(), errInvalidShardLeaders.Error()))
 
-	qn.withSearchResult = &internalpb.SearchResults{
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Search(mock.Anything, mock.Anything).Return(&internalpb.SearchResults{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_UnexpectedError,
 		},
-	}
+	}, nil)
 	assert.Error(t, task.Execute(ctx))
 
-	result1 := &internalpb.SearchResults{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
-	}
-	qn.withSearchResult = result1
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Search(mock.Anything, mock.Anything).Return(&internalpb.SearchResults{
+		Status: merr.Status(nil),
+	}, nil)
 	assert.NoError(t, task.Execute(ctx))
 }
 
@@ -1793,22 +1745,53 @@ func TestTaskSearch_parseQueryInfo(t *testing.T) {
 	t.Run("parseSearchInfo no error", func(t *testing.T) {
 		var targetOffset int64 = 200
 
-		sp := getValidSearchParams()
-		sp = append(sp, &commonpb.KeyValuePair{
+		normalParam := getValidSearchParams()
+
+		noMetricTypeParams := getBaseSearchParams()
+		noMetricTypeParams = append(noMetricTypeParams, &commonpb.KeyValuePair{
+			Key:   SearchParamsKey,
+			Value: `{"nprobe": 10}`,
+		})
+
+		noSearchParams := getBaseSearchParams()
+		noSearchParams = append(noSearchParams, &commonpb.KeyValuePair{
+			Key:   common.MetricTypeKey,
+			Value: metric.L2,
+		})
+
+		offsetParam := getValidSearchParams()
+		offsetParam = append(offsetParam, &commonpb.KeyValuePair{
 			Key:   OffsetKey,
 			Value: strconv.FormatInt(targetOffset, 10),
 		})
 
-		info, offset, err := parseSearchInfo(sp)
-		assert.NoError(t, err)
-		assert.NotNil(t, info)
-		assert.Equal(t, targetOffset, offset)
+		tests := []struct {
+			description string
+			validParams []*commonpb.KeyValuePair
+		}{
+			{"noMetricType", noMetricTypeParams},
+			{"noSearchParams", noSearchParams},
+			{"normal", normalParam},
+			{"offsetParam", offsetParam},
+		}
+
+		for _, test := range tests {
+			t.Run(test.description, func(t *testing.T) {
+				info, offset, err := parseSearchInfo(test.validParams)
+				assert.NoError(t, err)
+				assert.NotNil(t, info)
+				if test.description == "offsetParam" {
+					assert.Equal(t, targetOffset, offset)
+				}
+			})
+		}
 	})
 
 	t.Run("parseSearchInfo error", func(t *testing.T) {
 		spNoTopk := []*commonpb.KeyValuePair{{
 			Key:   AnnsFieldKey,
-			Value: testFloatVecField}}
+			Value: testFloatVecField,
+		}}
 
 		spInvalidTopk := append(spNoTopk, &commonpb.KeyValuePair{
 			Key:   TopKKey,
@@ -1832,7 +1815,7 @@ func TestTaskSearch_parseQueryInfo(t *testing.T) {
 
 		spNoSearchParams := append(spNoMetricType, &commonpb.KeyValuePair{
 			Key:   common.MetricTypeKey,
-			Value: distance.L2,
+			Value: metric.L2,
 		})
 
 		// no roundDecimal is valid
@@ -1874,8 +1857,6 @@ func TestTaskSearch_parseQueryInfo(t *testing.T) {
 			{"Invalid_topk", spInvalidTopk},
 			{"Invalid_topk_65536", spInvalidTopk65536},
 			{"Invalid_topk_plus_offset", spInvalidTopkPlusOffset},
-			{"No_Metric_type", spNoMetricType},
-			{"No_search_params", spNoSearchParams},
 			{"Invalid_round_decimal", spInvalidRoundDecimal},
 			{"Invalid_round_decimal_1000", spInvalidRoundDecimal2},
 			{"Invalid_offset_not_int", spInvalidOffsetNoInt},
@@ -1896,203 +1877,6 @@ func TestTaskSearch_parseQueryInfo(t *testing.T) {
 	})
 }
 
-func TestTaskSearch_parseSearchParams_AutoIndexEnable(t *testing.T) {
-	oldEnable := Params.AutoIndexConfig.Enable
-	oldIndexType := Params.AutoIndexConfig.IndexType
-	oldIndexParams := Params.AutoIndexConfig.IndexParams
-	oldSearchParamYamStr := Params.AutoIndexConfig.SearchParamsYamlStr
-	oldParser := Params.AutoIndexConfig.Parser
-	//parseSearchParams
-	Params.AutoIndexConfig.Enable = true
-	Params.AutoIndexConfig.IndexType = indexparamcheck.IndexHNSW
-	Params.AutoIndexConfig.IndexParams = make(map[string]string)
-
-	buildParams := map[string]interface{}{
-		common.MetricTypeKey: indexparamcheck.L2,
-		common.IndexTypeKey:  indexparamcheck.IndexHNSW,
-		"M":                  8,
-		"efConstruction":     50,
-	}
-	buildParamsJSONValue, err := json.Marshal(buildParams)
-	assert.NoError(t, err)
-	Params.AutoIndexConfig.IndexParams, err = funcutil.ParseIndexParamsMap(string(buildParamsJSONValue))
-	assert.NoError(t, err)
-
-	jsonStr := `
-      {
-        "1": {
-          "bp": [10, 90],
-          "functions": [
-            "__ef = __topk * 2.2 + 31",
-            "__ef = __topk * 1.58 + 39",
-            "__ef = __topk"
-          ]
-        },
-        "2": {
-          "bp": [10, 200],
-          "functions": [
-            "__ef = __topk *3 + 64",
-            "__ef = 8 * pow(__topk, 0.7) + 50",
-            "__ef = __topk"
-          ]
-        },
-        "3": {
-          "bp": [10, 300],
-          "functions": [
-            "__ef = 10 * pow(__topk, 0.7) + 80",
-            "__ef = 10 * pow(__topk, 0.66) + 74",
-            "__ef = __topk"
-          ]
-        }
-      }`
-	Params.AutoIndexConfig.Parser = autoindex.NewParser()
-	Params.AutoIndexConfig.Parser.InitFromJSONStr(jsonStr)
-
-	normalKVPairs := []*commonpb.KeyValuePair{
-		{
-			Key:   AnnsFieldKey,
-			Value: testFloatVecField,
-		},
-		{
-			Key:   TopKKey,
-			Value: "10",
-		},
-		{
-			Key:   RoundDecimalKey,
-			Value: "-1",
-		},
-		{
-			Key:   common.MetricTypeKey,
-			Value: indexparamcheck.L2,
-		},
-	}
-
-	normalWithNilParams := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: "null",
-		},
-	)
-
-	//var normalWithLevel []*commonpb.KeyValuePair
-	normalWithEmptyParams := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: "{}",
-		},
-	)
-
-	normalWithNormalLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level": 1 }`,
-		},
-	)
-
-	normalWithNormalStrLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level": "1" }`,
-		},
-	)
-
-	normalTests := []struct {
-		description string
-		params      []*commonpb.KeyValuePair
-	}{
-		{"normal", normalKVPairs},
-		{"normal_with_nil_params", normalWithNilParams},
-		{"normal_with_empty_params", normalWithEmptyParams},
-		{"normal_with_normal_level", normalWithNormalLevel},
-		{"normal_with_normal_str_level", normalWithNormalStrLevel},
-	}
-
-	for _, test := range normalTests {
-		t.Run(test.description, func(t *testing.T) {
-			_, _, err := parseSearchInfo(test.params)
-			assert.NoError(t, err)
-		})
-	}
-
-	invalidWithWrongParams := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: "",
-		},
-	)
-
-	invalidWithWrongLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level":x}`,
-		},
-	)
-
-	invalidWithWrongStrLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level":"x"}`,
-		},
-	)
-
-	invalidWithSmallLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level":-1}`,
-		},
-	)
-
-	invalidWithSmallStrLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level":"-1"}`,
-		},
-	)
-
-	invalidWithLargeLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level":100}`,
-		},
-	)
-
-	invalidWithLargeStrLevel := append(normalKVPairs,
-		&commonpb.KeyValuePair{
-			Key:   SearchParamsKey,
-			Value: `{"level":"100"}`,
-		},
-	)
-
-	invalidTests := []struct {
-		description string
-		params      []*commonpb.KeyValuePair
-	}{
-		{"invalid_wrong_params", invalidWithWrongParams},
-		{"invalid_wrong_level", invalidWithWrongLevel},
-		{"invalid_wrong_str_level", invalidWithWrongStrLevel},
-		{"invalid_with_small_level", invalidWithSmallLevel},
-		{"invalid_with_small_str_level", invalidWithSmallStrLevel},
-		{"invalid_with_large_level", invalidWithLargeLevel},
-		{"invalid_with_large_str_level", invalidWithLargeStrLevel},
-	}
-
-	for _, test := range invalidTests {
-		t.Run(test.description, func(t *testing.T) {
-			info, offset, err := parseSearchInfo(test.params)
-			assert.Error(t, err)
-			assert.Nil(t, info)
-			assert.Zero(t, offset)
-		})
-	}
-
-	Params.AutoIndexConfig.Enable = oldEnable
-	Params.AutoIndexConfig.IndexType = oldIndexType
-	Params.AutoIndexConfig.IndexParams = oldIndexParams
-	Params.AutoIndexConfig.SearchParamsYamlStr = oldSearchParamYamStr
-	Params.AutoIndexConfig.Parser = oldParser
-
-}
-
 func getSearchResultData(nq, topk int64) *schemapb.SearchResultData {
 	result := schemapb.SearchResultData{
 		NumQueries: nq,
@@ -2102,4 +1886,295 @@ func getSearchResultData(nq, topk int64) *schemapb.SearchResultData {
 		Topks:      []int64{},
 	}
 	return &result
+}
+
+func TestSearchTask_Requery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const (
+		dim        = 128
+		rows       = 5
+		collection = "test-requery"
+
+		pkField  = "pk"
+		vecField = "vec"
+	)
+
+	ids := make([]int64, rows)
+	for i := range ids {
+		ids[i] = int64(i)
+	}
+
+	t.Run("Test normal", func(t *testing.T) {
+		schema := constructCollectionSchema(pkField, vecField, dim, collection)
+		node := mocks.NewMockProxy(t)
+		node.EXPECT().Query(mock.Anything, mock.Anything).
+			Return(&milvuspb.QueryResults{
+				FieldsData: []*schemapb.FieldData{
+					{
+						Type:      schemapb.DataType_Int64,
+						FieldName: pkField,
+						Field: &schemapb.FieldData_Scalars{
+							Scalars: &schemapb.ScalarField{
+								Data: &schemapb.ScalarField_LongData{
+									LongData: &schemapb.LongArray{
+										Data: ids,
+									},
+								},
+							},
+						},
+					},
+					newFloatVectorFieldData(vecField, rows, dim),
+				},
+			}, nil)
+
+		resultIDs := &schemapb.IDs{
+			IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: ids,
+				},
+			},
+		}
+
+		outputFields := []string{vecField}
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{
+				OutputFields: outputFields,
+			},
+			result: &milvuspb.SearchResults{
+				Results: &schemapb.SearchResultData{
+					Ids: resultIDs,
+				},
+			},
+			schema: schema,
+			tr:     timerecord.NewTimeRecorder("search"),
+			node:   node,
+		}
+
+		err := qt.Requery()
+		assert.NoError(t, err)
+		assert.Len(t, qt.result.Results.FieldsData, 1)
+		assert.Equal(t, vecField, qt.result.Results.FieldsData[0].GetFieldName())
+	})
+
+	t.Run("Test no primary key", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{}
+		node := mocks.NewMockProxy(t)
+
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{},
+			schema:  schema,
+			tr:      timerecord.NewTimeRecorder("search"),
+			node:    node,
+		}
+
+		err := qt.Requery()
+		t.Logf("err = %s", err)
+		assert.Error(t, err)
+	})
+
+	t.Run("Test requery failed 1", func(t *testing.T) {
+		schema := constructCollectionSchema(pkField, vecField, dim, collection)
+		node := mocks.NewMockProxy(t)
+		node.EXPECT().Query(mock.Anything, mock.Anything).
+			Return(nil, fmt.Errorf("mock err 1"))
+
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{},
+			schema:  schema,
+			tr:      timerecord.NewTimeRecorder("search"),
+			node:    node,
+		}
+
+		err := qt.Requery()
+		t.Logf("err = %s", err)
+		assert.Error(t, err)
+	})
+
+	t.Run("Test requery failed 2", func(t *testing.T) {
+		schema := constructCollectionSchema(pkField, vecField, dim, collection)
+		node := mocks.NewMockProxy(t)
+		node.EXPECT().Query(mock.Anything, mock.Anything).
+			Return(&milvuspb.QueryResults{
+				Status: &commonpb.Status{
+					ErrorCode: commonpb.ErrorCode_UnexpectedError,
+					Reason:    "mock err 2",
+				},
+			}, nil)
+
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{},
+			schema:  schema,
+			tr:      timerecord.NewTimeRecorder("search"),
+			node:    node,
+		}
+
+		err := qt.Requery()
+		t.Logf("err = %s", err)
+		assert.Error(t, err)
+	})
+
+	t.Run("Test get pk field data failed", func(t *testing.T) {
+		schema := constructCollectionSchema(pkField, vecField, dim, collection)
+		node := mocks.NewMockProxy(t)
+		node.EXPECT().Query(mock.Anything, mock.Anything).
+			Return(&milvuspb.QueryResults{
+				FieldsData: []*schemapb.FieldData{},
+			}, nil)
+
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{},
+			schema:  schema,
+			tr:      timerecord.NewTimeRecorder("search"),
+			node:    node,
+		}
+
+		err := qt.Requery()
+		t.Logf("err = %s", err)
+		assert.Error(t, err)
+	})
+
+	t.Run("Test incomplete query result", func(t *testing.T) {
+		schema := constructCollectionSchema(pkField, vecField, dim, collection)
+		node := mocks.NewMockProxy(t)
+		node.EXPECT().Query(mock.Anything, mock.Anything).
+			Return(&milvuspb.QueryResults{
+				FieldsData: []*schemapb.FieldData{
+					{
+						Type:      schemapb.DataType_Int64,
+						FieldName: pkField,
+						Field: &schemapb.FieldData_Scalars{
+							Scalars: &schemapb.ScalarField{
+								Data: &schemapb.ScalarField_LongData{
+									LongData: &schemapb.LongArray{
+										Data: ids[:len(ids)-1],
+									},
+								},
+							},
+						},
+					},
+					newFloatVectorFieldData(vecField, rows, dim),
+				},
+			}, nil)
+
+		resultIDs := &schemapb.IDs{
+			IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: ids,
+				},
+			},
+		}
+
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{},
+			result: &milvuspb.SearchResults{
+				Results: &schemapb.SearchResultData{
+					Ids: resultIDs,
+				},
+			},
+			schema: schema,
+			tr:     timerecord.NewTimeRecorder("search"),
+			node:   node,
+		}
+
+		err := qt.Requery()
+		t.Logf("err = %s", err)
+		assert.Error(t, err)
+	})
+
+	t.Run("Test postExecute with requery failed", func(t *testing.T) {
+		schema := constructCollectionSchema(pkField, vecField, dim, collection)
+		node := mocks.NewMockProxy(t)
+		node.EXPECT().Query(mock.Anything, mock.Anything).
+			Return(nil, fmt.Errorf("mock err 1"))
+
+		resultIDs := &schemapb.IDs{
+			IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{
+					Data: ids,
+				},
+			},
+		}
+
+		qt := &searchTask{
+			ctx: ctx,
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{
+					MsgType:  commonpb.MsgType_Search,
+					SourceID: paramtable.GetNodeID(),
+				},
+			},
+			request: &milvuspb.SearchRequest{},
+			result: &milvuspb.SearchResults{
+				Results: &schemapb.SearchResultData{
+					Ids: resultIDs,
+				},
+			},
+			requery:   true,
+			schema:    schema,
+			resultBuf: typeutil.NewConcurrentSet[*internalpb.SearchResults](),
+			tr:        timerecord.NewTimeRecorder("search"),
+			node:      node,
+		}
+		scores := make([]float32, rows)
+		for i := range scores {
+			scores[i] = float32(i)
+		}
+		partialResultData := &schemapb.SearchResultData{
+			Ids:    resultIDs,
+			Scores: scores,
+		}
+		bytes, err := proto.Marshal(partialResultData)
+		assert.NoError(t, err)
+		qt.resultBuf.Insert(&internalpb.SearchResults{
+			SlicedBlob: bytes,
+		})
+
+		err = qt.PostExecute(ctx)
+		t.Logf("err = %s", err)
+		assert.Error(t, err)
+	})
 }

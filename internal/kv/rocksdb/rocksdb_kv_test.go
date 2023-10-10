@@ -22,8 +22,12 @@ import (
 	"sync"
 	"testing"
 
-	rocksdbkv "github.com/milvus-io/milvus/internal/kv/rocksdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/milvus-io/milvus/internal/kv/predicates"
+	rocksdbkv "github.com/milvus-io/milvus/internal/kv/rocksdb"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 func TestRocksdbKV(t *testing.T) {
@@ -38,13 +42,13 @@ func TestRocksdbKV(t *testing.T) {
 	defer rocksdbKV.RemoveWithPrefix("")
 
 	err = rocksdbKV.Save("abc", "123")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	err = rocksdbKV.SaveBytes("abcd", []byte("1234"))
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	val, err := rocksdbKV.Load("abc")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, val, "123")
 	value, err := rocksdbKV.LoadBytes("abc")
 	assert.NoError(t, err)
@@ -56,7 +60,7 @@ func TestRocksdbKV(t *testing.T) {
 	assert.Error(t, err)
 
 	keys, vals, err := rocksdbKV.LoadWithPrefix("abc")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(keys), len(vals))
 	assert.Equal(t, len(keys), 2)
 
@@ -77,21 +81,21 @@ func TestRocksdbKV(t *testing.T) {
 	assert.Equal(t, values[1], []byte("1234"))
 
 	err = rocksdbKV.Save("key_1", "123")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = rocksdbKV.Save("key_2", "456")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = rocksdbKV.Save("key_3", "789")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	keys = []string{"key_1", "key_2"}
 	vals, err = rocksdbKV.MultiLoad(keys)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(vals), len(keys))
 	assert.Equal(t, vals[0], "123")
 	assert.Equal(t, vals[1], "456")
 
 	values, err = rocksdbKV.MultiLoadBytes(keys)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(values), len(keys))
 	assert.Equal(t, values[0], []byte("123"))
 	assert.Equal(t, values[1], []byte("456"))
@@ -129,10 +133,10 @@ func TestRocksdbKV_Prefix(t *testing.T) {
 		"abddqqq": "1234555",
 	}
 	err = rocksdbKV.MultiSave(kvs)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	keys, vals, err := rocksdbKV.LoadWithPrefix("abc")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	assert.Equal(t, len(keys), 1)
 	assert.Equal(t, len(vals), 1)
@@ -146,48 +150,47 @@ func TestRocksdbKV_Prefix(t *testing.T) {
 	}
 
 	err = rocksdbKV.MultiSaveBytes(bytesKvs)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	var values [][]byte
 	keys, values, err = rocksdbKV.LoadBytesWithPrefix("abc")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(keys), 1)
 	assert.Equal(t, len(values), 1)
 	assert.Equal(t, keys[0], "abcd")
 	assert.Equal(t, values[0], []byte("123"))
 
 	err = rocksdbKV.RemoveWithPrefix("abc")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	val, err := rocksdbKV.Load("abc")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(val), 0)
 	val, err = rocksdbKV.Load("abdd")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, val, "1234")
 	val, err = rocksdbKV.Load("abddqqq")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, val, "1234555")
 
 	// test remove ""
 	err = rocksdbKV.RemoveWithPrefix("")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// test remove from an empty cf
 	err = rocksdbKV.RemoveWithPrefix("")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	val, err = rocksdbKV.Load("abddqqq")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, len(val), 0)
 
 	// test we can still save after drop
 	err = rocksdbKV.Save("abcd", "123")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	val, err = rocksdbKV.Load("abcd")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, val, "123")
-
 }
 
 func TestRocksdbKV_Txn(t *testing.T) {
@@ -214,30 +217,6 @@ func TestRocksdbKV_Txn(t *testing.T) {
 	assert.Equal(t, len(keys), 3)
 	assert.Equal(t, len(vals), 3)
 
-	removePrefix := []string{"abc", "abd"}
-	rocksdbKV.MultiRemoveWithPrefix(removePrefix)
-
-	keys, vals, err = rocksdbKV.LoadWithPrefix("")
-	assert.NoError(t, err)
-	assert.Equal(t, len(keys), 0)
-	assert.Equal(t, len(vals), 0)
-
-	err = rocksdbKV.MultiSave(kvs)
-	assert.NoError(t, err)
-	keys, vals, err = rocksdbKV.LoadWithPrefix("")
-	assert.NoError(t, err)
-	assert.Equal(t, len(keys), 3)
-	assert.Equal(t, len(vals), 3)
-
-	// test delete the whole table
-	removePrefix = []string{"", "hello"}
-	rocksdbKV.MultiRemoveWithPrefix(removePrefix)
-
-	keys, vals, err = rocksdbKV.LoadWithPrefix("")
-	assert.NoError(t, err)
-	assert.Equal(t, len(keys), 0)
-	assert.Equal(t, len(vals), 0)
-
 	err = rocksdbKV.MultiSave(kvs)
 	assert.NoError(t, err)
 	keys, vals, err = rocksdbKV.LoadWithPrefix("")
@@ -246,7 +225,7 @@ func TestRocksdbKV_Txn(t *testing.T) {
 	assert.Equal(t, len(vals), 3)
 
 	// test remove and save
-	removePrefix = []string{"abc", "abd"}
+	removePrefix := []string{"abc", "abd"}
 	kvs2 := map[string]string{
 		"abfad": "12345",
 	}
@@ -260,7 +239,7 @@ func TestRocksdbKV_Txn(t *testing.T) {
 func TestRocksdbKV_Goroutines(t *testing.T) {
 	name := "/tmp/rocksdb"
 	rocksdbkv, err := rocksdbkv.NewRocksdbKV(name)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer os.RemoveAll(name)
 	defer rocksdbkv.Close()
 	defer rocksdbkv.RemoveWithPrefix("")
@@ -273,10 +252,10 @@ func TestRocksdbKV_Goroutines(t *testing.T) {
 			key := "key_" + strconv.Itoa(i)
 			val := "val_" + strconv.Itoa(i)
 			err := rocksdbkv.Save(key, val)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 
 			getVal, err := rocksdbkv.Load(key)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			assert.Equal(t, getVal, val)
 		}(i)
 	}
@@ -286,7 +265,7 @@ func TestRocksdbKV_Goroutines(t *testing.T) {
 func TestRocksdbKV_DummyDB(t *testing.T) {
 	name := "/tmp/rocksdb_dummy"
 	rocksdbkv, err := rocksdbkv.NewRocksdbKV(name)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer os.RemoveAll(name)
 	defer rocksdbkv.Close()
 	defer rocksdbkv.RemoveWithPrefix("")
@@ -321,7 +300,7 @@ func TestRocksdbKV_DummyDB(t *testing.T) {
 func TestRocksdbKV_CornerCase(t *testing.T) {
 	name := "/tmp/rocksdb_corner"
 	rocksdbkv, err := rocksdbkv.NewRocksdbKV(name)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	defer os.RemoveAll(name)
 	defer rocksdbkv.Close()
 	defer rocksdbkv.RemoveWithPrefix("")
@@ -339,4 +318,69 @@ func TestRocksdbKV_CornerCase(t *testing.T) {
 	assert.Error(t, err)
 	err = rocksdbkv.DeleteRange("a", "a")
 	assert.Error(t, err)
+}
+
+func TestHas(t *testing.T) {
+	dir := t.TempDir()
+	db, err := rocksdbkv.NewRocksdbKV(dir)
+	assert.NoError(t, err)
+	defer db.Close()
+	defer db.RemoveWithPrefix("")
+
+	has, err := db.Has("key1")
+	assert.NoError(t, err)
+	assert.False(t, has)
+	err = db.Save("key1", "value1")
+	assert.NoError(t, err)
+	has, err = db.Has("key1")
+	assert.NoError(t, err)
+	assert.True(t, has)
+	err = db.Remove("key1")
+	assert.NoError(t, err)
+	has, err = db.Has("key1")
+	assert.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestHasPrefix(t *testing.T) {
+	dir := t.TempDir()
+	db, err := rocksdbkv.NewRocksdbKV(dir)
+	assert.NoError(t, err)
+	defer db.Close()
+	defer db.RemoveWithPrefix("")
+
+	has, err := db.HasPrefix("key")
+	assert.NoError(t, err)
+	assert.False(t, has)
+
+	err = db.Save("key1", "value1")
+	assert.NoError(t, err)
+
+	has, err = db.HasPrefix("key")
+	assert.NoError(t, err)
+	assert.True(t, has)
+
+	err = db.Remove("key1")
+	assert.NoError(t, err)
+
+	has, err = db.HasPrefix("key")
+	assert.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestPredicates(t *testing.T) {
+	dir := t.TempDir()
+	db, err := rocksdbkv.NewRocksdbKV(dir)
+
+	require.NoError(t, err)
+	defer db.Close()
+	defer db.RemoveWithPrefix("")
+
+	err = db.MultiSaveAndRemove(map[string]string{}, []string{}, predicates.ValueEqual("a", "b"))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, merr.ErrServiceUnavailable)
+
+	err = db.MultiSaveAndRemoveWithPrefix(map[string]string{}, []string{}, predicates.ValueEqual("a", "b"))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, merr.ErrServiceUnavailable)
 }

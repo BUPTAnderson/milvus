@@ -17,34 +17,19 @@
 package utils
 
 import (
-	"fmt"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
-
-// WrapStatus wraps status with given error code, message and errors
-func WrapStatus(code commonpb.ErrorCode, msg string, errs ...error) *commonpb.Status {
-	status := &commonpb.Status{
-		ErrorCode: code,
-		Reason:    msg,
-	}
-
-	for _, err := range errs {
-		status.Reason = fmt.Sprintf("%s, err=%v", status.Reason, err)
-	}
-
-	return status
-}
-
-// WrapError wraps error with given message
-func WrapError(msg string, err error) error {
-	return fmt.Errorf("%s[%w]", msg, err)
-}
 
 func SegmentBinlogs2SegmentInfo(collectionID int64, partitionID int64, segmentBinlogs *datapb.SegmentBinlogs) *datapb.SegmentInfo {
 	return &datapb.SegmentInfo{
@@ -63,6 +48,7 @@ func MergeMetaSegmentIntoSegmentInfo(info *querypb.SegmentInfo, segments ...*met
 	first := segments[0]
 	if info.GetSegmentID() == 0 {
 		*info = querypb.SegmentInfo{
+			NodeID:       paramtable.GetNodeID(),
 			SegmentID:    first.GetID(),
 			CollectionID: first.GetCollectionID(),
 			PartitionID:  first.GetPartitionID(),
@@ -70,6 +56,12 @@ func MergeMetaSegmentIntoSegmentInfo(info *querypb.SegmentInfo, segments ...*met
 			DmChannel:    first.GetInsertChannel(),
 			NodeIds:      make([]int64, 0),
 			SegmentState: commonpb.SegmentState_Sealed,
+			IndexInfos:   make([]*querypb.FieldIndexInfo, 0),
+		}
+		for _, indexInfo := range first.IndexInfo {
+			info.IndexName = indexInfo.IndexName
+			info.IndexID = indexInfo.IndexID
+			info.IndexInfos = append(info.IndexInfos, indexInfo)
 		}
 	}
 
@@ -80,7 +72,37 @@ func MergeMetaSegmentIntoSegmentInfo(info *querypb.SegmentInfo, segments ...*met
 
 // packSegmentLoadInfo packs SegmentLoadInfo for given segment,
 // packs with index if withIndex is true, this fetch indexes from IndexCoord
-func PackSegmentLoadInfo(segment *datapb.SegmentInfo, indexes []*querypb.FieldIndexInfo) *querypb.SegmentLoadInfo {
+func PackSegmentLoadInfo(resp *datapb.GetSegmentInfoResponse, indexes []*querypb.FieldIndexInfo) *querypb.SegmentLoadInfo {
+	var (
+		deltaPosition *msgpb.MsgPosition
+		positionSrc   string
+	)
+
+	segment := resp.GetInfos()[0]
+
+	if resp.GetChannelCheckpoint() != nil && resp.ChannelCheckpoint[segment.InsertChannel] != nil {
+		deltaPosition = resp.ChannelCheckpoint[segment.InsertChannel]
+		positionSrc = "channelCheckpoint"
+	} else if segment.GetDmlPosition() != nil {
+		deltaPosition = segment.GetDmlPosition()
+		positionSrc = "segmentDMLPos"
+	} else {
+		deltaPosition = segment.GetStartPosition()
+		positionSrc = "segmentStartPos"
+	}
+
+	posTime := tsoutil.PhysicalTime(deltaPosition.GetTimestamp())
+	tsLag := time.Since(posTime)
+	if tsLag >= 10*time.Minute {
+		log.Warn("delta position is quite stale",
+			zap.Int64("collectionID", segment.GetCollectionID()),
+			zap.Int64("segmentID", segment.GetID()),
+			zap.String("channel", segment.InsertChannel),
+			zap.String("positionSource", positionSrc),
+			zap.Uint64("posTs", deltaPosition.GetTimestamp()),
+			zap.Time("posTime", posTime),
+			zap.Duration("tsLag", tsLag))
+	}
 	loadInfo := &querypb.SegmentLoadInfo{
 		SegmentID:     segment.ID,
 		PartitionID:   segment.PartitionID,
@@ -91,6 +113,8 @@ func PackSegmentLoadInfo(segment *datapb.SegmentInfo, indexes []*querypb.FieldIn
 		Deltalogs:     segment.Deltalogs,
 		InsertChannel: segment.InsertChannel,
 		IndexInfos:    indexes,
+		StartPosition: segment.GetStartPosition(),
+		DeltaPosition: deltaPosition,
 	}
 	loadInfo.SegmentSize = calculateSegmentSize(loadInfo)
 	return loadInfo
@@ -112,21 +136,30 @@ func calculateSegmentSize(segmentLoadInfo *querypb.SegmentLoadInfo) int64 {
 		if index, ok := fieldIndex[fieldID]; ok {
 			segmentSize += index.IndexSize
 		} else {
-			segmentSize += funcutil.GetFieldSizeFromFieldBinlog(fieldBinlog)
+			segmentSize += getFieldSizeFromFieldBinlog(fieldBinlog)
 		}
 	}
 
 	// Get size of state data
 	for _, fieldBinlog := range segmentLoadInfo.Statslogs {
-		segmentSize += funcutil.GetFieldSizeFromFieldBinlog(fieldBinlog)
+		segmentSize += getFieldSizeFromFieldBinlog(fieldBinlog)
 	}
 
 	// Get size of delete data
 	for _, fieldBinlog := range segmentLoadInfo.Deltalogs {
-		segmentSize += funcutil.GetFieldSizeFromFieldBinlog(fieldBinlog)
+		segmentSize += getFieldSizeFromFieldBinlog(fieldBinlog)
 	}
 
 	return segmentSize
+}
+
+func getFieldSizeFromFieldBinlog(fieldBinlog *datapb.FieldBinlog) int64 {
+	fieldSize := int64(0)
+	for _, binlog := range fieldBinlog.Binlogs {
+		fieldSize += binlog.LogSize
+	}
+
+	return fieldSize
 }
 
 func MergeDmChannelInfo(infos []*datapb.VchannelInfo) *meta.DmChannel {
@@ -147,12 +180,4 @@ func MergeDmChannelInfo(infos []*datapb.VchannelInfo) *meta.DmChannel {
 	}
 
 	return dmChannel
-}
-
-func Replica2ReplicaInfo(replica *querypb.Replica) *milvuspb.ReplicaInfo {
-	return &milvuspb.ReplicaInfo{
-		ReplicaID:    replica.GetID(),
-		CollectionID: replica.GetCollectionID(),
-		NodeIds:      replica.GetNodes(),
-	}
 }

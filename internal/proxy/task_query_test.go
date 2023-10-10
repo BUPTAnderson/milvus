@@ -1,63 +1,85 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 package proxy
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/types"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 func TestQueryTask_all(t *testing.T) {
-	Params.Init()
-
 	var (
 		err error
 		ctx = context.TODO()
 
 		rc = NewRootCoordMock()
-		qc = NewQueryCoordMock(withValidShardLeaders())
-		qn = &QueryNodeMock{}
+		qc = mocks.NewMockQueryCoordClient(t)
+		qn = getQueryNodeClient()
 
-		shardsNum      = int32(2)
+		shardsNum      = common.DefaultShardsNum
 		collectionName = t.Name() + funcutil.GenRandomStr()
 
 		expr   = fmt.Sprintf("%s > 0", testInt64Field)
 		hitNum = 10
-
-		errPolicy = func(context.Context, *shardClientMgr, func(context.Context, int64, types.QueryNode, []string) error, map[string][]nodeInfo) error {
-			return fmt.Errorf("fake error")
-		}
 	)
 
-	mockCreator := func(ctx context.Context, address string) (types.QueryNode, error) {
-		return qn, nil
-	}
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 
-	mgr := newShardClientMgr(withShardClientCreator(mockCreator))
+	successStatus := commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}
+	qc.EXPECT().LoadCollection(mock.Anything, mock.Anything).Return(&successStatus, nil)
+	qc.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
+		Status: &successStatus,
+		Shards: []*querypb.ShardLeadersList{
+			{
+				ChannelName: "channel-1",
+				NodeIds:     []int64{1, 2, 3},
+				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
+			},
+		},
+	}, nil).Maybe()
 
-	rc.Start()
-	defer rc.Stop()
-	qc.Start()
-	defer qc.Stop()
+	mgr := NewMockShardClientManager(t)
+	mgr.EXPECT().GetClient(mock.Anything, mock.Anything).Return(qn, nil).Maybe()
+	mgr.EXPECT().UpdateShardLeaders(mock.Anything, mock.Anything).Return(nil).Maybe()
+	lb := NewLBPolicyImpl(mgr)
 
+	defer rc.Close()
 	err = InitMetaCache(ctx, rc, qc, mgr)
 	assert.NoError(t, err)
 
@@ -93,13 +115,13 @@ func TestQueryTask_all(t *testing.T) {
 	require.NoError(t, createColT.Execute(ctx))
 	require.NoError(t, createColT.PostExecute(ctx))
 
-	collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+	collectionID, err := globalMetaCache.GetCollectionID(ctx, GetCurDBNameFromContextOrDefault(ctx), collectionName)
 	assert.NoError(t, err)
 
 	status, err := qc.LoadCollection(ctx, &querypb.LoadCollectionRequest{
 		Base: &commonpb.MsgBase{
 			MsgType:  commonpb.MsgType_LoadCollection,
-			SourceID: Params.ProxyCfg.GetNodeID(),
+			SourceID: paramtable.GetNodeID(),
 		},
 		CollectionID: collectionID,
 	})
@@ -112,27 +134,32 @@ func TestQueryTask_all(t *testing.T) {
 		RetrieveRequest: &internalpb.RetrieveRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:  commonpb.MsgType_Retrieve,
-				SourceID: Params.ProxyCfg.GetNodeID(),
+				SourceID: paramtable.GetNodeID(),
 			},
 			CollectionID:   collectionID,
 			OutputFieldsId: make([]int64, len(fieldName2Types)),
 		},
 		ctx: ctx,
 		result: &milvuspb.QueryResults{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			},
+			Status:     merr.Status(nil),
+			FieldsData: []*schemapb.FieldData{},
 		},
 		request: &milvuspb.QueryRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:  commonpb.MsgType_Retrieve,
-				SourceID: Params.ProxyCfg.GetNodeID(),
+				SourceID: paramtable.GetNodeID(),
 			},
 			CollectionName: collectionName,
 			Expr:           expr,
+			QueryParams: []*commonpb.KeyValuePair{
+				{
+					Key:   IgnoreGrowingKey,
+					Value: "false",
+				},
+			},
 		},
-		qc:       qc,
-		shardMgr: mgr,
+		qc: qc,
+		lb: lb,
 	}
 
 	assert.NoError(t, task.OnEnqueue())
@@ -147,16 +174,17 @@ func TestQueryTask_all(t *testing.T) {
 	// after preExecute
 	assert.Greater(t, task.TimeoutTimestamp, typeutil.ZeroTimestamp)
 
-	task.ctx = ctx
-	task.queryShardPolicy = errPolicy
-	assert.Error(t, task.Execute(ctx))
+	// check reduce_stop_for_best
+	assert.Equal(t, false, task.RetrieveRequest.GetReduceStopForBest())
+	task.request.QueryParams = append(task.request.QueryParams, &commonpb.KeyValuePair{
+		Key:   ReduceStopForBestKey,
+		Value: "trxxxx",
+	})
+	assert.Error(t, task.PreExecute(ctx))
 
-	task.queryShardPolicy = mergeRoundRobinPolicy
 	result1 := &internalpb.RetrieveResults{
-		Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_RetrieveResult},
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Base:   &commonpb.MsgBase{MsgType: commonpb.MsgType_RetrieveResult},
+		Status: merr.Status(nil),
 		Ids: &schemapb.IDs{
 			IdField: &schemapb.IDs_IntId{
 				IntId: &schemapb.LongArray{Data: generateInt64Array(hitNum)},
@@ -172,31 +200,47 @@ func TestQueryTask_all(t *testing.T) {
 	for fieldName, dataType := range fieldName2Types {
 		result1.FieldsData = append(result1.FieldsData, generateFieldData(dataType, fieldName, hitNum))
 	}
-
+	result1.FieldsData = append(result1.FieldsData, generateFieldData(schemapb.DataType_Int64, common.TimeStampFieldName, hitNum))
+	task.RetrieveRequest.OutputFieldsId = append(task.RetrieveRequest.OutputFieldsId, common.TimeStampField)
 	task.ctx = ctx
-	qn.queryError = fmt.Errorf("mock error")
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Query(mock.Anything, mock.Anything).Return(nil, errors.New("mock error"))
 	assert.Error(t, task.Execute(ctx))
 
-	qn.queryError = nil
-	qn.withQueryResult = &internalpb.RetrieveResults{
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Query(mock.Anything, mock.Anything).Return(&internalpb.RetrieveResults{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_NotShardLeader,
 		},
-	}
-	assert.Equal(t, task.Execute(ctx), errInvalidShardLeaders)
+	}, nil)
+	err = task.Execute(ctx)
+	assert.True(t, strings.Contains(err.Error(), errInvalidShardLeaders.Error()))
 
-	qn.withQueryResult = &internalpb.RetrieveResults{
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Query(mock.Anything, mock.Anything).Return(&internalpb.RetrieveResults{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_UnexpectedError,
 		},
-	}
+	}, nil)
 	assert.Error(t, task.Execute(ctx))
 
-	qn.withQueryResult = result1
-
+	qn.ExpectedCalls = nil
+	qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	qn.EXPECT().Query(mock.Anything, mock.Anything).Return(result1, nil)
 	assert.NoError(t, task.Execute(ctx))
 
+	task.queryParams = &queryParams{
+		limit:  100,
+		offset: 100,
+	}
 	assert.NoError(t, task.PostExecute(ctx))
+
+	for i := 0; i < len(task.result.FieldsData); i++ {
+		assert.NotEqual(t, task.result.FieldsData[i].FieldId, common.TimeStampField)
+	}
 }
 
 func Test_translateToOutputFieldIDs(t *testing.T) {
@@ -374,7 +418,6 @@ func TestTaskQuery_functions(t *testing.T) {
 						Key:   test.inKey[i],
 						Value: test.inValue[i],
 					})
-
 				}
 				ret, err := parseQueryParams(inParams)
 				if test.expectErr {
@@ -469,7 +512,8 @@ func TestTaskQuery_functions(t *testing.T) {
 				1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
 				1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
 				11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0,
-				11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0}
+				11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0,
+			}
 
 			t.Run("test limited", func(t *testing.T) {
 				tests := []struct {
@@ -491,7 +535,33 @@ func TestTaskQuery_functions(t *testing.T) {
 						assert.NoError(t, err)
 					})
 				}
+			})
 
+			t.Run("test unLimited and maxOutputSize", func(t *testing.T) {
+				paramtable.Get().Save(paramtable.Get().QuotaConfig.MaxOutputSize.Key, "1")
+
+				ids := make([]int64, 100)
+				offsets := make([]int64, 100)
+				for i := range ids {
+					ids[i] = int64(i)
+					offsets[i] = int64(i)
+				}
+				fieldData := getFieldData(Int64FieldName, Int64FieldID, schemapb.DataType_Int64, ids, 1)
+
+				result := &internalpb.RetrieveResults{
+					Ids: &schemapb.IDs{
+						IdField: &schemapb.IDs_IntId{
+							IntId: &schemapb.LongArray{
+								Data: ids,
+							},
+						},
+					},
+					FieldsData: []*schemapb.FieldData{fieldData},
+				}
+
+				_, err := reduceRetrieveResults(context.Background(), []*internalpb.RetrieveResults{result}, &queryParams{limit: typeutil.Unlimited})
+				assert.Error(t, err)
+				paramtable.Get().Save(paramtable.Get().QuotaConfig.MaxOutputSize.Key, "1104857600")
 			})
 
 			t.Run("test offset", func(t *testing.T) {
@@ -514,6 +584,28 @@ func TestTaskQuery_functions(t *testing.T) {
 						assert.InDeltaSlice(t, resultFloat[test.offset*Dim:(test.offset+1)*Dim], result.FieldsData[1].GetVectors().GetFloatVector().Data, 10e-10)
 					})
 				}
+			})
+
+			t.Run("test stop reduce for best for limit", func(t *testing.T) {
+				result, err := reduceRetrieveResults(context.Background(),
+					[]*internalpb.RetrieveResults{r1, r2},
+					&queryParams{limit: 2, reduceStopForBest: true})
+				assert.NoError(t, err)
+				assert.Equal(t, 2, len(result.GetFieldsData()))
+				assert.Equal(t, []int64{11, 11, 22}, result.GetFieldsData()[0].GetScalars().GetLongData().Data)
+				len := len(result.GetFieldsData()[0].GetScalars().GetLongData().Data)
+				assert.InDeltaSlice(t, resultFloat[0:(len)*Dim], result.FieldsData[1].GetVectors().GetFloatVector().Data, 10e-10)
+			})
+
+			t.Run("test stop reduce for best for unlimited set", func(t *testing.T) {
+				result, err := reduceRetrieveResults(context.Background(),
+					[]*internalpb.RetrieveResults{r1, r2},
+					&queryParams{limit: typeutil.Unlimited, reduceStopForBest: true})
+				assert.NoError(t, err)
+				assert.Equal(t, 2, len(result.GetFieldsData()))
+				assert.Equal(t, []int64{11, 11, 22, 22}, result.GetFieldsData()[0].GetScalars().GetLongData().Data)
+				len := len(result.GetFieldsData()[0].GetScalars().GetLongData().Data)
+				assert.InDeltaSlice(t, resultFloat[0:(len)*Dim], result.FieldsData[1].GetVectors().GetFloatVector().Data, 10e-10)
 			})
 		})
 	})
@@ -648,4 +740,208 @@ func getFieldData(fieldName string, fieldID int64, fieldType schemapb.DataType, 
 	}
 
 	return fieldData
+}
+
+func Test_filterSystemFields(t *testing.T) {
+	outputFieldIDs := []UniqueID{common.RowIDField, common.TimeStampField, common.StartOfUserFieldID}
+	filtered := filterSystemFields(outputFieldIDs)
+	assert.ElementsMatch(t, []UniqueID{common.StartOfUserFieldID}, filtered)
+}
+
+func Test_matchCountRule(t *testing.T) {
+	type args struct {
+		outputs []string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			args: args{
+				outputs: nil,
+			},
+			want: false,
+		},
+		{
+			args: args{
+				outputs: []string{"count(*)", "count(*)"},
+			},
+			want: false,
+		},
+		{
+			args: args{
+				outputs: []string{"not count(*)"},
+			},
+			want: false,
+		},
+		{
+			args: args{
+				outputs: []string{"count(*)"},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				outputs: []string{"COUNT(*)"},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				outputs: []string{"      count(*)"},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				outputs: []string{"      COUNT(*)"},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				outputs: []string{"count(*)     "},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				outputs: []string{"COUNT(*)     "},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equalf(t, tt.want, matchCountRule(tt.args.outputs), "matchCountRule(%v)", tt.args.outputs)
+		})
+	}
+}
+
+func Test_createCntPlan(t *testing.T) {
+	t.Run("plan without filter", func(t *testing.T) {
+		plan, err := createCntPlan("", nil)
+		assert.NoError(t, err)
+		assert.True(t, plan.GetQuery().GetIsCount())
+		assert.Nil(t, plan.GetQuery().GetPredicates())
+	})
+
+	t.Run("invalid schema", func(t *testing.T) {
+		_, err := createCntPlan("a > b", nil)
+		assert.Error(t, err)
+	})
+
+	t.Run("invalid schema", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "a",
+					IsPrimaryKey: true,
+					DataType:     schemapb.DataType_Int64,
+				},
+			},
+		}
+		plan, err := createCntPlan("a > 4", schema)
+		assert.NoError(t, err)
+		assert.True(t, plan.GetQuery().GetIsCount())
+		assert.NotNil(t, plan.GetQuery().GetPredicates())
+	})
+}
+
+func Test_queryTask_createPlan(t *testing.T) {
+	t.Run("match count rule", func(t *testing.T) {
+		tsk := &queryTask{
+			request: &milvuspb.QueryRequest{
+				OutputFields: []string{"count(*)"},
+			},
+		}
+		err := tsk.createPlan(context.TODO())
+		assert.NoError(t, err)
+		plan := tsk.plan
+		assert.True(t, plan.GetQuery().GetIsCount())
+		assert.Nil(t, plan.GetQuery().GetPredicates())
+	})
+
+	t.Run("query without expression", func(t *testing.T) {
+		tsk := &queryTask{
+			request: &milvuspb.QueryRequest{
+				OutputFields: []string{"a"},
+			},
+		}
+		err := tsk.createPlan(context.TODO())
+		assert.Error(t, err)
+	})
+
+	t.Run("invalid expression", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "a",
+					IsPrimaryKey: true,
+					DataType:     schemapb.DataType_Int64,
+				},
+			},
+		}
+
+		tsk := &queryTask{
+			schema: schema,
+			request: &milvuspb.QueryRequest{
+				OutputFields: []string{"a"},
+				Expr:         "b > 2",
+			},
+		}
+		err := tsk.createPlan(context.TODO())
+		assert.Error(t, err)
+	})
+
+	t.Run("invalid output fields", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "a",
+					IsPrimaryKey: true,
+					DataType:     schemapb.DataType_Int64,
+				},
+			},
+		}
+
+		tsk := &queryTask{
+			schema: schema,
+			request: &milvuspb.QueryRequest{
+				OutputFields: []string{"b"},
+				Expr:         "a > 2",
+			},
+		}
+		err := tsk.createPlan(context.TODO())
+		assert.Error(t, err)
+	})
+}
+
+func TestQueryTask_IDs2Expr(t *testing.T) {
+	fieldName := "pk"
+	intIDs := &schemapb.IDs{
+		IdField: &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{
+				Data: []int64{1, 2, 3, 4, 5},
+			},
+		},
+	}
+	stringIDs := &schemapb.IDs{
+		IdField: &schemapb.IDs_StrId{
+			StrId: &schemapb.StringArray{
+				Data: []string{"a", "b", "c"},
+			},
+		},
+	}
+	idExpr := IDs2Expr(fieldName, intIDs)
+	expectIDExpr := "pk in [ 1, 2, 3, 4, 5 ]"
+	assert.Equal(t, expectIDExpr, idExpr)
+
+	strExpr := IDs2Expr(fieldName, stringIDs)
+	expectStrExpr := "pk in [ \"a\", \"b\", \"c\" ]"
+	assert.Equal(t, expectStrExpr, strExpr)
 }

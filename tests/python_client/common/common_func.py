@@ -2,17 +2,36 @@ import os
 import random
 import math
 import string
+import json
+import time
+import uuid
+from functools import singledispatch
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
-
+from npy_append_array import NpyAppendArray
+from faker import Faker
+from pathlib import Path
+from minio import Minio
 from pymilvus import DataType
 from base.schema_wrapper import ApiCollectionSchemaWrapper, ApiFieldSchemaWrapper
 from common import common_type as ct
 from utils.util_log import test_log as log
 from customize.milvus_operator import MilvusOperator
-
+fake = Faker()
 """" Methods of processing data """
+
+
+@singledispatch
+def to_serializable(val):
+    """Used by default."""
+    return str(val)
+
+
+@to_serializable.register(np.float32)
+def ts_float32(val):
+    """Used if *val* is an instance of numpy.float32."""
+    return np.float64(val)
 
 
 class ParamInfo:
@@ -24,8 +43,10 @@ class ParamInfo:
         self.param_password = ""
         self.param_secure = False
         self.param_replica_num = ct.default_replica_num
+        self.param_uri = ""
+        self.param_token = ""
 
-    def prepare_param_info(self, host, port, handler, replica_num, user, password, secure):
+    def prepare_param_info(self, host, port, handler, replica_num, user, password, secure, uri, token):
         self.param_host = host
         self.param_port = port
         self.param_handler = handler
@@ -33,6 +54,8 @@ class ParamInfo:
         self.param_password = password
         self.param_secure = secure
         self.param_replica_num = replica_num
+        self.param_uri = uri
+        self.param_token = token
 
 
 param_info = ParamInfo()
@@ -43,7 +66,9 @@ def gen_unique_str(str_value=None):
     return "test_" + prefix if str_value is None else str_value + "_" + prefix
 
 
-def gen_str_by_length(length=8):
+def gen_str_by_length(length=8, letters_only=False):
+    if letters_only:
+        return "".join(random.choice(string.ascii_letters) for _ in range(length))
     return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
 
 
@@ -63,6 +88,12 @@ def gen_string_field(name=ct.default_string_field_name, description=ct.default_d
                                                                 description=description, max_length=max_length,
                                                                 is_primary=is_primary, **kwargs)
     return string_field
+
+
+def gen_json_field(name=ct.default_json_field_name, description=ct.default_desc, is_primary=False, **kwargs):
+    json_field, _ = ApiFieldSchemaWrapper().init_field_schema(name=name, dtype=DataType.JSON, description=description,
+                                                              is_primary=is_primary, **kwargs)
+    return json_field
 
 
 def gen_int8_field(name=ct.default_int8_field_name, description=ct.default_desc, is_primary=False, **kwargs):
@@ -89,83 +120,145 @@ def gen_int64_field(name=ct.default_int64_field_name, description=ct.default_des
     return int64_field
 
 
-def gen_float_field(name=ct.default_float_field_name, is_primary=False, description=ct.default_desc):
+def gen_float_field(name=ct.default_float_field_name, is_primary=False, description=ct.default_desc, **kwargs):
     float_field, _ = ApiFieldSchemaWrapper().init_field_schema(name=name, dtype=DataType.FLOAT, description=description,
-                                                               is_primary=is_primary)
+                                                               is_primary=is_primary, **kwargs)
     return float_field
 
 
-def gen_double_field(name=ct.default_double_field_name, is_primary=False, description=ct.default_desc):
-    double_field, _ = ApiFieldSchemaWrapper().init_field_schema(name=name, dtype=DataType.DOUBLE,
-                                                                description=description, is_primary=is_primary)
+def gen_double_field(name=ct.default_double_field_name, is_primary=False, description=ct.default_desc, **kwargs):
+    double_field, _ = ApiFieldSchemaWrapper().init_field_schema(name=name, dtype=DataType.DOUBLE,  description=description,
+                                                                is_primary=is_primary, **kwargs)
     return double_field
 
 
 def gen_float_vec_field(name=ct.default_float_vec_field_name, is_primary=False, dim=ct.default_dim,
-                        description=ct.default_desc):
+                        description=ct.default_desc, **kwargs):
     float_vec_field, _ = ApiFieldSchemaWrapper().init_field_schema(name=name, dtype=DataType.FLOAT_VECTOR,
                                                                    description=description, dim=dim,
-                                                                   is_primary=is_primary)
+                                                                   is_primary=is_primary, **kwargs)
     return float_vec_field
 
 
 def gen_binary_vec_field(name=ct.default_binary_vec_field_name, is_primary=False, dim=ct.default_dim,
-                         description=ct.default_desc):
+                         description=ct.default_desc, **kwargs):
     binary_vec_field, _ = ApiFieldSchemaWrapper().init_field_schema(name=name, dtype=DataType.BINARY_VECTOR,
                                                                     description=description, dim=dim,
-                                                                    is_primary=is_primary)
+                                                                    is_primary=is_primary, **kwargs)
     return binary_vec_field
 
 
 def gen_default_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name,
-                                  auto_id=False, dim=ct.default_dim):
-    fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_float_vec_field(dim=dim)]
+                                  auto_id=False, dim=ct.default_dim, enable_dynamic_field=False, with_json=True, **kwargs):
+    if enable_dynamic_field:
+        if primary_field is ct.default_int64_field_name:
+            fields = [gen_int64_field(), gen_float_vec_field(dim=dim)]
+        elif primary_field is ct.default_string_field_name:
+            fields = [gen_string_field(), gen_float_vec_field(dim=dim)]
+        else:
+            log.error("Primary key only support int or varchar")
+            assert False
+    else:
+        fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_json_field(),
+                  gen_float_vec_field(dim=dim)]
+        if with_json is False:
+            fields.remove(gen_json_field())
+
     schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
-                                                                    primary_field=primary_field, auto_id=auto_id)
+                                                                    primary_field=primary_field, auto_id=auto_id,
+                                                                    enable_dynamic_field=enable_dynamic_field, **kwargs)
+    return schema
+
+
+def gen_bulk_insert_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name, with_varchar_field=True,
+                                      auto_id=False, dim=ct.default_dim, enable_dynamic_field=False, with_json=False):
+    if enable_dynamic_field:
+        if primary_field is ct.default_int64_field_name:
+            fields = [gen_int64_field(), gen_float_vec_field(dim=dim)]
+        elif primary_field is ct.default_string_field_name:
+            fields = [gen_string_field(), gen_float_vec_field(dim=dim)]
+        else:
+            log.error("Primary key only support int or varchar")
+            assert False
+    else:
+        fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_json_field(),
+                  gen_float_vec_field(dim=dim)]
+        if with_json is False:
+            fields.remove(gen_json_field())
+        if with_varchar_field is False:
+            fields.remove(gen_string_field())
+    schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
+                                                                    primary_field=primary_field, auto_id=auto_id,
+                                                                    enable_dynamic_field=enable_dynamic_field)
     return schema
 
 
 def gen_general_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name,
-                                  auto_id=False, is_binary=False, dim=ct.default_dim):
+                                  auto_id=False, is_binary=False, dim=ct.default_dim, **kwargs):
     if is_binary:
         fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_binary_vec_field(dim=dim)]
     else:
         fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_float_vec_field(dim=dim)]
     schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
-                                                                    primary_field=primary_field, auto_id=auto_id)
+                                                                    primary_field=primary_field, auto_id=auto_id, **kwargs)
     return schema
 
 
 def gen_string_pk_default_collection_schema(description=ct.default_desc, primary_field=ct.default_string_field_name,
-                                            auto_id=False, dim=ct.default_dim):
-    fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_float_vec_field(dim=dim)]
+                                            auto_id=False, dim=ct.default_dim, **kwargs):
+    fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_json_field(), gen_float_vec_field(dim=dim)]
     schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
-                                                                    primary_field=primary_field, auto_id=auto_id)
+                                                                    primary_field=primary_field, auto_id=auto_id, **kwargs)
+    return schema
+
+
+def gen_json_default_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name,
+                                       auto_id=False, dim=ct.default_dim, **kwargs):
+    fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_json_field(), gen_float_vec_field(dim=dim)]
+    schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
+                                                                    primary_field=primary_field, auto_id=auto_id, **kwargs)
+    return schema
+
+
+def gen_multiple_json_default_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name,
+                                                auto_id=False, dim=ct.default_dim, **kwargs):
+    fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_json_field(name="json1"),
+              gen_json_field(name="json2"), gen_float_vec_field(dim=dim)]
+    schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
+                                                                    primary_field=primary_field, auto_id=auto_id, **kwargs)
     return schema
 
 
 def gen_collection_schema_all_datatype(description=ct.default_desc,
                                        primary_field=ct.default_int64_field_name,
-                                       auto_id=False, dim=ct.default_dim):
-    fields = [gen_int64_field(), gen_int32_field(), gen_int16_field(), gen_int8_field(),
-              gen_bool_field(), gen_float_field(), gen_double_field(), gen_string_field(), gen_float_vec_field(dim=dim)]
+                                       auto_id=False, dim=ct.default_dim,
+                                       enable_dynamic_field=False, with_json=True, **kwargs):
+    if enable_dynamic_field:
+        fields = [gen_int64_field(), gen_float_vec_field(dim=dim)]
+    else:
+        fields = [gen_int64_field(), gen_int32_field(), gen_int16_field(), gen_int8_field(),
+                  gen_bool_field(), gen_float_field(), gen_double_field(), gen_string_field(),
+                  gen_json_field(), gen_float_vec_field(dim=dim)]
+        if with_json is False:
+            fields.remove(gen_json_field())
     schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
-                                                                    primary_field=primary_field, auto_id=auto_id)
+                                                                    primary_field=primary_field, auto_id=auto_id,
+                                                                    enable_dynamic_field=enable_dynamic_field, **kwargs)
     return schema
 
 
-def gen_collection_schema(fields, primary_field=None, description=ct.default_desc, auto_id=False):
+def gen_collection_schema(fields, primary_field=None, description=ct.default_desc, auto_id=False, **kwargs):
     schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, primary_field=primary_field,
-                                                                    description=description, auto_id=auto_id)
+                                                                    description=description, auto_id=auto_id, **kwargs)
     return schema
 
 
 def gen_default_binary_collection_schema(description=ct.default_desc, primary_field=ct.default_int64_field_name,
-                                         auto_id=False, dim=ct.default_dim):
+                                         auto_id=False, dim=ct.default_dim, **kwargs):
     fields = [gen_int64_field(), gen_float_field(), gen_string_field(), gen_binary_vec_field(dim=dim)]
     binary_schema, _ = ApiCollectionSchemaWrapper().init_collection_schema(fields=fields, description=description,
                                                                            primary_field=primary_field,
-                                                                           auto_id=auto_id)
+                                                                           auto_id=auto_id, **kwargs)
     return binary_schema
 
 
@@ -189,8 +282,10 @@ def gen_schema_multi_string_fields(string_fields):
 
 def gen_vectors(nb, dim):
     vectors = [[random.random() for _ in range(dim)] for _ in range(nb)]
-    vectors = preprocessing.normalize(vectors, axis=1, norm='l2')
-    return vectors.tolist()
+    if dim > 1:
+        vectors = preprocessing.normalize(vectors, axis=1, norm='l2')
+        vectors = vectors.tolist()
+    return vectors
 
 
 def gen_string(nb):
@@ -209,18 +304,59 @@ def gen_binary_vectors(num, dim):
     return raw_vectors, binary_vectors
 
 
-def gen_default_dataframe_data(nb=ct.default_nb, dim=ct.default_dim, start=0):
-    int_values = pd.Series(data=[i for i in range(start, start + nb)])
+def gen_default_dataframe_data(nb=ct.default_nb, dim=ct.default_dim, start=0, with_json=True,
+                               random_primary_key=False):
+    if not random_primary_key:
+        int_values = pd.Series(data=[i for i in range(start, start + nb)])
+    else:
+        int_values = pd.Series(data=random.sample(range(start, start + nb), nb))
     float_values = pd.Series(data=[np.float32(i) for i in range(start, start + nb)], dtype="float32")
     string_values = pd.Series(data=[str(i) for i in range(start, start + nb)], dtype="string")
+    json_values = [{"number": i, "float": i*1.0} for i in range(start, start + nb)]
     float_vec_values = gen_vectors(nb, dim)
     df = pd.DataFrame({
         ct.default_int64_field_name: int_values,
         ct.default_float_field_name: float_values,
         ct.default_string_field_name: string_values,
+        ct.default_json_field_name: json_values,
         ct.default_float_vec_field_name: float_vec_values
     })
+    if with_json is False:
+        df.drop(ct.default_json_field_name, axis=1, inplace=True)
+
     return df
+
+
+def gen_default_rows_data(nb=ct.default_nb, dim=ct.default_dim, start=0, with_json=True):
+    array = []
+    for i in range(start, start + nb):
+        dict = {ct.default_int64_field_name: i,
+                ct.default_float_field_name: i*1.0,
+                ct.default_string_field_name: str(i),
+                ct.default_json_field_name: {"number": i, "float": i*1.0},
+                ct.default_float_vec_field_name: gen_vectors(1, dim)[0]
+                }
+        if with_json is False:
+            dict.pop(ct.default_json_field_name, None)
+        array.append(dict)
+
+    return array
+
+
+def gen_default_data_for_upsert(nb=ct.default_nb, dim=ct.default_dim, start=0, size=10000):
+    int_values = pd.Series(data=[i for i in range(start, start + nb)])
+    float_values = pd.Series(data=[np.float32(i + size) for i in range(start, start + nb)], dtype="float32")
+    string_values = pd.Series(data=[str(i + size) for i in range(start, start + nb)], dtype="string")
+    json_values = [{"number": i, "string": str(i)} for i in range(start, start + nb)]
+    float_vec_values = gen_vectors(nb, dim)
+    df = pd.DataFrame({
+        ct.default_int64_field_name: int_values,
+        ct.default_float_field_name: float_values,
+        ct.default_string_field_name: string_values,
+        ct.default_json_field_name: json_values,
+        ct.default_float_vec_field_name: float_vec_values
+    })
+    return df, float_values
 
 
 def gen_dataframe_multi_vec_fields(vec_fields, nb=ct.default_nb):
@@ -272,15 +408,20 @@ def gen_dataframe_multi_string_fields(string_fields, nb=ct.default_nb):
     return df
 
 
-def gen_dataframe_all_data_type(nb=ct.default_nb, dim=ct.default_dim, start=0):
-    int64_values = pd.Series(data=[i for i in range(start, start + nb)])
+def gen_dataframe_all_data_type(nb=ct.default_nb, dim=ct.default_dim, start=0, with_json=True, random_primary_key=False):
+    if not random_primary_key:
+        int64_values = pd.Series(data=[i for i in range(start, start + nb)])
+    else:
+        int64_values = pd.Series(data=random.sample(range(start, start + nb), nb)) 
     int32_values = pd.Series(data=[np.int32(i) for i in range(start, start + nb)], dtype="int32")
     int16_values = pd.Series(data=[np.int16(i) for i in range(start, start + nb)], dtype="int16")
     int8_values = pd.Series(data=[np.int8(i) for i in range(start, start + nb)], dtype="int8")
-    bool_values = pd.Series(data=[np.bool(i) for i in range(start, start + nb)], dtype="bool")
+    bool_values = pd.Series(data=[np.bool_(i) for i in range(start, start + nb)], dtype="bool")
     float_values = pd.Series(data=[np.float32(i) for i in range(start, start + nb)], dtype="float32")
     double_values = pd.Series(data=[np.double(i) for i in range(start, start + nb)], dtype="double")
     string_values = pd.Series(data=[str(i) for i in range(start, start + nb)], dtype="string")
+    json_values = [{"number": i, "string": str(i), "bool": bool(i),
+                    "list": [j for j in range(i, i + ct.default_json_list_length)]} for i in range(start, start + nb)]
     float_vec_values = gen_vectors(nb, dim)
     df = pd.DataFrame({
         ct.default_int64_field_name: int64_values,
@@ -291,9 +432,36 @@ def gen_dataframe_all_data_type(nb=ct.default_nb, dim=ct.default_dim, start=0):
         ct.default_float_field_name: float_values,
         ct.default_double_field_name: double_values,
         ct.default_string_field_name: string_values,
+        ct.default_json_field_name: json_values,
         ct.default_float_vec_field_name: float_vec_values
+
     })
+    if with_json is False:
+        df.drop(ct.default_json_field_name, axis=1, inplace=True)
+
     return df
+
+
+def gen_default_rows_data_all_data_type(nb=ct.default_nb, dim=ct.default_dim, start=0, with_json=True):
+    array = []
+    for i in range(start, start + nb):
+        dict = {ct.default_int64_field_name: i,
+                ct.default_int32_field_name: i,
+                ct.default_int16_field_name: i,
+                ct.default_int8_field_name: i,
+                ct.default_bool_field_name: bool(i),
+                ct.default_float_field_name: i*1.0,
+                ct.default_double_field_name: i * 1.0,
+                ct.default_string_field_name: str(i),
+                ct.default_json_field_name: {"number": i, "string": str(i), "bool": bool(i),
+                                             "list": [j for j in range(i, i + ct.default_json_list_length)]},
+                ct.default_float_vec_field_name: gen_vectors(1, dim)[0]
+                }
+        if with_json is False:
+            dict.pop(ct.default_json_field_name, None)
+        array.append(dict)
+
+    return array
 
 
 def gen_default_binary_dataframe_data(nb=ct.default_nb, dim=ct.default_dim, start=0):
@@ -310,22 +478,285 @@ def gen_default_binary_dataframe_data(nb=ct.default_nb, dim=ct.default_dim, star
     return df, binary_raw_values
 
 
-def gen_default_list_data(nb=ct.default_nb, dim=ct.default_dim):
+def gen_default_list_data(nb=ct.default_nb, dim=ct.default_dim, start=0, with_json=True):
+    int_values = [i for i in range(start, start + nb)]
+    float_values = [np.float32(i) for i in range(start, start + nb)]
+    string_values = [str(i) for i in range(start, start + nb)]
+    json_values = [{"number": i, "string": str(i), "bool": bool(i), "list": [j for j in range(0, i)]}
+                   for i in range(start, start + nb)]
+    float_vec_values = gen_vectors(nb, dim)
+    if with_json is False:
+        data = [int_values, float_values, string_values, float_vec_values]
+    else:
+        data = [int_values, float_values, string_values, json_values, float_vec_values]
+    return data
+
+
+def gen_default_list_data_for_bulk_insert(nb=ct.default_nb, varchar_len=2000, with_varchar_field=True):
+    str_value = gen_str_by_length(length=varchar_len)
     int_values = [i for i in range(nb)]
     float_values = [np.float32(i) for i in range(nb)]
-    string_values = [str(i) for i in range(nb)]
-    float_vec_values = gen_vectors(nb, dim)
+    string_values = [f"{str(i)}_{str_value}" for i in range(nb)]
+    # in case of large nb, float_vec_values will be too large in memory
+    # then generate float_vec_values in each loop instead of generating all at once during generate npy or json file
+    float_vec_values = []  # placeholder for float_vec
     data = [int_values, float_values, string_values, float_vec_values]
+    if with_varchar_field is False:
+        data = [int_values, float_values, float_vec_values]
     return data
 
 
-def gen_default_list_data_for_bulk_insert(nb=ct.default_nb, dim=ct.default_dim):
-    int_values = [i for i in range(nb)]
-    float_values = [float(i) for i in range(nb)]
-    string_values = [str(i) for i in range(nb)]
-    float_vec_values = gen_vectors(nb, dim)
-    data = [int_values, float_values, string_values, float_vec_values]
+def prepare_bulk_insert_data(schema=None,
+                             nb=ct.default_nb,
+                             file_type="npy",
+                             minio_endpoint="127.0.0.1:9000",
+                             bucket_name="milvus-bucket"):
+    schema = gen_default_collection_schema() if schema is None else schema
+    dim = get_dim_by_schema(schema=schema)
+    log.info(f"start to generate raw data for bulk insert")
+    t0 = time.time()
+    data = get_column_data_by_schema(schema=schema, nb=nb, skip_vectors=True)
+    log.info(f"generate raw data for bulk insert cost {time.time() - t0} s")
+    data_dir = "/tmp/bulk_insert_data"
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    log.info(f"schema:{schema}, nb:{nb}, file_type:{file_type}, minio_endpoint:{minio_endpoint}, bucket_name:{bucket_name}")
+    files = []
+    log.info(f"generate {file_type} files for bulk insert")
+    if file_type == "json":
+        files = gen_json_files_for_bulk_insert(data, schema, data_dir)
+    if file_type == "npy":
+        files = gen_npy_files_for_bulk_insert(data, schema, data_dir)
+    log.info(f"generated {len(files)} {file_type} files for bulk insert, cost {time.time() - t0} s")
+    log.info("upload file to minio")
+    client = Minio(minio_endpoint, access_key="minioadmin", secret_key="minioadmin", secure=False)
+    for file_name in files:
+        file_size = os.path.getsize(os.path.join(data_dir, file_name)) / 1024 / 1024
+        t0 = time.time()
+        client.fput_object(bucket_name, file_name, os.path.join(data_dir, file_name))
+        log.info(f"upload file {file_name} to minio, size: {file_size:.2f} MB, cost {time.time() - t0:.2f} s")
+    return files
+
+
+def get_column_data_by_schema(nb=ct.default_nb, schema=None, skip_vectors=False, start=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    fields_not_auto_id = []
+    for field in fields:
+        if not field.auto_id:
+            fields_not_auto_id.append(field)
+    data = []
+    for field in fields_not_auto_id:
+        if field.dtype == DataType.FLOAT_VECTOR and skip_vectors is True:
+            tmp = []
+        else:
+            tmp = gen_data_by_type(field, nb=nb, start=start)
+        data.append(tmp)
     return data
+
+
+def get_row_data_by_schema(nb=ct.default_nb, schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    fields_not_auto_id = []
+    for field in fields:
+        if not field.auto_id:
+            fields_not_auto_id.append(field)
+    data = []
+    for i in range(nb):
+        tmp = {}
+        for field in fields_not_auto_id:
+            tmp[field.name] = gen_data_by_type(field)
+        data.append(tmp)
+    return data
+
+
+def get_fields_map(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    fields_map = {}
+    for field in fields:
+        fields_map[field.name] = field.dtype
+    return fields_map
+
+
+def get_int64_field_name(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    for field in fields:
+        if field.dtype == DataType.INT64:
+            return field.name
+    return None
+
+
+def get_float_field_name(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    for field in fields:
+        if field.dtype == DataType.FLOAT or field.dtype == DataType.DOUBLE:
+            return field.name
+    return None
+
+
+def get_float_vec_field_name(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    for field in fields:
+        if field.dtype == DataType.FLOAT_VECTOR:
+            return field.name
+    return None
+
+
+def get_binary_vec_field_name(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    for field in fields:
+        if field.dtype == DataType.BINARY_VECTOR:
+            return field.name
+    return None
+
+
+def get_dim_by_schema(schema=None):
+    if schema is None:
+        schema = gen_default_collection_schema()
+    fields = schema.fields
+    for field in fields:
+        if field.dtype == DataType.FLOAT_VECTOR or field.dtype == DataType.BINARY_VECTOR:
+            dim = field.params['dim']
+            return dim
+    return None
+
+
+def gen_data_by_type(field, nb=None, start=None):
+    # if nb is None, return one data, else return a list of data
+    data_type = field.dtype
+    if data_type == DataType.BOOL:
+        if nb is None:
+            return random.choice([True, False])
+        return [random.choice([True, False]) for _ in range(nb)]
+    if data_type == DataType.INT8:
+        if nb is None:
+            return random.randint(-128, 127)
+        return [random.randint(-128, 127) for _ in range(nb)]
+    if data_type == DataType.INT16:
+        if nb is None:
+            return random.randint(-32768, 32767)
+        return [random.randint(-32768, 32767) for _ in range(nb)]
+    if data_type == DataType.INT32:
+        if nb is None:
+            return random.randint(-2147483648, 2147483647)
+        return [random.randint(-2147483648, 2147483647) for _ in range(nb)]
+    if data_type == DataType.INT64:
+        if nb is None:
+            return random.randint(-9223372036854775808, 9223372036854775807)
+        if start is not None:
+            return [i for i in range(start, start+nb)]
+        return [random.randint(-9223372036854775808, 9223372036854775807) for _ in range(nb)]
+    if data_type == DataType.FLOAT:
+        if nb is None:
+            return np.float32(random.random())
+        return [np.float32(random.random()) for _ in range(nb)]
+    if data_type == DataType.DOUBLE:
+        if nb is None:
+            return np.float64(random.random())
+        return [np.float64(random.random()) for _ in range(nb)]
+    if data_type == DataType.VARCHAR:
+        max_length = field.params['max_length']
+        max_length = min(20, max_length-1)
+        length = random.randint(0, max_length)
+        if nb is None:
+            return "".join([chr(random.randint(97, 122)) for _ in range(length)])
+        return ["".join([chr(random.randint(97, 122)) for _ in range(length)]) for _ in range(nb)]
+    if data_type == DataType.JSON:
+        if nb is None:
+            return {"name": fake.name(), "address": fake.address()}
+        data = [{"name": str(i), "address": i} for i in range(nb)]
+        return data
+    if data_type == DataType.FLOAT_VECTOR:
+        dim = field.params['dim']
+        if nb is None:
+            return [random.random() for i in range(dim)]
+        return [[random.random() for i in range(dim)] for _ in range(nb)]
+    return None
+
+
+def gen_json_files_for_bulk_insert(data, schema, data_dir):
+    for d in data:
+        if len(d) > 0:
+            nb = len(d)
+    dim = get_dim_by_schema(schema)
+    vec_field_name = get_float_vec_field_name(schema)
+    fields_name = [field.name for field in schema.fields]
+    # get vec field index
+    vec_field_index = fields_name.index(vec_field_name)
+    uuid_str = str(uuid.uuid4())
+    log.info(f"file dir name: {uuid_str}")
+    file_name = f"{uuid_str}/bulk_insert_data_source_dim_{dim}_nb_{nb}.json"
+    files = [file_name]
+    data_source = os.path.join(data_dir, file_name)
+    Path(data_source).parent.mkdir(parents=True, exist_ok=True)
+    log.info(f"file name: {data_source}")
+    with open(data_source, "w") as f:
+        f.write("{")
+        f.write("\n")
+        f.write('"rows":[')
+        f.write("\n")
+        for i in range(nb):
+            entity_value = [None for _ in range(len(fields_name))]
+            for j in range(len(data)):
+                if j == vec_field_index:
+                    entity_value[j] = [random.random() for _ in range(dim)]
+                else:
+                    entity_value[j] = data[j][i]
+            entity = dict(zip(fields_name, entity_value))
+            f.write(json.dumps(entity, indent=4, default=to_serializable))
+            if i != nb - 1:
+                f.write(",")
+            f.write("\n")
+        f.write("]")
+        f.write("\n")
+        f.write("}")
+    return files
+
+
+def gen_npy_files_for_bulk_insert(data, schema, data_dir):
+    for d in data:
+        if len(d) > 0:
+            nb = len(d)
+    dim = get_dim_by_schema(schema)
+    vec_field_name = get_float_vec_field_name(schema)
+    fields_name = [field.name for field in schema.fields]
+    files = []
+    uuid_str = uuid.uuid4()
+    for field in fields_name:
+        files.append(f"{uuid_str}/{field}.npy")
+    for i, file in enumerate(files):
+        data_source = os.path.join(data_dir, file)
+        #  mkdir for npy file
+        Path(data_source).parent.mkdir(parents=True, exist_ok=True)
+        log.info(f"save file {data_source}")
+        if vec_field_name in file:
+            log.info(f"generate {nb} vectors with dim {dim} for {data_source}")
+            with NpyAppendArray(data_source, "wb") as npaa:
+                for j in range(nb):
+                    vector = np.array([[random.random() for _ in range(dim)]])
+                    npaa.append(vector)
+
+        elif isinstance(data[i][0], dict):
+            tmp = []
+            for d in data[i]:
+                tmp.append(json.dumps(d))
+            data[i] = tmp
+            np.save(data_source, np.array(data[i]))
+        else:
+            np.save(data_source, np.array(data[i]))
+    return files
 
 
 def gen_default_tuple_data(nb=ct.default_nb, dim=ct.default_dim):
@@ -340,9 +771,11 @@ def gen_default_tuple_data(nb=ct.default_nb, dim=ct.default_dim):
 def gen_numpy_data(nb=ct.default_nb, dim=ct.default_dim):
     int_values = np.arange(nb, dtype='int64')
     float_values = np.arange(nb, dtype='float32')
-    string_values = [np.str(i) for i in range(nb)]
+    string_values = [np.str_(i) for i in range(nb)]
+    json_values = [{"number": i, "string": str(i), "bool": bool(i),
+                    "list": [j for j in range(i, i + ct.default_json_list_length)]} for i in range(nb)]
     float_vec_values = gen_vectors(nb, dim)
-    data = [int_values, float_values, string_values, float_vec_values]
+    data = [int_values, float_values, string_values, json_values, float_vec_values]
     return data
 
 
@@ -366,6 +799,23 @@ def gen_simple_index():
     return index_params
 
 
+def gen_autoindex_params():
+    index_params = [
+        {},
+        {"metric_type": "IP"},
+        {"metric_type": "L2"},
+        {"metric_type": "COSINE"},
+        {"index_type": "AUTOINDEX"},
+        {"index_type": "AUTOINDEX", "metric_type": "L2"},
+        {"index_type": "AUTOINDEX", "metric_type": "COSINE"},
+        {"index_type": "IVF_FLAT", "metric_type": "L2", "nlist": "1024", "m": "100"},
+        {"index_type": "DISKANN", "metric_type": "L2"},
+        {"index_type": "IVF_PQ", "nlist": "128", "m": "16", "nbits": "8", "metric_type": "IP"},
+        {"index_type": "IVF_SQ8", "nlist": "128", "metric_type": "COSINE"}
+    ]
+    return index_params
+
+
 def gen_invalid_field_types():
     field_types = [
         6,
@@ -379,7 +829,7 @@ def gen_invalid_field_types():
     return field_types
 
 
-def gen_invaild_search_params_type():
+def gen_invalid_search_params_type():
     invalid_search_key = 100
     search_params = []
     for index_type in ct.all_index_types:
@@ -400,15 +850,29 @@ def gen_invaild_search_params_type():
                     continue
                 annoy_search_param = {"index_type": index_type, "search_params": {"search_k": search_k}}
                 search_params.append(annoy_search_param)
+        elif index_type == "SCANN":
+            for reorder_k in ct.get_invalid_ints:
+                if isinstance(reorder_k, int):
+                    continue
+                scann_search_param = {"index_type": index_type, "search_params": {"nprobe": 8, "reorder_k": reorder_k}}
+                search_params.append(scann_search_param)
+        elif index_type == "DISKANN":
+            for search_list in ct.get_invalid_ints:
+                diskann_search_param = {"index_type": index_type, "search_params": {"search_list": search_list}}
+                search_params.append(diskann_search_param)
     return search_params
 
 
 def gen_search_param(index_type, metric_type="L2"):
     search_params = []
-    if index_type in ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"]:
-        for nprobe in [64, 128]:
-            ivf_search_params = {"metric_type": metric_type, "params": {"nprobe": nprobe}}
+    if index_type in ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "GPU_IVF_FLAT", "GPU_IVF_PQ"]:
+        if index_type in ["GPU_FLAT"]:
+            ivf_search_params = {"metric_type": metric_type, "params": {}}
             search_params.append(ivf_search_params)
+        else:
+            for nprobe in [64]:
+                ivf_search_params = {"metric_type": metric_type, "params": {"nprobe": nprobe}}
+                search_params.append(ivf_search_params)
     elif index_type in ["BIN_FLAT", "BIN_IVF_FLAT"]:
         if metric_type not in ct.binary_metrics:
             log.error("Metric type error: binary index only supports distance type in (%s)" % ct.binary_metrics)
@@ -418,16 +882,37 @@ def gen_search_param(index_type, metric_type="L2"):
             binary_search_params = {"metric_type": metric_type, "params": {"nprobe": nprobe}}
             search_params.append(binary_search_params)
     elif index_type in ["HNSW"]:
-        for ef in [64, 32768]:
+        for ef in [64, 1500, 32768]:
             hnsw_search_param = {"metric_type": metric_type, "params": {"ef": ef}}
             search_params.append(hnsw_search_param)
     elif index_type == "ANNOY":
         for search_k in [1000, 5000]:
             annoy_search_param = {"metric_type": metric_type, "params": {"search_k": search_k}}
             search_params.append(annoy_search_param)
+    elif index_type == "SCANN":
+        for reorder_k in [1200, 3000]:
+            scann_search_param = {"metric_type": metric_type, "params": {"nprobe": 64, "reorder_k": reorder_k}}
+            search_params.append(scann_search_param)
+    elif index_type == "DISKANN":
+        for search_list in [20, 300, 1500]:
+            diskann_search_param = {"metric_type": metric_type, "params": {"search_list": search_list}}
+            search_params.append(diskann_search_param)
     else:
         log.error("Invalid index_type.")
         raise Exception("Invalid index_type.")
+    log.debug(search_params)
+    
+    return search_params
+
+
+def gen_autoindex_search_params():
+    search_params = [
+        {},
+        {"metric_type": "IP"},
+        {"nlist": "1024"},
+        {"efSearch": "100"},
+        {"search_k": "1000"}
+    ]
     return search_params
 
 
@@ -443,9 +928,17 @@ def gen_invalid_search_param(index_type, metric_type="L2"):
             hnsw_search_param = {"metric_type": metric_type, "params": {"ef": ef}}
             search_params.append(hnsw_search_param)
     elif index_type == "ANNOY":
-        for search_k in ["-1"]:
+        for search_k in ["-2"]:
             annoy_search_param = {"metric_type": metric_type, "params": {"search_k": search_k}}
             search_params.append(annoy_search_param)
+    elif index_type == "DISKANN":
+        for search_list in ["-1"]:
+            diskann_search_param = {"metric_type": metric_type, "params": {"search_list": search_list}}
+            search_params.append(diskann_search_param)
+    elif index_type == "SCANN":
+        for reorder_k in [-1]:
+            scann_search_param = {"metric_type": metric_type, "params": {"reorder_k": reorder_k, "nprobe": 10}}
+            search_params.append(scann_search_param)
     else:
         log.error("Invalid index_type.")
         raise Exception("Invalid index_type.")
@@ -468,53 +961,84 @@ def gen_normal_expressions():
         "(int64 > 0 && int64 < 400) or (int64 > 500 && int64 < 1000)",
         "int64 not in [1, 2, 3]",
         "int64 in [1, 2, 3] and float != 2",
-        "int64 == 0 || int64 == 1 || int64 == 2",
-        "0 < int64 < 400",
-        "500 <= int64 < 1000",
+        "int64 == 0 || float == 10**2 || (int64 + 1) == 3",
+        "0 <= int64 < 400 and int64 % 100 == 0",
         "200+300 < int64 <= 500+500",
-        "int64 in [300/2, 900%40, -10*30+800, 2048/2%200, (100+200)*2]",
-        "float in [+3**6, 2**10/2]",
-        "(int64 % 100 == 0) && int64 < 500",
-        "float <= 4**5/2 && float > 500-1 && float != 500/2+260",
         "int64 > 400 && int64 < 200",
-        "float < -2**8",
-        "(int64 + 1) == 3 || int64 * 2 == 64 || float == 10**2"
-    ]
-    return expressions
-
-def gen_field_compare_expressions():
-    expressions = [
-        "int64_1 | int64_2 == 1",
-        "int64_1 && int64_2 ==1",
-        "int64_1 + int64_2 == 10",
-        "int64_1 - int64_2 == 2",
-        "int64_1 * int64_2 == 8",
-        "int64_1 / int64_2 == 2",
-        "int64_1 ** int64_2 == 4",
-        "int64_1 % int64_2 == 0",
-        "int64_1 in int64_2",
-        "int64_1 + int64_2 >= 10"
-    ]
-    return expressions
-
-def gen_normal_string_expressions(field):
-    expressions = [
-        f"\"0\"< {field} < \"3\"",
-        f"{field} >= \"0\"",
-        f"({field} > \"0\" && {field} < \"100\") or ({field} > \"200\" && {field} < \"300\")",
-        f"\"0\" <= {field} <= \"100\"",
-        f"{field} == \"0\"|| {field} == \"1\"|| {field} ==\"2\"",
-        f"{field} != \"0\"",
-        f"{field} not in [\"0\", \"1\", \"2\"]",
-        f"{field} in [\"0\", \"1\", \"2\"]"
+        "int64 in [300/2, 900%40, -10*30+800, (100+200)*2] or float in [+3**6, 2**10/2]",
+        "float <= -4**5/2 && float > 500-1 && float != 500/2+260"
     ]
     return expressions
 
 
-def gen_invaild_string_expressions():
+def gen_json_field_expressions():
     expressions = [
-        "varchar in [0,  \"1\"]",
+        "json_field['number'] > 0",
+        "0 <= json_field['number'] < 400 or 1000 > json_field['number'] >= 500",
+        "json_field['number'] not in [1, 2, 3]",
+        "json_field['number'] in [1, 2, 3] and json_field['float'] != 2",
+        "json_field['number'] == 0 || json_field['float'] == 10**2 || json_field['number'] + 1 == 3",
+        "json_field['number'] < 400 and json_field['number'] >= 100 and json_field['number'] % 100 == 0",
+        "json_field['float'] > 400 && json_field['float'] < 200",
+        "json_field['number'] in [300/2, -10*30+800, (100+200)*2] or json_field['float'] in [+3**6, 2**10/2]",
+        "json_field['float'] <= -4**5/2 && json_field['float'] > 500-1 && json_field['float'] != 500/2+260"
+    ]
+    return expressions
+
+
+def gen_field_compare_expressions(fields1=None, fields2=None):
+    if fields1 is None:
+        fields1 = ["int64_1"]
+        fields2 = ["int64_2"]
+    expressions = []
+    for field1, field2 in zip(fields1, fields2):
+        expression = [
+            f"{field1} | {field2} == 1",
+            f"{field1} + {field2} <= 10 || {field1} - {field2} == 2",
+            f"{field1} * {field2} >= 8 && {field1} / {field2} < 2",
+            f"{field1} ** {field2} != 4 and {field1} + {field2} > 5",
+            f"{field1} not in {field2}",
+            f"{field1} in {field2}",
+        ]
+        expressions.extend(expression)
+    return expressions
+
+
+def gen_normal_string_expressions(fields=None):
+    if fields is None:
+        fields = [ct.default_string_field_name]
+    expressions = []
+    for field in fields:
+        expression = [
+            f"\"0\"< {field} < \"3\"",
+            f"{field} >= \"0\"",
+            f"({field} > \"0\" && {field} < \"100\") or ({field} > \"200\" && {field} < \"300\")",
+            f"\"0\" <= {field} <= \"100\"",
+            f"{field} == \"0\"|| {field} == \"1\"|| {field} ==\"2\"",
+            f"{field} != \"0\"",
+            f"{field} not in [\"0\", \"1\", \"2\"]",
+            f"{field} in [\"0\", \"1\", \"2\"]"
+        ]
+        expressions.extend(expression)
+    return expressions
+
+
+def gen_invalid_string_expressions():
+    expressions = [
+        "varchar in [0, \"1\"]",
         "varchar not in [\"0\", 1, 2]"
+    ]
+    return expressions
+
+
+def gen_invalid_bool_expressions():
+    expressions = [
+        "bool",
+        "!bool",
+        "true",
+        "false",
+        "int64 > 0 and bool",
+        "int64 > 0 or false"
     ]
     return expressions
 
@@ -540,6 +1064,22 @@ def gen_normal_expressions_field(field):
     return expressions
 
 
+def gen_integer_overflow_expressions():
+    expressions = [
+        "int8 < - 128",
+        "int8 > 127",
+        "int8 > -129 && int8 < 128",
+        "int16 < -32768",
+        "int16 >= 32768",
+        "int16 > -32769 && int16 <32768",
+        "int32 < -2147483648",
+        "int32 == 2147483648",
+        "int32 < 2147483648 || int32 == -2147483648",
+        "int8 in  [-129, 1] || int16 in [32769] || int32 in [2147483650, 0]"
+    ]
+    return expressions
+
+
 def l2(x, y):
     return np.linalg.norm(np.array(x) - np.array(y))
 
@@ -548,44 +1088,48 @@ def ip(x, y):
     return np.inner(np.array(x), np.array(y))
 
 
+def cosine(x, y):
+    return np.dot(x, y)/(np.linalg.norm(x)*np.linalg.norm(y))
+
+
 def jaccard(x, y):
-    x = np.asarray(x, np.bool)
-    y = np.asarray(y, np.bool)
+    x = np.asarray(x, np.bool_)
+    y = np.asarray(y, np.bool_)
     return 1 - np.double(np.bitwise_and(x, y).sum()) / np.double(np.bitwise_or(x, y).sum())
 
 
 def hamming(x, y):
-    x = np.asarray(x, np.bool)
-    y = np.asarray(y, np.bool)
+    x = np.asarray(x, np.bool_)
+    y = np.asarray(y, np.bool_)
     return np.bitwise_xor(x, y).sum()
 
 
 def tanimoto(x, y):
-    x = np.asarray(x, np.bool)
-    y = np.asarray(y, np.bool)
+    x = np.asarray(x, np.bool_)
+    y = np.asarray(y, np.bool_)
     res = np.double(np.bitwise_and(x, y).sum()) / np.double(np.bitwise_or(x, y).sum())
     if res == 0:
-        value = 0
+        value = float("inf")
     else:
         value = -np.log2(res)
     return value
 
 
 def tanimoto_calc(x, y):
-    x = np.asarray(x, np.bool)
-    y = np.asarray(y, np.bool)
+    x = np.asarray(x, np.bool_)
+    y = np.asarray(y, np.bool_)
     return np.double((len(x) - np.bitwise_xor(x, y).sum())) / (len(y) + np.bitwise_xor(x, y).sum())
 
 
 def substructure(x, y):
-    x = np.asarray(x, np.bool)
-    y = np.asarray(y, np.bool)
+    x = np.asarray(x, np.bool_)
+    y = np.asarray(y, np.bool_)
     return 1 - np.double(np.bitwise_and(x, y).sum()) / np.count_nonzero(y)
 
 
 def superstructure(x, y):
-    x = np.asarray(x, np.bool)
-    y = np.asarray(y, np.bool)
+    x = np.asarray(x, np.bool_)
+    y = np.asarray(y, np.bool_)
     return 1 - np.double(np.bitwise_and(x, y).sum()) / np.count_nonzero(x)
 
 
@@ -607,6 +1151,31 @@ def compare_distance_2d_vector(x, y, distance, metric, sqrt):
             else:
                 raise Exception("metric type is invalid")
             assert abs(distance_i - distance[i][j]) < ct.epsilon
+
+    return True
+
+
+def compare_distance_vector_and_vector_list(x, y, metric, distance):
+    """
+    target: compare the distance between x and y[i] with the expected distance array
+    method: compare the distance between x and y[i] with the expected distance array
+    expected: return true if all distances are matched
+    """
+    if not isinstance(y, list):
+        log.error("%s is not a list." % str(y))
+        assert False
+    for i in range(len(y)):
+        if metric == "L2":
+            distance_i = l2(x, y[i])
+        elif metric == "IP":
+            distance_i = ip(x, y[i])
+        elif metric == "COSINE":
+            distance_i = cosine(x, y[i])
+        else:
+            raise Exception("metric type is invalid")
+        if abs(distance_i - distance[i]) > ct.epsilon:
+            log.error("The distance between %f and %f is not equal with %f" % (x, y[i], distance[i]))
+            assert abs(distance_i - distance[i]) < ct.epsilon
 
     return True
 
@@ -648,6 +1217,29 @@ def index_to_dict(index):
     }
 
 
+def assert_json_contains(expr, list_data):
+    result_ids = []
+    expr_prefix = expr.split('(', 1)[0]
+    exp_ids = eval(expr.split(', ', 1)[1].split(')', 1)[0])
+    if expr_prefix in ["json_contains", "JSON_CONTAINS"]:
+        for i in range(len(list_data)):
+            if exp_ids in list_data[i]:
+                result_ids.append(i)
+    elif expr_prefix in ["json_contains_all", "JSON_CONTAINS_ALL"]:
+        for i in range(len(list_data)):
+            set_list_data = set(tuple(element) if isinstance(element, list) else element for element in list_data[i])
+            if set(exp_ids).issubset(set_list_data):
+                result_ids.append(i)
+    elif expr_prefix in ["json_contains_any", "JSON_CONTAINS_ANY"]:
+        for i in range(len(list_data)):
+            set_list_data = set(tuple(element) if isinstance(element, list) else element for element in list_data[i])
+            if set(exp_ids) & set_list_data:
+                result_ids.append(i)
+    else:
+        log.warning("unknown expr: %s" % expr)
+    return result_ids
+
+
 def assert_equal_index(index_1, index_2):
     return index_to_dict(index_1) == index_to_dict(index_2)
 
@@ -668,8 +1260,9 @@ def gen_partitions(collection_w, partition_num=1):
     log.info("gen_partitions: created partitions %s" % par)
 
 
-def insert_data(collection_w, nb=3000, is_binary=False, is_all_data_type=False,
-                auto_id=False, dim=ct.default_dim, insert_offset=0):
+def insert_data(collection_w, nb=ct.default_nb, is_binary=False, is_all_data_type=False,
+                auto_id=False, dim=ct.default_dim, insert_offset=0, enable_dynamic_field=False, with_json=True,
+                random_primary_key=False):
     """
     target: insert non-binary/binary data
     method: insert non-binary/binary data into partitions if any
@@ -683,14 +1276,25 @@ def insert_data(collection_w, nb=3000, is_binary=False, is_all_data_type=False,
     start = insert_offset
     log.info(f"inserted {nb} data into collection {collection_w.name}")
     for i in range(num):
-        default_data = gen_default_dataframe_data(nb // num, dim=dim, start=start)
+        log.debug("Dynamic field is enabled: %s" % enable_dynamic_field)
+        default_data = gen_default_dataframe_data(nb // num, dim=dim, start=start, with_json=with_json,
+                                                  random_primary_key=random_primary_key)
+        if enable_dynamic_field:
+            default_data = gen_default_rows_data(nb // num, dim=dim, start=start, with_json=with_json)
         if is_binary:
             default_data, binary_raw_data = gen_default_binary_dataframe_data(nb // num, dim=dim, start=start)
             binary_raw_vectors.extend(binary_raw_data)
         if is_all_data_type:
-            default_data = gen_dataframe_all_data_type(nb // num, dim=dim, start=start)
+            default_data = gen_dataframe_all_data_type(nb // num, dim=dim, start=start, with_json=with_json,
+                                                       random_primary_key=random_primary_key)
+            if enable_dynamic_field:
+                default_data = gen_default_rows_data_all_data_type(nb // num, dim=dim, start=start, with_json=with_json)
         if auto_id:
-            default_data.drop(ct.default_int64_field_name, axis=1, inplace=True)
+            if enable_dynamic_field:
+                for data in default_data:
+                    data.pop(ct.default_int64_field_name, None)
+            else:
+                default_data.drop(ct.default_int64_field_name, axis=1, inplace=True)
         insert_res = collection_w.insert(default_data, par[i].name)[0]
         time_stamp = insert_res.timestamp
         insert_ids.extend(insert_res.primary_keys)
@@ -767,6 +1371,7 @@ def gen_grant_list(collection_name):
                   {"object": "User", "object_name": "*", "privilege": "SelectUser"}]
     return grant_list
 
+
 def install_milvus_operator_specific_config(namespace, milvus_mode, release_name, image,
                                             rate_limit_enable, collection_rate_limit):
     """
@@ -800,7 +1405,7 @@ def install_milvus_operator_specific_config(namespace, milvus_mode, release_name
 
     if milvus_mode not in ["standalone", "cluster"]:
         log.error("[milvus_mode] is not 'standalone' or 'cluster'")
-    
+
     if rate_limit_enable not in ["true", "false"]:
         log.error("[rate_limit_enable] is not 'true' or 'false'")
 
@@ -821,5 +1426,14 @@ def install_milvus_operator_specific_config(namespace, milvus_mode, release_name
         host = mic.endpoint(release_name, NAMESPACE).split(':')[0]
     else:
         raise MilvusException(message=f'Milvus healthy timeout 1800s')
-    
+
     return host
+
+
+def get_wildcard_output_field_names(collection_w, output_fields):
+    all_fields = [field.name for field in collection_w.schema.fields]
+    output_fields = output_fields.copy()
+    if "*" in output_fields:
+        output_fields.remove("*")
+        output_fields.extend(all_fields)
+    return output_fields

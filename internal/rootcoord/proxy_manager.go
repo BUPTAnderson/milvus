@@ -23,22 +23,23 @@ import (
 	"path"
 	"sync"
 
-	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
-	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
-
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/metrics"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+
+	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // proxyManager manages proxy connected to the rootcoord
 type proxyManager struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
+	wg               errgroup.Group
 	lock             sync.Mutex
 	etcdCli          *clientv3.Client
 	initSessionsFunc []func([]*sessionutil.Session)
@@ -50,10 +51,10 @@ type proxyManager struct {
 // etcdEndpoints is the address list of etcd
 // fns are the custom getSessions function list
 func newProxyManager(ctx context.Context, client *clientv3.Client, fns ...func([]*sessionutil.Session)) *proxyManager {
-	ctx2, cancel2 := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(ctx)
 	p := &proxyManager{
-		ctx:     ctx2,
-		cancel:  cancel2,
+		ctx:     ctx,
+		cancel:  cancel,
 		lock:    sync.Mutex{},
 		etcdCli: client,
 	}
@@ -77,14 +78,14 @@ func (p *proxyManager) DelSessionFunc(fns ...func(*sessionutil.Session)) {
 
 // WatchProxy starts a goroutine to watch proxy session changes on etcd
 func (p *proxyManager) WatchProxy() error {
-	ctx, cancel := context.WithTimeout(p.ctx, rootcoord.RequestTimeout)
+	ctx, cancel := context.WithTimeout(p.ctx, etcdkv.RequestTimeout)
 	defer cancel()
 
 	sessions, rev, err := p.getSessionsOnEtcd(ctx)
 	if err != nil {
 		return err
 	}
-	log.Debug("succeed to init sessions on etcd", zap.Any("sessions", sessions), zap.Int64("revision", rev))
+	log.Info("succeed to init sessions on etcd", zap.Any("sessions", sessions), zap.Int64("revision", rev))
 	// all init function should be clear meta firstly.
 	for _, f := range p.initSessionsFunc {
 		f(sessions)
@@ -92,18 +93,22 @@ func (p *proxyManager) WatchProxy() error {
 
 	eventCh := p.etcdCli.Watch(
 		p.ctx,
-		path.Join(Params.EtcdCfg.MetaRootPath, sessionutil.DefaultServiceRoot, typeutil.ProxyRole),
+		path.Join(Params.EtcdCfg.MetaRootPath.GetValue(), sessionutil.DefaultServiceRoot, typeutil.ProxyRole),
 		clientv3.WithPrefix(),
 		clientv3.WithCreatedNotify(),
 		clientv3.WithPrevKV(),
 		clientv3.WithRev(rev+1),
 	)
-	go p.startWatchEtcd(p.ctx, eventCh)
+
+	p.wg.Go(func() error {
+		p.startWatchEtcd(p.ctx, eventCh)
+		return nil
+	})
 	return nil
 }
 
 func (p *proxyManager) startWatchEtcd(ctx context.Context, eventCh clientv3.WatchChan) {
-	log.Debug("start to watch etcd")
+	log.Info("start to watch etcd")
 	for {
 		select {
 		case <-ctx.Done():
@@ -120,7 +125,7 @@ func (p *proxyManager) startWatchEtcd(ctx context.Context, eventCh clientv3.Watc
 					err2 := p.WatchProxy()
 					if err2 != nil {
 						log.Error("re watch proxy fails when etcd has a compaction error",
-							zap.String("etcd error", err.Error()), zap.Error(err2))
+							zap.Error(err), zap.Error(err2))
 						panic("failed to handle etcd request, exit..")
 					}
 					return
@@ -153,7 +158,6 @@ func (p *proxyManager) handlePutEvent(e *clientv3.Event) error {
 	for _, f := range p.addSessionsFunc {
 		f(session)
 	}
-	metrics.RootCoordProxyCounter.WithLabelValues().Inc()
 	return nil
 }
 
@@ -166,7 +170,6 @@ func (p *proxyManager) handleDeleteEvent(e *clientv3.Event) error {
 	for _, f := range p.delSessionsFunc {
 		f(session)
 	}
-	metrics.RootCoordProxyCounter.WithLabelValues().Dec()
 	return nil
 }
 
@@ -182,7 +185,7 @@ func (p *proxyManager) parseSession(value []byte) (*sessionutil.Session, error) 
 func (p *proxyManager) getSessionsOnEtcd(ctx context.Context) ([]*sessionutil.Session, int64, error) {
 	resp, err := p.etcdCli.Get(
 		ctx,
-		path.Join(Params.EtcdCfg.MetaRootPath, sessionutil.DefaultServiceRoot, typeutil.ProxyRole),
+		path.Join(Params.EtcdCfg.MetaRootPath.GetValue(), sessionutil.DefaultServiceRoot, typeutil.ProxyRole),
 		clientv3.WithPrefix(),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 	)
@@ -194,7 +197,7 @@ func (p *proxyManager) getSessionsOnEtcd(ctx context.Context) ([]*sessionutil.Se
 	for _, v := range resp.Kvs {
 		session, err := p.parseSession(v.Value)
 		if err != nil {
-			log.Debug("failed to unmarshal session", zap.Error(err))
+			log.Warn("failed to unmarshal session", zap.Error(err))
 			return nil, 0, err
 		}
 		sessions = append(sessions, session)
@@ -206,30 +209,5 @@ func (p *proxyManager) getSessionsOnEtcd(ctx context.Context) ([]*sessionutil.Se
 // Stop stops the proxyManager
 func (p *proxyManager) Stop() {
 	p.cancel()
-}
-
-// listProxyInEtcd helper function lists proxy in etcd
-func listProxyInEtcd(ctx context.Context, cli *clientv3.Client) (map[int64]*sessionutil.Session, error) {
-	ctx2, cancel := context.WithTimeout(ctx, rootcoord.RequestTimeout)
-	defer cancel()
-	resp, err := cli.Get(
-		ctx2,
-		path.Join(Params.EtcdCfg.MetaRootPath, sessionutil.DefaultServiceRoot, typeutil.ProxyRole),
-		clientv3.WithPrefix(),
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list proxy failed, etcd error = %w", err)
-	}
-	sess := make(map[int64]*sessionutil.Session)
-	for _, v := range resp.Kvs {
-		var s sessionutil.Session
-		err := json.Unmarshal(v.Value, &s)
-		if err != nil {
-			log.Debug("unmarshal SvrSession failed", zap.Error(err))
-			continue
-		}
-		sess[s.ServerID] = &s
-	}
-	return sess, nil
+	p.wg.Wait()
 }

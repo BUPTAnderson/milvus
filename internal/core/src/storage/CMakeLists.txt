@@ -22,39 +22,56 @@ endif()
 
 milvus_add_pkg_config("milvus_storage")
 
+if (DEFINED AZURE_BUILD_DIR)
+    add_definitions(-DAZURE_BUILD_DIR)
+    include_directories(azure-blob-storage)
+    include_directories("${AZURE_BUILD_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include")
+    set(STORAGE_FILES
+        ${STORAGE_FILES}
+        AzureChunkManager.cpp
+        )
+endif()
+
 set(STORAGE_FILES
+    ${STORAGE_FILES}
     parquet_c.cpp
     PayloadStream.cpp
     DataCodec.cpp
     Util.cpp
+    FieldData.cpp
     PayloadReader.cpp
     PayloadWriter.cpp
-    FieldData.cpp
+    BinlogReader.cpp
     IndexData.cpp
     InsertData.cpp
     Event.cpp
-    storage_c.cpp)
-
-if(BUILD_DISK_ANN STREQUAL "ON")
-    set(STORAGE_FILES
-        ${STORAGE_FILES}
-        LocalChunkManager.cpp
-        MinioChunkManager.cpp
-        DiskFileManagerImpl.cpp)
-endif()
+    ThreadPool.cpp
+    storage_c.cpp
+    MinioChunkManager.cpp
+    ChunkManagers.cpp
+    AliyunSTSClient.cpp
+    AliyunCredentialsProvider.cpp
+    MemFileManagerImpl.cpp
+    LocalChunkManager.cpp
+    DiskFileManagerImpl.cpp
+    ThreadPools.cpp
+    ChunkCache.cpp)
 
 add_library(milvus_storage SHARED ${STORAGE_FILES})
 
-find_package(Boost REQUIRED COMPONENTS filesystem)
-
-if(BUILD_DISK_ANN STREQUAL "ON")
-    target_link_libraries(milvus_storage PUBLIC milvus_common Boost::filesystem aws-cpp-sdk-s3 pthread)
-else()
-    target_link_libraries(milvus_storage PUBLIC milvus_common Boost::filesystem pthread)
-endif()
-
-if(NOT CMAKE_INSTALL_PREFIX)
-    set(CMAKE_INSTALL_PREFIX ${CMAKE_CURRENT_BINARY_DIR})
+if (DEFINED AZURE_BUILD_DIR)
+    target_link_libraries(milvus_storage PUBLIC
+            "-L${AZURE_BUILD_DIR} -lblob-chunk-manager"
+            milvus_common
+            pthread
+            ${CONAN_LIBS}
+            )
+else ()
+    target_link_libraries(milvus_storage PUBLIC
+            milvus_common
+            pthread
+            ${CONAN_LIBS}
+            )
 endif()
 
 install(TARGETS milvus_storage DESTINATION "${CMAKE_INSTALL_LIBDIR}")

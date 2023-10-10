@@ -19,20 +19,18 @@ package rootcoord
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
-	"github.com/milvus-io/milvus/internal/log"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/common"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
-
-var logger = log.L().WithOptions(zap.Fields(zap.String("role", typeutil.RootCoordRole)))
 
 // EqualKeyPairArray check whether 2 KeyValuePairs are equal
 func EqualKeyPairArray(p1 []*commonpb.KeyValuePair, p2 []*commonpb.KeyValuePair) bool {
@@ -108,6 +106,7 @@ func CheckMsgType(got, expect commonpb.MsgType) error {
 	return nil
 }
 
+// Deprecated: use merr.StatusWithErrorCode or merr.Status instead
 func failStatus(code commonpb.ErrorCode, reason string) *commonpb.Status {
 	return &commonpb.Status{
 		ErrorCode: code,
@@ -116,10 +115,7 @@ func failStatus(code commonpb.ErrorCode, reason string) *commonpb.Status {
 }
 
 func succStatus() *commonpb.Status {
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}
+	return merr.Status(nil)
 }
 
 type TimeTravelRequest interface {
@@ -136,4 +132,96 @@ func getTravelTs(req TimeTravelRequest) Timestamp {
 
 func isMaxTs(ts Timestamp) bool {
 	return ts == typeutil.MaxTimestamp
+}
+
+func getCollectionRateLimitConfigDefaultValue(configKey string) float64 {
+	switch configKey {
+	case common.CollectionInsertRateMaxKey:
+		return Params.QuotaConfig.DMLMaxInsertRatePerCollection.GetAsFloat()
+	case common.CollectionInsertRateMinKey:
+		return Params.QuotaConfig.DMLMinInsertRatePerCollection.GetAsFloat()
+	case common.CollectionUpsertRateMaxKey:
+		return Params.QuotaConfig.DMLMaxUpsertRatePerCollection.GetAsFloat()
+	case common.CollectionUpsertRateMinKey:
+		return Params.QuotaConfig.DMLMinUpsertRatePerCollection.GetAsFloat()
+	case common.CollectionDeleteRateMaxKey:
+		return Params.QuotaConfig.DMLMaxDeleteRatePerCollection.GetAsFloat()
+	case common.CollectionDeleteRateMinKey:
+		return Params.QuotaConfig.DMLMinDeleteRatePerCollection.GetAsFloat()
+	case common.CollectionBulkLoadRateMaxKey:
+		return Params.QuotaConfig.DMLMaxBulkLoadRatePerCollection.GetAsFloat()
+	case common.CollectionBulkLoadRateMinKey:
+		return Params.QuotaConfig.DMLMinBulkLoadRatePerCollection.GetAsFloat()
+	case common.CollectionQueryRateMaxKey:
+		return Params.QuotaConfig.DQLMaxQueryRatePerCollection.GetAsFloat()
+	case common.CollectionQueryRateMinKey:
+		return Params.QuotaConfig.DQLMinQueryRatePerCollection.GetAsFloat()
+	case common.CollectionSearchRateMaxKey:
+		return Params.QuotaConfig.DQLMaxSearchRatePerCollection.GetAsFloat()
+	case common.CollectionSearchRateMinKey:
+		return Params.QuotaConfig.DQLMinSearchRatePerCollection.GetAsFloat()
+	case common.CollectionDiskQuotaKey:
+		return Params.QuotaConfig.DiskQuotaPerCollection.GetAsFloat()
+
+	default:
+		return float64(0)
+	}
+}
+
+func getCollectionRateLimitConfig(properties map[string]string, configKey string) float64 {
+	megaBytes2Bytes := func(v float64) float64 {
+		return v * 1024.0 * 1024.0
+	}
+	toBytesIfNecessary := func(rate float64) float64 {
+		switch configKey {
+		case common.CollectionInsertRateMaxKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionInsertRateMinKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionUpsertRateMaxKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionUpsertRateMinKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionDeleteRateMaxKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionDeleteRateMinKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionBulkLoadRateMaxKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionBulkLoadRateMinKey:
+			return megaBytes2Bytes(rate)
+		case common.CollectionQueryRateMaxKey:
+			return rate
+		case common.CollectionQueryRateMinKey:
+			return rate
+		case common.CollectionSearchRateMaxKey:
+			return rate
+		case common.CollectionSearchRateMinKey:
+			return rate
+		case common.CollectionDiskQuotaKey:
+			return megaBytes2Bytes(rate)
+
+		default:
+			return float64(0)
+		}
+	}
+
+	v, ok := properties[configKey]
+	if ok {
+		rate, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			log.Warn("invalid configuration for collection dml rate",
+				zap.String("config item", configKey),
+				zap.String("config value", v))
+			return getCollectionRateLimitConfigDefaultValue(configKey)
+		}
+
+		rateInBytes := toBytesIfNecessary(rate)
+		if rateInBytes < 0 {
+			return getCollectionRateLimitConfigDefaultValue(configKey)
+		}
+		return rateInBytes
+	}
+
+	return getCollectionRateLimitConfigDefaultValue(configKey)
 }

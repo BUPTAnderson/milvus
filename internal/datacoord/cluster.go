@@ -20,13 +20,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/metrics"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
 	"github.com/samber/lo"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 // Cluster provides interfaces to interact with datanode cluster
@@ -60,21 +61,13 @@ func (c *Cluster) Startup(ctx context.Context, nodes []*NodeInfo) error {
 // Register registers a new node in cluster
 func (c *Cluster) Register(node *NodeInfo) error {
 	c.sessionManager.AddSession(node)
-	err := c.channelManager.AddNode(node.NodeID)
-	if err == nil {
-		metrics.DataCoordNumDataNodes.WithLabelValues().Inc()
-	}
-	return err
+	return c.channelManager.AddNode(node.NodeID)
 }
 
 // UnRegister removes a node from cluster
 func (c *Cluster) UnRegister(node *NodeInfo) error {
 	c.sessionManager.DeleteSession(node)
-	err := c.channelManager.DeleteNode(node.NodeID)
-	if err == nil {
-		metrics.DataCoordNumDataNodes.WithLabelValues().Dec()
-	}
-	return err
+	return c.channelManager.DeleteNode(node.NodeID)
 }
 
 // Watch tries to add a channel in datanode cluster
@@ -85,7 +78,8 @@ func (c *Cluster) Watch(ch string, collectionID UniqueID) error {
 // Flush sends flush requests to dataNodes specified
 // which also according to channels where segments are assigned to.
 func (c *Cluster) Flush(ctx context.Context, nodeID int64, channel string,
-	segments []*datapb.SegmentInfo, markSegments []*datapb.SegmentInfo) error {
+	segments []*datapb.SegmentInfo,
+) error {
 	if !c.channelManager.Match(nodeID, channel) {
 		log.Warn("node is not matched with channel",
 			zap.String("channel", channel),
@@ -103,15 +97,38 @@ func (c *Cluster) Flush(ctx context.Context, nodeID int64, channel string,
 	req := &datapb.FlushSegmentsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_Flush),
-			commonpbutil.WithSourceID(Params.DataCoordCfg.GetNodeID()),
+			commonpbutil.WithSourceID(paramtable.GetNodeID()),
+			commonpbutil.WithTargetID(nodeID),
 		),
-		CollectionID:   ch.CollectionID,
-		SegmentIDs:     lo.Map(segments, getSegmentID),
-		MarkSegmentIDs: lo.Map(markSegments, getSegmentID),
+		CollectionID: ch.CollectionID,
+		SegmentIDs:   lo.Map(segments, getSegmentID),
 	}
 
 	c.sessionManager.Flush(ctx, nodeID, req)
 	return nil
+}
+
+func (c *Cluster) FlushChannels(ctx context.Context, nodeID int64, flushTs Timestamp, channels []string) error {
+	if len(channels) == 0 {
+		return nil
+	}
+
+	for _, channel := range channels {
+		if !c.channelManager.Match(nodeID, channel) {
+			return fmt.Errorf("channel %s is not watched on node %d", channel, nodeID)
+		}
+	}
+
+	req := &datapb.FlushChannelsRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithSourceID(paramtable.GetNodeID()),
+			commonpbutil.WithTargetID(nodeID),
+		),
+		FlushTs:  flushTs,
+		Channels: channels,
+	}
+
+	return c.sessionManager.FlushChannels(ctx, nodeID, req)
 }
 
 // Import sends import requests to DataNodes whose ID==nodeID.
@@ -120,8 +137,14 @@ func (c *Cluster) Import(ctx context.Context, nodeID int64, it *datapb.ImportTas
 }
 
 // ReCollectSegmentStats triggers a ReCollectSegmentStats call from session manager.
-func (c *Cluster) ReCollectSegmentStats(ctx context.Context, nodeID int64) {
-	c.sessionManager.ReCollectSegmentStats(ctx, nodeID)
+func (c *Cluster) ReCollectSegmentStats(ctx context.Context) error {
+	for _, node := range c.sessionManager.getLiveNodeIDs() {
+		err := c.sessionManager.ReCollectSegmentStats(ctx, node)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetSessions returns all sessions
@@ -132,4 +155,5 @@ func (c *Cluster) GetSessions() []*Session {
 // Close releases resources opened in Cluster
 func (c *Cluster) Close() {
 	c.sessionManager.Close()
+	c.channelManager.Close()
 }

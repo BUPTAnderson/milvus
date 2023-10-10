@@ -13,7 +13,7 @@ package rmq
 
 import (
 	"github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/client"
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 // Check rmqMessage implements ConsumerMessage
@@ -31,7 +31,7 @@ func (rm *rmqMessage) Topic() string {
 
 // Properties returns the properties of rocksmq message
 func (rm *rmqMessage) Properties() map[string]string {
-	return nil
+	return rm.msg.Properties
 }
 
 // Payload returns the payload of rocksmq message

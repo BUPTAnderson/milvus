@@ -17,57 +17,70 @@
 package observers
 
 import (
-	"context"
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/kv"
-	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
-	"github.com/milvus-io/milvus/internal/util/etcd"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/milvus-io/milvus/internal/kv"
+	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/metastore"
+	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
+	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
+	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type CollectionObserverSuite struct {
 	suite.Suite
 
 	// Data
-	collections    []int64
-	partitions     map[int64][]int64 // CollectionID -> PartitionIDs
-	channels       map[int64][]*meta.DmChannel
-	segments       map[int64][]*datapb.SegmentInfo // CollectionID -> []datapb.SegmentInfo
-	loadTypes      map[int64]querypb.LoadType
-	replicaNumber  map[int64]int32
-	loadPercentage map[int64]int32
-	nodes          []int64
+	collections   []int64
+	partitions    map[int64][]int64 // CollectionID -> PartitionIDs
+	channels      map[int64][]*meta.DmChannel
+	segments      map[int64][]*datapb.SegmentInfo // CollectionID -> []datapb.SegmentInfo
+	loadTypes     map[int64]querypb.LoadType
+	replicaNumber map[int64]int32
+	nodes         []int64
 
 	// Mocks
 	idAllocator func() (int64, error)
 	etcd        *clientv3.Client
 	kv          kv.MetaKv
-	store       meta.Store
+	store       metastore.QueryCoordCatalog
+	broker      *meta.MockBroker
 
 	// Dependencies
-	dist      *meta.DistributionManager
-	meta      *meta.Meta
-	targetMgr *meta.TargetManager
+	dist              *meta.DistributionManager
+	meta              *meta.Meta
+	targetMgr         *meta.TargetManager
+	targetObserver    *TargetObserver
+	leaderObserver    *LeaderObserver
+	checkerController *checkers.CheckerController
 
 	// Test object
 	ob *CollectionObserver
 }
 
 func (suite *CollectionObserverSuite) SetupSuite() {
-	Params.Init()
+	paramtable.Init()
 
-	suite.collections = []int64{100, 101}
+	suite.collections = []int64{100, 101, 102, 103}
 	suite.partitions = map[int64][]int64{
 		100: {10},
 		101: {11, 12},
+		102: {13},
+		103: {14},
 	}
 	suite.channels = map[int64][]*meta.DmChannel{
 		100: {
@@ -88,6 +101,18 @@ func (suite *CollectionObserverSuite) SetupSuite() {
 			meta.DmChannelFromVChannel(&datapb.VchannelInfo{
 				CollectionID: 101,
 				ChannelName:  "101-dmc1",
+			}),
+		},
+		102: {
+			meta.DmChannelFromVChannel(&datapb.VchannelInfo{
+				CollectionID: 102,
+				ChannelName:  "102-dmc0",
+			}),
+		},
+		103: {
+			meta.DmChannelFromVChannel(&datapb.VchannelInfo{
+				CollectionID: 103,
+				ChannelName:  "103-dmc0",
 			}),
 		},
 	}
@@ -120,18 +145,20 @@ func (suite *CollectionObserverSuite) SetupSuite() {
 				InsertChannel: "101-dmc1",
 			},
 		},
+		102: genSegmentsInfo(999, 5, 102, 13, "102-dmc0"),
+		103: genSegmentsInfo(10, 2000, 103, 14, "103-dmc0"),
 	}
 	suite.loadTypes = map[int64]querypb.LoadType{
 		100: querypb.LoadType_LoadCollection,
 		101: querypb.LoadType_LoadPartition,
+		102: querypb.LoadType_LoadCollection,
+		103: querypb.LoadType_LoadCollection,
 	}
 	suite.replicaNumber = map[int64]int32{
 		100: 1,
 		101: 1,
-	}
-	suite.loadPercentage = map[int64]int32{
-		100: 0,
-		101: 50,
+		102: 1,
+		103: 2,
 	}
 	suite.nodes = []int64{1, 2, 3}
 }
@@ -142,40 +169,69 @@ func (suite *CollectionObserverSuite) SetupTest() {
 	suite.idAllocator = RandomIncrementIDAllocator()
 	log.Debug("create embedded etcd KV...")
 	config := GenerateEtcdConfig()
-	client, err := etcd.GetEtcdClient(&config)
+	client, err := etcd.GetEtcdClient(
+		config.UseEmbedEtcd.GetAsBool(),
+		config.EtcdUseSSL.GetAsBool(),
+		config.Endpoints.GetAsStrings(),
+		config.EtcdTLSCert.GetValue(),
+		config.EtcdTLSKey.GetValue(),
+		config.EtcdTLSCACert.GetValue(),
+		config.EtcdTLSMinVersion.GetValue())
 	suite.Require().NoError(err)
-	suite.kv = etcdkv.NewEtcdKV(client, Params.EtcdCfg.MetaRootPath+"-"+RandomMetaRootPath())
+	suite.kv = etcdkv.NewEtcdKV(client, Params.EtcdCfg.MetaRootPath.GetValue()+"-"+RandomMetaRootPath())
 	suite.Require().NoError(err)
 	log.Debug("create meta store...")
-	suite.store = meta.NewMetaStore(suite.kv)
+	suite.store = querycoord.NewCatalog(suite.kv)
 
 	// Dependencies
 	suite.dist = meta.NewDistributionManager()
-	suite.meta = meta.NewMeta(suite.idAllocator, suite.store)
-	suite.targetMgr = meta.NewTargetManager()
+	suite.meta = meta.NewMeta(suite.idAllocator, suite.store, session.NewNodeManager())
+	suite.broker = meta.NewMockBroker(suite.T())
+	suite.targetMgr = meta.NewTargetManager(suite.broker, suite.meta)
+	suite.targetObserver = NewTargetObserver(suite.meta,
+		suite.targetMgr,
+		suite.dist,
+		suite.broker,
+	)
+	suite.checkerController = &checkers.CheckerController{}
+
+	mockCluster := session.NewMockCluster(suite.T())
+	suite.leaderObserver = NewLeaderObserver(suite.dist, suite.meta, suite.targetMgr, suite.broker, mockCluster)
+	mockCluster.EXPECT().SyncDistribution(mock.Anything, mock.Anything, mock.Anything).Return(merr.Status(nil), nil).Maybe()
 
 	// Test object
 	suite.ob = NewCollectionObserver(
 		suite.dist,
 		suite.meta,
 		suite.targetMgr,
+		suite.targetObserver,
+		suite.leaderObserver,
+		suite.checkerController,
 	)
 
+	for _, collection := range suite.collections {
+		suite.broker.EXPECT().GetPartitions(mock.Anything, collection).Return(suite.partitions[collection], nil).Maybe()
+	}
+	suite.targetObserver.Start()
+	suite.leaderObserver.Start()
+	suite.ob.Start()
 	suite.loadAll()
 }
 
 func (suite *CollectionObserverSuite) TearDownTest() {
+	suite.targetObserver.Stop()
 	suite.ob.Stop()
 	suite.kv.Close()
 }
 
 func (suite *CollectionObserverSuite) TestObserve() {
 	const (
-		timeout = 2 * time.Second
+		timeout = 3 * time.Second
 	)
+	// time before load
+	time := suite.meta.GetCollection(suite.collections[2]).UpdatedAt
 	// Not timeout
-	Params.QueryCoordCfg.LoadTimeoutSeconds = timeout
-	suite.ob.Start(context.Background())
+	paramtable.Get().Save(Params.QueryCoordCfg.LoadTimeoutSeconds.Key, "3")
 
 	// Collection 100 loaded before timeout,
 	// collection 101 timeout
@@ -191,19 +247,88 @@ func (suite *CollectionObserverSuite) TestObserve() {
 		Channel:      "100-dmc1",
 		Segments:     map[int64]*querypb.SegmentDist{2: {NodeID: 2, Version: 0}},
 	})
+	view1 := &meta.LeaderView{
+		ID:           3,
+		CollectionID: 102,
+		Channel:      "102-dmc0",
+		Segments:     map[int64]*querypb.SegmentDist{2: {NodeID: 5, Version: 0}},
+	}
+
+	segmentsInfo, ok := suite.segments[103]
+	suite.True(ok)
+	view2 := &meta.LeaderView{
+		ID:           3,
+		CollectionID: 13,
+		Channel:      "103-dmc0",
+		Segments:     make(map[int64]*querypb.SegmentDist),
+	}
+	for _, segment := range segmentsInfo {
+		view2.Segments[segment.GetID()] = &querypb.SegmentDist{
+			NodeID: 3, Version: 0,
+		}
+	}
+	suite.dist.LeaderViewManager.Update(3, view1, view2)
+
 	suite.Eventually(func() bool {
-		return suite.isCollectionLoaded(suite.collections[0]) &&
-			suite.isCollectionTimeout(suite.collections[1])
+		return suite.isCollectionLoadedContinue(suite.collections[2], time)
+	}, timeout-1, timeout/10)
+
+	suite.Eventually(func() bool {
+		return suite.isCollectionLoaded(suite.collections[0])
+	}, timeout*2, timeout/10)
+
+	suite.Eventually(func() bool {
+		return suite.isCollectionTimeout(suite.collections[1])
+	}, timeout*2, timeout/10)
+
+	suite.Eventually(func() bool {
+		return suite.isCollectionLoaded(suite.collections[3])
+	}, timeout*2, timeout/10)
+}
+
+func (suite *CollectionObserverSuite) TestObservePartition() {
+	const (
+		timeout = 3 * time.Second
+	)
+	paramtable.Get().Save(Params.QueryCoordCfg.LoadTimeoutSeconds.Key, "3")
+
+	// Partition 10 loaded
+	// Partition 11 timeout
+	suite.dist.LeaderViewManager.Update(1, &meta.LeaderView{
+		ID:           1,
+		CollectionID: 100,
+		Channel:      "100-dmc0",
+		Segments:     map[int64]*querypb.SegmentDist{1: {NodeID: 1, Version: 0}},
+	}, &meta.LeaderView{
+		ID:           1,
+		CollectionID: 101,
+		Channel:      "",
+
+		Segments: map[int64]*querypb.SegmentDist{},
+	})
+	suite.dist.LeaderViewManager.Update(2, &meta.LeaderView{
+		ID:           2,
+		CollectionID: 100,
+		Channel:      "100-dmc1",
+		Segments:     map[int64]*querypb.SegmentDist{2: {NodeID: 2, Version: 0}},
+	})
+
+	suite.Eventually(func() bool {
+		return suite.isPartitionLoaded(suite.partitions[100][0])
+	}, timeout*2, timeout/10)
+
+	suite.Eventually(func() bool {
+		return suite.isPartitionTimeout(suite.collections[1], suite.partitions[101][0])
 	}, timeout*2, timeout/10)
 }
 
 func (suite *CollectionObserverSuite) isCollectionLoaded(collection int64) bool {
 	exist := suite.meta.Exist(collection)
-	percentage := suite.meta.GetLoadPercentage(collection)
-	status := suite.meta.GetStatus(collection)
+	percentage := suite.meta.CalculateLoadPercentage(collection)
+	status := suite.meta.CalculateLoadStatus(collection)
 	replicas := suite.meta.ReplicaManager.GetByCollection(collection)
-	channels := suite.targetMgr.GetDmChannelsByCollection(collection)
-	segments := suite.targetMgr.GetSegmentsByCollection(collection)
+	channels := suite.targetMgr.GetDmChannelsByCollection(collection, meta.CurrentTarget)
+	segments := suite.targetMgr.GetHistoricalSegmentsByCollection(collection, meta.CurrentTarget)
 
 	return exist &&
 		percentage == 100 &&
@@ -213,27 +338,59 @@ func (suite *CollectionObserverSuite) isCollectionLoaded(collection int64) bool 
 		len(segments) == len(suite.segments[collection])
 }
 
+func (suite *CollectionObserverSuite) isPartitionLoaded(partitionID int64) bool {
+	partition := suite.meta.GetPartition(partitionID)
+	if partition == nil {
+		return false
+	}
+	collection := partition.GetCollectionID()
+	percentage := suite.meta.GetPartitionLoadPercentage(partitionID)
+	status := partition.GetStatus()
+	channels := suite.targetMgr.GetDmChannelsByCollection(collection, meta.CurrentTarget)
+	segments := suite.targetMgr.GetHistoricalSegmentsByPartition(collection, partitionID, meta.CurrentTarget)
+	expectedSegments := lo.Filter(suite.segments[collection], func(seg *datapb.SegmentInfo, _ int) bool {
+		return seg.PartitionID == partitionID
+	})
+	return percentage == 100 &&
+		status == querypb.LoadStatus_Loaded &&
+		len(channels) == len(suite.channels[collection]) &&
+		len(segments) == len(expectedSegments)
+}
+
 func (suite *CollectionObserverSuite) isCollectionTimeout(collection int64) bool {
 	exist := suite.meta.Exist(collection)
 	replicas := suite.meta.ReplicaManager.GetByCollection(collection)
-	channels := suite.targetMgr.GetDmChannelsByCollection(collection)
-	segments := suite.targetMgr.GetSegmentsByCollection(collection)
-
+	channels := suite.targetMgr.GetDmChannelsByCollection(collection, meta.CurrentTarget)
+	segments := suite.targetMgr.GetHistoricalSegmentsByCollection(collection, meta.CurrentTarget)
 	return !(exist ||
 		len(replicas) > 0 ||
 		len(channels) > 0 ||
 		len(segments) > 0)
 }
 
+func (suite *CollectionObserverSuite) isPartitionTimeout(collection int64, partitionID int64) bool {
+	partition := suite.meta.GetPartition(partitionID)
+	segments := suite.targetMgr.GetHistoricalSegmentsByPartition(collection, partitionID, meta.CurrentTarget)
+	return partition == nil && len(segments) == 0
+}
+
+func (suite *CollectionObserverSuite) isCollectionLoadedContinue(collection int64, beforeTime time.Time) bool {
+	return suite.meta.GetCollection(collection).UpdatedAt.After(beforeTime)
+}
+
 func (suite *CollectionObserverSuite) loadAll() {
 	for _, collection := range suite.collections {
 		suite.load(collection)
 	}
+	suite.targetMgr.UpdateCollectionCurrentTarget(suite.collections[0])
+	suite.targetMgr.UpdateCollectionNextTarget(suite.collections[0])
+	suite.targetMgr.UpdateCollectionCurrentTarget(suite.collections[2])
+	suite.targetMgr.UpdateCollectionNextTarget(suite.collections[2])
 }
 
 func (suite *CollectionObserverSuite) load(collection int64) {
 	// Mock meta data
-	replicas, err := suite.meta.ReplicaManager.Spawn(collection, suite.replicaNumber[collection])
+	replicas, err := suite.meta.ReplicaManager.Spawn(collection, suite.replicaNumber[collection], meta.DefaultResourceGroupName)
 	suite.NoError(err)
 	for _, replica := range replicas {
 		replica.AddNode(suite.nodes...)
@@ -241,35 +398,65 @@ func (suite *CollectionObserverSuite) load(collection int64) {
 	err = suite.meta.ReplicaManager.Put(replicas...)
 	suite.NoError(err)
 
-	if suite.loadTypes[collection] == querypb.LoadType_LoadCollection {
-		suite.meta.PutCollection(&meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
+	suite.meta.PutCollection(&meta.Collection{
+		CollectionLoadInfo: &querypb.CollectionLoadInfo{
+			CollectionID:  collection,
+			ReplicaNumber: suite.replicaNumber[collection],
+			Status:        querypb.LoadStatus_Loading,
+			LoadType:      suite.loadTypes[collection],
+		},
+		LoadPercentage: 0,
+		CreatedAt:      time.Now(),
+	})
+
+	for _, partition := range suite.partitions[collection] {
+		suite.meta.PutPartition(&meta.Partition{
+			PartitionLoadInfo: &querypb.PartitionLoadInfo{
 				CollectionID:  collection,
+				PartitionID:   partition,
 				ReplicaNumber: suite.replicaNumber[collection],
 				Status:        querypb.LoadStatus_Loading,
 			},
 			LoadPercentage: 0,
 			CreatedAt:      time.Now(),
 		})
-	} else {
-		for _, partition := range suite.partitions[collection] {
-			suite.meta.PutPartition(&meta.Partition{
-				PartitionLoadInfo: &querypb.PartitionLoadInfo{
-					CollectionID:  collection,
-					PartitionID:   partition,
-					ReplicaNumber: suite.replicaNumber[collection],
-					Status:        querypb.LoadStatus_Loading,
-				},
-				LoadPercentage: 0,
-				CreatedAt:      time.Now(),
-			})
-		}
 	}
 
-	suite.targetMgr.AddDmChannel(suite.channels[collection]...)
-	suite.targetMgr.AddSegment(suite.segments[collection]...)
+	dmChannels := make([]*datapb.VchannelInfo, 0)
+	for _, channel := range suite.channels[collection] {
+		dmChannels = append(dmChannels, &datapb.VchannelInfo{
+			CollectionID: collection,
+			ChannelName:  channel.GetChannelName(),
+		})
+	}
+
+	allSegments := make([]*datapb.SegmentInfo, 0) // partitionID -> segments
+	for _, segment := range suite.segments[collection] {
+		allSegments = append(allSegments, &datapb.SegmentInfo{
+			ID:            segment.GetID(),
+			PartitionID:   segment.PartitionID,
+			InsertChannel: segment.GetInsertChannel(),
+		})
+	}
+
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection).Return(dmChannels, allSegments, nil)
+	suite.targetMgr.UpdateCollectionNextTarget(collection)
 }
 
 func TestCollectionObserver(t *testing.T) {
 	suite.Run(t, new(CollectionObserverSuite))
+}
+
+func genSegmentsInfo(count int, start int, collID int64, partitionID int64, insertChannel string) []*datapb.SegmentInfo {
+	ret := make([]*datapb.SegmentInfo, 0, count)
+	for i := 0; i < count; i++ {
+		segment := &datapb.SegmentInfo{
+			ID:            int64(start + i),
+			CollectionID:  collID,
+			PartitionID:   partitionID,
+			InsertChannel: insertChannel,
+		}
+		ret = append(ret, segment)
+	}
+	return ret
 }

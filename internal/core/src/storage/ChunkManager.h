@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <map>
 
 namespace milvus::storage {
 
@@ -73,7 +74,10 @@ class ChunkManager {
      * @return uint64_t
      */
     virtual uint64_t
-    Read(const std::string& filepath, uint64_t offset, void* buf, uint64_t len) = 0;
+    Read(const std::string& filepath,
+         uint64_t offset,
+         void* buf,
+         uint64_t len) = 0;
 
     /**
      * @brief Write buffer to file with offset
@@ -82,7 +86,10 @@ class ChunkManager {
      * @param len
      */
     virtual void
-    Write(const std::string& filepath, uint64_t offset, void* buf, uint64_t len) = 0;
+    Write(const std::string& filepath,
+          uint64_t offset,
+          void* buf,
+          uint64_t len) = 0;
 
     /**
      * @brief List files with same prefix
@@ -106,23 +113,24 @@ class ChunkManager {
      */
     virtual std::string
     GetName() const = 0;
-};
 
-/**
- * @brief RemoteChunkManager is responsible for read and write Remote file
- * that inherited from ChunkManager.
- */
-
-class RemoteChunkManager : public ChunkManager {
- public:
-    virtual ~RemoteChunkManager() {
-    }
+    /**
+     * @brief Get the Root Path
+     * @return std::string
+     */
     virtual std::string
-    GetName() const {
-        return "RemoteChunkManager";
-    }
+    GetRootPath() const = 0;
 };
 
-using RemoteChunkManagerPtr = std::unique_ptr<RemoteChunkManager>;
+using ChunkManagerPtr = std::shared_ptr<ChunkManager>;
+
+enum class ChunkManagerType : int8_t {
+    None = 0,
+    Local = 1,
+    Minio = 2,
+    Remote = 3,
+};
+
+extern std::map<std::string, ChunkManagerType> ChunkManagerType_Map;
 
 }  // namespace milvus::storage

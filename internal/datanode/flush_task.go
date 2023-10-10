@@ -18,15 +18,17 @@ package datanode
 
 import (
 	"context"
-	"errors"
 	"sync"
 
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/util/retry"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/internal/kv"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
 
 // errStart used for retry start
@@ -44,7 +46,8 @@ type flushDeleteTask interface {
 
 // flushTaskRunner controls a single flush task lifetime
 // this runner will wait insert data flush & del data flush done
-//  then call the notifyFunc
+//
+//	then call the notifyFunc
 type flushTaskRunner struct {
 	sync.WaitGroup
 	kv.BaseKV
@@ -61,7 +64,7 @@ type flushTaskRunner struct {
 	insertLogs map[UniqueID]*datapb.Binlog
 	statsLogs  map[UniqueID]*datapb.Binlog
 	deltaLogs  []*datapb.Binlog //[]*DelDataBuf
-	pos        *internalpb.MsgPosition
+	pos        *msgpb.MsgPosition
 	flushed    bool
 	dropped    bool
 
@@ -122,7 +125,8 @@ func (t *flushTaskRunner) init(f notifyMetaFunc, postFunc taskPostFunc, signal <
 
 // runFlushInsert executes flush insert task with once and retry
 func (t *flushTaskRunner) runFlushInsert(task flushInsertTask,
-	binlogs, statslogs map[UniqueID]*datapb.Binlog, flushed bool, dropped bool, pos *internalpb.MsgPosition, opts ...retry.Option) {
+	binlogs, statslogs map[UniqueID]*datapb.Binlog, flushed bool, dropped bool, pos *msgpb.MsgPosition, opts ...retry.Option,
+) {
 	t.insertOnce.Do(func() {
 		t.insertLogs = binlogs
 		t.statsLogs = statslogs
@@ -130,10 +134,11 @@ func (t *flushTaskRunner) runFlushInsert(task flushInsertTask,
 		t.pos = pos
 		t.dropped = dropped
 		log.Info("running flush insert task",
-			zap.Int64("segment ID", t.segmentID),
+			zap.Int64("segmentID", t.segmentID),
 			zap.Bool("flushed", flushed),
 			zap.Bool("dropped", dropped),
 			zap.Any("position", pos),
+			zap.Time("PosTime", tsoutil.PhysicalTime(pos.GetTimestamp())),
 		)
 		go func() {
 			err := retry.Do(context.Background(), func() error {
@@ -215,7 +220,14 @@ func (t *flushTaskRunner) getFlushPack() *segmentFlushPack {
 		dropped:    t.dropped,
 	}
 	log.Debug("flush pack composed",
-		zap.Any("pack", pack))
+		zap.Int64("segmentID", t.segmentID),
+		zap.Int("insertLogs", len(t.insertLogs)),
+		zap.Int("statsLogs", len(t.statsLogs)),
+		zap.Int("deleteLogs", len(t.deltaLogs)),
+		zap.Bool("flushed", t.flushed),
+		zap.Bool("dropped", t.dropped),
+	)
+
 	if t.insertErr != nil || t.deleteErr != nil {
 		log.Warn("flush task error detected", zap.Error(t.insertErr), zap.Error(t.deleteErr))
 		pack.err = errors.New("execution failed")

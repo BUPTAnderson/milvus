@@ -22,6 +22,9 @@ void
 SegcoreSetChunkRows(const int64_t);
 
 void
+SegcoreSetEnableGrowingSegmentIndex(const bool);
+
+void
 SegcoreSetNlist(const int64_t);
 
 void
@@ -30,6 +33,21 @@ SegcoreSetNprobe(const int64_t);
 // return value must be freed by the caller
 char*
 SegcoreSetSimdType(const char*);
+
+void
+SegcoreSetKnowhereBuildThreadPoolNum(const uint32_t num_threads);
+
+void
+SegcoreSetKnowhereSearchThreadPoolNum(const uint32_t num_threads);
+
+void
+SegcoreCloseGlog();
+
+int32_t
+GetCurrentIndexVersion();
+
+int32_t
+GetMinimalIndexVersion();
 
 #ifdef __cplusplus
 }

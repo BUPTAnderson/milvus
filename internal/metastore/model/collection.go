@@ -1,14 +1,17 @@
 package model
 
 import (
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
+	"github.com/samber/lo"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/common"
 )
 
 type Collection struct {
 	TenantID             string
+	DBID                 int64
 	CollectionID         int64
 	Partitions           []*Partition
 	Name                 string
@@ -24,15 +27,17 @@ type Collection struct {
 	Aliases              []string // TODO: deprecate this.
 	Properties           []*commonpb.KeyValuePair
 	State                pb.CollectionState
+	EnableDynamicField   bool
 }
 
-func (c Collection) Available() bool {
+func (c *Collection) Available() bool {
 	return c.State == pb.CollectionState_CollectionCreated
 }
 
-func (c Collection) Clone() *Collection {
+func (c *Collection) Clone() *Collection {
 	return &Collection{
 		TenantID:             c.TenantID,
+		DBID:                 c.DBID,
 		CollectionID:         c.CollectionID,
 		Name:                 c.Name,
 		Description:          c.Description,
@@ -48,18 +53,29 @@ func (c Collection) Clone() *Collection {
 		Aliases:              common.CloneStringList(c.Aliases),
 		Properties:           common.CloneKeyValuePairs(c.Properties),
 		State:                c.State,
+		EnableDynamicField:   c.EnableDynamicField,
 	}
 }
 
-func (c Collection) Equal(other Collection) bool {
+func (c *Collection) GetPartitionNum(filterUnavailable bool) int {
+	if !filterUnavailable {
+		return len(c.Partitions)
+	}
+	return lo.CountBy(c.Partitions, func(p *Partition) bool { return p.Available() })
+}
+
+func (c *Collection) Equal(other Collection) bool {
 	return c.TenantID == other.TenantID &&
+		c.DBID == other.DBID &&
 		CheckPartitionsEqual(c.Partitions, other.Partitions) &&
 		c.Name == other.Name &&
 		c.Description == other.Description &&
 		c.AutoID == other.AutoID &&
 		CheckFieldsEqual(c.Fields, other.Fields) &&
 		c.ShardsNum == other.ShardsNum &&
-		c.ConsistencyLevel == other.ConsistencyLevel
+		c.ConsistencyLevel == other.ConsistencyLevel &&
+		checkParamsEqual(c.Properties, other.Properties) &&
+		c.EnableDynamicField == other.EnableDynamicField
 }
 
 func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
@@ -79,6 +95,7 @@ func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
 
 	return &Collection{
 		CollectionID:         coll.ID,
+		DBID:                 coll.DbId,
 		Name:                 coll.Schema.Name,
 		Description:          coll.Schema.Description,
 		AutoID:               coll.Schema.AutoID,
@@ -92,6 +109,7 @@ func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
 		StartPositions:       coll.StartPositions,
 		State:                coll.State,
 		Properties:           coll.Properties,
+		EnableDynamicField:   coll.Schema.EnableDynamicField,
 	}
 }
 
@@ -130,9 +148,10 @@ func marshalCollectionModelWithConfig(coll *Collection, c *config) *pb.Collectio
 	}
 
 	collSchema := &schemapb.CollectionSchema{
-		Name:        coll.Name,
-		Description: coll.Description,
-		AutoID:      coll.AutoID,
+		Name:               coll.Name,
+		Description:        coll.Description,
+		AutoID:             coll.AutoID,
+		EnableDynamicField: coll.EnableDynamicField,
 	}
 
 	if c.withFields {
@@ -142,6 +161,7 @@ func marshalCollectionModelWithConfig(coll *Collection, c *config) *pb.Collectio
 
 	collectionPb := &pb.CollectionInfo{
 		ID:                   coll.CollectionID,
+		DbId:                 coll.DBID,
 		Schema:               collSchema,
 		CreateTime:           coll.CreateTime,
 		VirtualChannelNames:  coll.VirtualChannelNames,

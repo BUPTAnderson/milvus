@@ -10,8 +10,10 @@ on:
     paths:
       - 'scripts/**'
       - 'internal/**'
+      - 'pkg/**'
       - 'cmd/**'
       - 'build/**'
+      - 'tests/integration/**'
       - '.github/workflows/mac.yaml'
       - '.env'
       - docker-compose.yml
@@ -26,32 +28,18 @@ jobs:
   mac:
     name: Code Checker MacOS 12
     runs-on: macos-12
-    timeout-minutes: 60
+    timeout-minutes: 300 
     steps:
       - name: Checkout
         uses: actions/checkout@v2
-      - name: "Generate CCache Hash"
+      - name: 'Generate CCache Hash'
         env:
           CORE_HASH: ${{ hashFiles( 'internal/core/**/*.cpp', 'internal/core/**/*.cc', 'internal/core/**/*.c', 'internal/core/**/*.h', 'internal/core/**/*.hpp', 'internal/core/**/CMakeLists.txt') }}
         run: |
           echo "corehash=${CORE_HASH}" >> $GITHUB_ENV
           echo "Set CCache hash to ${CORE_HASH}"
-      - name: Mac Cache Third Party
-        uses: actions/cache@v3
-        with:
-          path: |
-            /tmp/thirdparty 
-          key: macos-thirdparty-${{ hashFiles('internal/core/thirdparty/**') }}
-          restore-keys: macos-thirdparty-
-      - name: Mac Cache Cmake Build             
-        uses: actions/cache@v3
-        with:
-          path: |
-            cmake_build/3rdparty_download/download
-          key: macos-cmake-build-${{ env.corehash }}
-          restore-keys: macos-cmake-build-
       - name: Mac Cache CCache Volumes
-        uses: actions/cache@v3
+        uses: pat-s/always-upload-cache@v3
         with:
           path: /var/tmp/ccache
           key: macos-ccache-${{ env.corehash }}
@@ -66,6 +54,12 @@ jobs:
           path: ~/go/pkg/mod
           key: macos-go-mod-${{ hashFiles('**/go.sum') }}
           restore-keys: macos-go-mod-
+      - name: Mac Cache Conan Packages
+        uses: pat-s/always-upload-cache@v3
+        with:
+          path: ~/.conan
+          key: macos-conan-${{ hashFiles('internal/core/conanfile.*') }}
+          restore-keys: macos-conan-
       - name: Code Check
         env:
           CCACHE_DIR: /var/tmp/ccache
@@ -73,16 +67,17 @@ jobs:
           CCACHE_COMPRESS: 1
           CCACHE_COMPRESSLEVEL: 5
           CCACHE_MAXSIZE: 2G
-          CUSTOM_THIRDPARTY_PATH: /tmp/thirdparty
         run: |
           if [[ ! -d "/var/tmp/ccache" ]];then
             mkdir -p /var/tmp/ccache
           fi
-          brew install boost libomp ninja tbb openblas ccache
+          ls -alh /var/tmp/ccache
+          brew install libomp ninja openblas ccache pkg-config
+          pip3 install conan==1.58.0
           if [[ ! -d "/usr/local/opt/llvm" ]]; then
             ln -s /usr/local/opt/llvm@14 /usr/local/opt/llvm
           fi
-          make milvus && sh scripts/collect_arrow_dep.sh -f /tmp/thirdparty
+          make milvus
       - name: Upload Cmake log
         uses: actions/upload-artifact@v3
         if: ${{ failure() }}

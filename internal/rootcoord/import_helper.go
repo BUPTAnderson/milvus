@@ -1,29 +1,52 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rootcoord
 
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/log"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	"go.uber.org/zap"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-type GetCollectionNameFunc func(collID, partitionID UniqueID) (string, string, error)
+type GetCollectionNameFunc func(dbName string, collID, partitionID UniqueID) (string, string, error)
+
 type IDAllocator func(count uint32) (UniqueID, UniqueID, error)
+
 type ImportFunc func(ctx context.Context, req *datapb.ImportTaskRequest) (*datapb.ImportTaskResponse, error)
-type MarkSegmentsDroppedFunc func(ctx context.Context, segIDs []int64) (*commonpb.Status, error)
+
+type GetSegmentStatesFunc func(ctx context.Context, req *datapb.GetSegmentStatesRequest) (*datapb.GetSegmentStatesResponse, error)
+
 type DescribeIndexFunc func(ctx context.Context, colID UniqueID) (*indexpb.DescribeIndexResponse, error)
+
 type GetSegmentIndexStateFunc func(ctx context.Context, collID UniqueID, indexName string, segIDs []UniqueID) ([]*indexpb.SegmentIndexState, error)
+
 type UnsetIsImportingStateFunc func(context.Context, *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error)
 
 type ImportFactory interface {
 	NewGetCollectionNameFunc() GetCollectionNameFunc
 	NewIDAllocator() IDAllocator
 	NewImportFunc() ImportFunc
-	NewMarkSegmentsDroppedFunc() MarkSegmentsDroppedFunc
+	NewGetSegmentStatesFunc() GetSegmentStatesFunc
 	NewDescribeIndexFunc() DescribeIndexFunc
 	NewGetSegmentIndexStateFunc() GetSegmentIndexStateFunc
 	NewUnsetIsImportingStateFunc() UnsetIsImportingStateFunc
@@ -45,8 +68,8 @@ func (f ImportFactoryImpl) NewImportFunc() ImportFunc {
 	return ImportFuncWithCore(f.c)
 }
 
-func (f ImportFactoryImpl) NewMarkSegmentsDroppedFunc() MarkSegmentsDroppedFunc {
-	return MarkSegmentsDroppedWithCore(f.c)
+func (f ImportFactoryImpl) NewGetSegmentStatesFunc() GetSegmentStatesFunc {
+	return GetSegmentStatesWithCore(f.c)
 }
 
 func (f ImportFactoryImpl) NewDescribeIndexFunc() DescribeIndexFunc {
@@ -66,8 +89,8 @@ func NewImportFactory(c *Core) ImportFactory {
 }
 
 func GetCollectionNameWithCore(c *Core) GetCollectionNameFunc {
-	return func(collID, partitionID UniqueID) (string, string, error) {
-		colInfo, err := c.meta.GetCollectionByID(c.ctx, collID, typeutil.MaxTimestamp)
+	return func(dbName string, collID, partitionID UniqueID) (string, string, error) {
+		colInfo, err := c.meta.GetCollectionByID(c.ctx, dbName, collID, typeutil.MaxTimestamp, false)
 		if err != nil {
 			log.Error("Core failed to get collection name by id", zap.Int64("ID", collID), zap.Error(err))
 			return "", "", err
@@ -94,11 +117,9 @@ func ImportFuncWithCore(c *Core) ImportFunc {
 	}
 }
 
-func MarkSegmentsDroppedWithCore(c *Core) MarkSegmentsDroppedFunc {
-	return func(ctx context.Context, segIDs []int64) (*commonpb.Status, error) {
-		return c.broker.MarkSegmentsDropped(ctx, &datapb.MarkSegmentsDroppedRequest{
-			SegmentIds: segIDs,
-		})
+func GetSegmentStatesWithCore(c *Core) GetSegmentStatesFunc {
+	return func(ctx context.Context, req *datapb.GetSegmentStatesRequest) (*datapb.GetSegmentStatesResponse, error) {
+		return c.broker.GetSegmentStates(ctx, req)
 	}
 }
 

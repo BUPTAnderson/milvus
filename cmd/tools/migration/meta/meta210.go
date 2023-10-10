@@ -3,31 +3,38 @@ package meta
 import (
 	"fmt"
 
+	"github.com/golang/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/cmd/tools/migration/legacy"
 	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
-
-	"github.com/golang/protobuf/proto"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/util"
 )
 
 type FieldIndexesWithSchema struct {
 	indexes []*pb.FieldIndexInfo
 	schema  *schemapb.CollectionSchema
 }
+
 type FieldIndexes210 map[UniqueID]*FieldIndexesWithSchema // coll_id -> field indexes.
 
-type TtCollectionsMeta210 map[UniqueID]map[Timestamp]*pb.CollectionInfo // coll_id -> ts -> coll
-type CollectionsMeta210 map[UniqueID]*pb.CollectionInfo                 // coll_id -> coll
+type (
+	TtCollectionsMeta210 map[UniqueID]map[Timestamp]*pb.CollectionInfo // coll_id -> ts -> coll
+	CollectionsMeta210   map[UniqueID]*pb.CollectionInfo               // coll_id -> coll
+)
 
-type TtAliasesMeta210 map[string]map[Timestamp]*pb.CollectionInfo // alias name -> ts -> coll
-type AliasesMeta210 map[string]*pb.CollectionInfo                 // alias name -> coll
+type (
+	TtAliasesMeta210 map[string]map[Timestamp]*pb.CollectionInfo // alias name -> ts -> coll
+	AliasesMeta210   map[string]*pb.CollectionInfo               // alias name -> coll
+)
 
-type CollectionIndexesMeta210 map[UniqueID]map[UniqueID]*pb.IndexInfo     // coll_id -> index_id -> index
-type SegmentIndexesMeta210 map[UniqueID]map[UniqueID]*pb.SegmentIndexInfo // seg_id -> index_id -> segment index
+type (
+	CollectionIndexesMeta210 map[UniqueID]map[UniqueID]*pb.IndexInfo        // coll_id -> index_id -> index
+	SegmentIndexesMeta210    map[UniqueID]map[UniqueID]*pb.SegmentIndexInfo // seg_id -> index_id -> segment index
+)
 
 type IndexBuildMeta210 map[UniqueID]*legacypb.IndexMeta // index_build_id -> index
 
@@ -163,7 +170,7 @@ func (meta *TtCollectionsMeta210) GenerateSaves() map[string]string {
 	var err error
 	for collection := range *meta {
 		for ts := range (*meta)[collection] {
-			k := rootcoord.ComposeSnapshotKey(rootcoord.SnapshotPrefix, rootcoord.BuildCollectionKey(collection), rootcoord.SnapshotsSep, ts)
+			k := rootcoord.ComposeSnapshotKey(rootcoord.SnapshotPrefix, rootcoord.BuildCollectionKey(util.NonDBID, collection), rootcoord.SnapshotsSep, ts)
 			record := (*meta)[collection][ts]
 			if record == nil {
 				v = rootcoord.ConstructTombstone()
@@ -189,7 +196,7 @@ func (meta *CollectionsMeta210) GenerateSaves() map[string]string {
 	var err error
 	for collection := range *meta {
 		record := (*meta)[collection]
-		k := rootcoord.BuildCollectionKey(collection)
+		k := rootcoord.BuildCollectionKey(util.NonDBID, collection)
 		if record == nil {
 			v = rootcoord.ConstructTombstone()
 		} else {
@@ -296,6 +303,14 @@ func (meta *IndexBuildMeta210) GenerateSaves() map[string]string {
 		kvs[k] = string(v)
 	}
 	return kvs
+}
+
+func (meta *IndexBuildMeta210) GetAllBuildIDs() []UniqueID {
+	ret := make([]UniqueID, 0, len(*meta))
+	for buildID := range *meta {
+		ret = append(ret, buildID)
+	}
+	return ret
 }
 
 func (meta *FieldIndexes210) AddRecord(collectionID UniqueID, fieldIndexes []*pb.FieldIndexInfo, schema *schemapb.CollectionSchema) {

@@ -30,7 +30,72 @@ class MinioChunkManagerTest : public testing::Test {
 
     virtual void
     SetUp() {
-        chunk_manager_ = std::make_unique<MinioChunkManager>(get_default_storage_config());
+        configs_ = get_default_remote_storage_config();
+        chunk_manager_ = std::make_unique<MinioChunkManager>(configs_);
+    }
+
+ protected:
+    MinioChunkManagerPtr chunk_manager_;
+    StorageConfig configs_;
+};
+
+StorageConfig
+get_google_cloud_storage_config() {
+    auto endpoint = "storage.googleapis.com:443";
+    auto accessKey = "";
+    auto accessValue = "";
+    auto rootPath = "files";
+    auto useSSL = true;
+    auto useIam = true;
+    auto iamEndPoint = "";
+    auto bucketName = "gcp-zilliz-infra-test";
+
+    return StorageConfig{endpoint,
+                         bucketName,
+                         accessKey,
+                         accessValue,
+                         rootPath,
+                         "minio",
+                         iamEndPoint,
+                         "error",
+                         "",
+                         useSSL,
+                         useIam};
+}
+
+StorageConfig
+get_aliyun_cloud_storage_config() {
+    auto endpoint = "oss-cn-shanghai.aliyuncs.com:443";
+    auto accessKey = "";
+    auto accessValue = "";
+    auto rootPath = "files";
+    auto useSSL = true;
+    auto useIam = true;
+    auto iamEndPoint = "";
+    auto bucketName = "vdc-infra-poc";
+
+    return StorageConfig{endpoint,
+                         bucketName,
+                         accessKey,
+                         accessValue,
+                         rootPath,
+                         "minio",
+                         iamEndPoint,
+                         useSSL,
+                         useIam};
+}
+
+class AliyunChunkManagerTest : public testing::Test {
+ public:
+    AliyunChunkManagerTest() {
+    }
+    ~AliyunChunkManagerTest() {
+    }
+
+    virtual void
+    SetUp() {
+        chunk_manager_ = std::make_unique<MinioChunkManager>(
+            get_aliyun_cloud_storage_config());
     }
 
  protected:
@@ -58,13 +123,14 @@ TEST_F(MinioChunkManagerTest, BucketNegtive) {
     try {
         chunk_manager_->CreateBucket(testBucketName);
     } catch (S3ErrorException& e) {
-        EXPECT_TRUE(std::string(e.what()).find("BucketAlreadyOwnedByYou") != string::npos);
+        EXPECT_TRUE(std::string(e.what()).find("BucketAlreadyOwnedByYou") !=
+                    string::npos);
     }
     chunk_manager_->DeleteBucket(testBucketName);
 }
 
 TEST_F(MinioChunkManagerTest, ObjectExist) {
-    string testBucketName = "test-objexist";
+    string testBucketName = configs_.bucket_name;
     string objPath = "1/3";
     chunk_manager_->SetBucketName(testBucketName);
     if (!chunk_manager_->BucketExists(testBucketName)) {
@@ -77,15 +143,16 @@ TEST_F(MinioChunkManagerTest, ObjectExist) {
 }
 
 TEST_F(MinioChunkManagerTest, WritePositive) {
-    string testBucketName = "test-write";
+    string testBucketName = configs_.bucket_name;
     chunk_manager_->SetBucketName(testBucketName);
     EXPECT_EQ(chunk_manager_->GetBucketName(), testBucketName);
 
-    if (!chunk_manager_->BucketExists(testBucketName)) {
-        chunk_manager_->CreateBucket(testBucketName);
-    }
+    // if (!chunk_manager_->BucketExists(testBucketName)) {
+    //     chunk_manager_->CreateBucket(testBucketName);
+    // }
+    auto has_bucket = chunk_manager_->BucketExists(testBucketName);
     uint8_t data[5] = {0x17, 0x32, 0x45, 0x34, 0x23};
-    string path = "1/3/5";
+    string path = "1";
     chunk_manager_->Write(path, data, sizeof(data));
 
     bool exist = chunk_manager_->Exist(path);
@@ -110,7 +177,7 @@ TEST_F(MinioChunkManagerTest, WritePositive) {
 }
 
 TEST_F(MinioChunkManagerTest, ReadPositive) {
-    string testBucketName = "test-read";
+    string testBucketName = configs_.bucket_name;
     chunk_manager_->SetBucketName(testBucketName);
     EXPECT_EQ(chunk_manager_->GetBucketName(), testBucketName);
 
@@ -123,11 +190,11 @@ TEST_F(MinioChunkManagerTest, ReadPositive) {
     bool exist = chunk_manager_->Exist(path);
     EXPECT_EQ(exist, true);
     auto size = chunk_manager_->Size(path);
-    EXPECT_EQ(size, 5);
+    EXPECT_EQ(size, sizeof(data));
 
     uint8_t readdata[20] = {0};
-    size = chunk_manager_->Read(path, readdata, 20);
-    EXPECT_EQ(size, 5);
+    size = chunk_manager_->Read(path, readdata, sizeof(data));
+    EXPECT_EQ(size, sizeof(data));
     EXPECT_EQ(readdata[0], 0x17);
     EXPECT_EQ(readdata[1], 0x32);
     EXPECT_EQ(readdata[2], 0x45);
@@ -145,9 +212,9 @@ TEST_F(MinioChunkManagerTest, ReadPositive) {
     exist = chunk_manager_->Exist(path);
     EXPECT_EQ(exist, true);
     size = chunk_manager_->Size(path);
-    EXPECT_EQ(size, 5);
-    size = chunk_manager_->Read(path, readdata, 20);
-    EXPECT_EQ(size, 5);
+    EXPECT_EQ(size, sizeof(dataWithNULL));
+    size = chunk_manager_->Read(path, readdata, sizeof(dataWithNULL));
+    EXPECT_EQ(size, sizeof(dataWithNULL));
     EXPECT_EQ(readdata[0], 0x17);
     EXPECT_EQ(readdata[1], 0x32);
     EXPECT_EQ(readdata[2], 0x00);
@@ -217,4 +284,47 @@ TEST_F(MinioChunkManagerTest, ListWithPrefixPositive) {
     chunk_manager_->Remove(path2);
     chunk_manager_->Remove(path3);
     chunk_manager_->DeleteBucket(testBucketName);
+}
+
+TEST_F(AliyunChunkManagerTest, ReadPositive) {
+    string testBucketName = "vdc-infra-poc";
+    chunk_manager_->SetBucketName(testBucketName);
+    EXPECT_EQ(chunk_manager_->GetBucketName(), testBucketName);
+
+    uint8_t data[5] = {0x17, 0x32, 0x45, 0x34, 0x23};
+    string path = "1/4/6";
+    chunk_manager_->Write(path, data, sizeof(data));
+    bool exist = chunk_manager_->Exist(path);
+    EXPECT_EQ(exist, true);
+    auto size = chunk_manager_->Size(path);
+    EXPECT_EQ(size, 5);
+
+    uint8_t readdata[20] = {0};
+    size = chunk_manager_->Read(path, readdata, 20);
+    EXPECT_EQ(readdata[0], 0x17);
+    EXPECT_EQ(readdata[1], 0x32);
+    EXPECT_EQ(readdata[2], 0x45);
+    EXPECT_EQ(readdata[3], 0x34);
+    EXPECT_EQ(readdata[4], 0x23);
+
+    size = chunk_manager_->Read(path, readdata, 3);
+    EXPECT_EQ(size, 3);
+    EXPECT_EQ(readdata[0], 0x17);
+    EXPECT_EQ(readdata[1], 0x32);
+    EXPECT_EQ(readdata[2], 0x45);
+
+    uint8_t dataWithNULL[] = {0x17, 0x32, 0x00, 0x34, 0x23};
+    chunk_manager_->Write(path, dataWithNULL, sizeof(dataWithNULL));
+    exist = chunk_manager_->Exist(path);
+    EXPECT_EQ(exist, true);
+    size = chunk_manager_->Size(path);
+    EXPECT_EQ(size, 5);
+    size = chunk_manager_->Read(path, readdata, 20);
+    EXPECT_EQ(readdata[0], 0x17);
+    EXPECT_EQ(readdata[1], 0x32);
+    EXPECT_EQ(readdata[2], 0x00);
+    EXPECT_EQ(readdata[3], 0x34);
+    EXPECT_EQ(readdata[4], 0x23);
+
+    chunk_manager_->Remove(path);
 }

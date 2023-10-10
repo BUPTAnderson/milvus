@@ -25,21 +25,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 func generateMsgPack() msgstream.MsgPack {
 	msgPack := msgstream.MsgPack{}
-	baseMsg := msgstream.BaseMsg{
-		BeginTimestamp: uint64(time.Now().Unix()),
-		EndTimestamp:   uint64(time.Now().Unix() + 1),
-		HashValues:     []uint32{0},
-	}
-	timeTickResult := internalpb.TimeTickMsg{
+
+	timeTickResult := msgpb.TimeTickMsg{
 		Base: &commonpb.MsgBase{
 			MsgType:   commonpb.MsgType_TimeTick,
 			MsgID:     0,
@@ -48,7 +44,11 @@ func generateMsgPack() msgstream.MsgPack {
 		},
 	}
 	timeTickMsg := &msgstream.TimeTickMsg{
-		BaseMsg:     baseMsg,
+		BaseMsg: msgstream.BaseMsg{
+			BeginTimestamp: uint64(time.Now().Unix()),
+			EndTimestamp:   uint64(time.Now().Unix() + 1),
+			HashValues:     []uint32{0},
+		},
 		TimeTickMsg: timeTickResult,
 	}
 	msgPack.Msgs = append(msgPack.Msgs, timeTickMsg)
@@ -62,7 +62,7 @@ func TestNodeCtx_Start(t *testing.T) {
 
 	msgStream, _ := factory.NewMsgStream(context.TODO())
 	channels := []string{"cc"}
-	msgStream.AsConsumer(channels, "sub", mqwrapper.SubscriptionPositionEarliest)
+	msgStream.AsConsumer(context.TODO(), channels, "sub", mqwrapper.SubscriptionPositionEarliest)
 
 	produceStream, _ := factory.NewMsgStream(context.TODO())
 	produceStream.AsProducer(channels)
@@ -74,7 +74,7 @@ func TestNodeCtx_Start(t *testing.T) {
 	produceStream.Produce(&msgPack)
 
 	nodeName := "input_node"
-	inputNode := NewInputNode(msgStream, nodeName, 100, 100)
+	inputNode := NewInputNode(msgStream.Chan(), nodeName, 100, 100, "", 0, 0, "")
 
 	node := &nodeCtx{
 		node:    inputNode,

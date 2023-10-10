@@ -19,14 +19,17 @@ package indexnode
 import (
 	"container/list"
 	"context"
-	"errors"
+	"fmt"
 	"runtime/debug"
 	"sync"
 
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 // TaskQueue is a queue used to store tasks.
@@ -172,16 +175,16 @@ type TaskScheduler struct {
 }
 
 // NewTaskScheduler creates a new task scheduler of indexing tasks.
-func NewTaskScheduler(ctx context.Context) (*TaskScheduler, error) {
+func NewTaskScheduler(ctx context.Context) *TaskScheduler {
 	ctx1, cancel := context.WithCancel(ctx)
 	s := &TaskScheduler{
 		ctx:           ctx1,
 		cancel:        cancel,
-		buildParallel: Params.IndexNodeCfg.BuildParallel,
+		buildParallel: Params.IndexNodeCfg.BuildParallel.GetAsInt(),
 	}
 	s.IndexBuildQueue = NewIndexBuildTaskQueue(s)
 
-	return s, nil
+	return s
 }
 
 func (sched *TaskScheduler) scheduleIndexBuildTask() []task {
@@ -213,12 +216,12 @@ func (sched *TaskScheduler) processTask(t task, q TaskQueue) {
 	sched.IndexBuildQueue.AddActiveTask(t)
 	defer sched.IndexBuildQueue.PopActiveTask(t.Name())
 	log.Ctx(t.Ctx()).Debug("process task", zap.String("task", t.Name()))
-	pipelines := []func(context.Context) error{t.Prepare, t.LoadData, t.BuildIndex, t.SaveIndexFiles}
+	pipelines := []func(context.Context) error{t.Prepare, t.BuildIndex, t.SaveIndexFiles}
 	for _, fn := range pipelines {
 		if err := wrap(fn); err != nil {
-			if err == errCancel {
-				log.Ctx(t.Ctx()).Warn("index build task canceled", zap.String("task", t.Name()))
-				t.SetState(commonpb.IndexState_Failed, err.Error())
+			if errors.Is(err, errCancel) {
+				log.Ctx(t.Ctx()).Warn("index build task canceled, retry it", zap.String("task", t.Name()))
+				t.SetState(commonpb.IndexState_Retry, err.Error())
 			} else if errors.Is(err, ErrNoSuchKey) {
 				t.SetState(commonpb.IndexState_Failed, err.Error())
 			} else {
@@ -228,6 +231,10 @@ func (sched *TaskScheduler) processTask(t task, q TaskQueue) {
 		}
 	}
 	t.SetState(commonpb.IndexState_Finished, "")
+	if indexBuildTask, ok := t.(*indexBuildTask); ok {
+		metrics.IndexNodeBuildIndexLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(indexBuildTask.tr.ElapseSpan().Seconds())
+		metrics.IndexNodeIndexTaskLatencyInQueue.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(indexBuildTask.queueDur.Milliseconds()))
+	}
 }
 
 func (sched *TaskScheduler) indexBuildLoop() {

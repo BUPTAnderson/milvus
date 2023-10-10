@@ -24,11 +24,12 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/generic"
-	"github.com/milvus-io/milvus/internal/util/retry"
-	"github.com/milvus-io/milvus/internal/util/trace"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/generic"
+	"github.com/milvus-io/milvus/pkg/util/retry"
 )
 
 type GRPCClientBase[T any] struct {
@@ -41,6 +42,7 @@ type GRPCClientBase[T any] struct {
 	GetGrpcClientErr error
 	role             string
 	nodeID           int64
+	sess             *sessionutil.Session
 }
 
 func (c *GRPCClientBase[T]) SetGetAddrFunc(f func() (string, error)) {
@@ -56,7 +58,6 @@ func (c *GRPCClientBase[T]) SetRole(role string) {
 }
 
 func (c *GRPCClientBase[T]) EnableEncryption() {
-
 }
 
 func (c *GRPCClientBase[T]) SetNewGrpcClientFunc(f func(cc *grpc.ClientConn) T) {
@@ -117,7 +118,7 @@ func (c *GRPCClientBase[T]) Call(ctx context.Context, caller func(client T) (any
 
 	ret, err := c.callOnce(ctx, caller)
 	if err != nil {
-		traceErr := fmt.Errorf("err: %s\n, %s", err.Error(), trace.StackTrace())
+		traceErr := fmt.Errorf("err: %s\n, %s", err.Error(), tracer.StackTrace())
 		log.Error("GRPCClientBase[T] Call grpc first call get error ", zap.Error(traceErr))
 		return nil, traceErr
 	}
@@ -131,7 +132,7 @@ func (c *GRPCClientBase[T]) ReCall(ctx context.Context, caller func(client T) (a
 		return ret, nil
 	}
 
-	traceErr := fmt.Errorf("err: %s\n, %s", err.Error(), trace.StackTrace())
+	traceErr := fmt.Errorf("err: %s\n, %s", err.Error(), tracer.StackTrace())
 	log.Warn("GRPCClientBase[T] client grpc first call get error ", zap.Error(traceErr))
 
 	if !funcutil.CheckCtxValid(ctx) {
@@ -140,7 +141,7 @@ func (c *GRPCClientBase[T]) ReCall(ctx context.Context, caller func(client T) (a
 
 	ret, err = c.callOnce(ctx, caller)
 	if err != nil {
-		traceErr = fmt.Errorf("err: %s\n, %s", err.Error(), trace.StackTrace())
+		traceErr = fmt.Errorf("err: %s\n, %s", err.Error(), tracer.StackTrace())
 		log.Error("GRPCClientBase[T] client grpc second call get error ", zap.Error(traceErr))
 		return nil, traceErr
 	}
@@ -162,4 +163,8 @@ func (c *GRPCClientBase[T]) GetNodeID() int64 {
 
 func (c *GRPCClientBase[T]) SetNodeID(nodeID int64) {
 	c.nodeID = nodeID
+}
+
+func (c *GRPCClientBase[T]) SetSession(sess *sessionutil.Session) {
+	c.sess = sess
 }

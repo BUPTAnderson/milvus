@@ -9,56 +9,15 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
-set( proto_file_names
-    schema.proto
-    common.proto
+find_package(Protobuf REQUIRED)
+
+add_library(milvus_proto STATIC
+    common.pb.cc
+    index_cgo_msg.pb.cc
+    plan.pb.cc
+    schema.pb.cc
+    segcore.pb.cc
     )
-
-set( PROTO_GOOGLE_PATH  "${MILVUS_SOURCE_DIR}/../../cmake_build/thirdparty/protobuf/protobuf-src/src/" )
-set( PROTO_PATH  "${MILVUS_SOURCE_DIR}/../../cmake_build/thirdparty/milvus-proto/proto/")
-
-FOREACH(proto_file ${proto_file_names})
-    STRING( REGEX REPLACE "[^/]proto" "" proto_src_file_name ${proto_file} )
-    LIST( APPEND milvus_proto_srcs "${proto_src_file_name}.pb.cc" )
-
-    ADD_CUSTOM_COMMAND(
-        OUTPUT  "${CMAKE_CURRENT_SOURCE_DIR}/${proto_src_file_name}.pb.h"
-                "${CMAKE_CURRENT_SOURCE_DIR}/${proto_src_file_name}.pb.cc"
-        COMMAND protobuf::protoc --proto_path=${PROTO_PATH}/
-                --proto_path=${PROTO_GOOGLE_PATH}/
-                --cpp_out=${CMAKE_CURRENT_SOURCE_DIR}/
-                ${proto_file}
-        DEPENDS ${PROTO_PATH}/${proto_file} )
-
-ENDFOREACH(proto_file)
-
-set( proto_file_names
-    segcore.proto
-    index_cgo_msg.proto
-    plan.proto
-    )
-
-set( PROTO_PATH  "${MILVUS_SOURCE_DIR}/../proto/")
-set( PROTO_GOOGLE_PATH  "${MILVUS_SOURCE_DIR}/../../cmake_build/thirdparty/protobuf/protobuf-src/src/" )
-set( PROTO_API_PATH  "${MILVUS_SOURCE_DIR}/../../cmake_build/thirdparty/milvus-proto/proto/" )
-
-FOREACH(proto_file ${proto_file_names})
-    STRING( REGEX REPLACE "[^/]proto" "" proto_src_file_name ${proto_file} )
-    LIST( APPEND milvus_proto_srcs "${proto_src_file_name}.pb.cc" )
-
-    ADD_CUSTOM_COMMAND(
-        OUTPUT  "${CMAKE_CURRENT_SOURCE_DIR}/${proto_src_file_name}.pb.h"
-                "${CMAKE_CURRENT_SOURCE_DIR}/${proto_src_file_name}.pb.cc"
-        COMMAND protobuf::protoc --proto_path=${PROTO_PATH}/
-                --proto_path=${PROTO_GOOGLE_PATH}/
-                --proto_path=${PROTO_API_PATH}/
-                --cpp_out=${CMAKE_CURRENT_SOURCE_DIR}/
-                ${proto_file}
-        DEPENDS ${PROTO_PATH}/${proto_file} )
-
-ENDFOREACH(proto_file)
-
-add_library(milvus_proto STATIC ${milvus_proto_srcs})
 message(STATUS "milvus proto sources: " ${milvus_proto_srcs})
 
-target_link_libraries( milvus_proto PUBLIC protobuf::libprotobuf)
+target_link_libraries( milvus_proto PUBLIC ${CONAN_LIBS} )

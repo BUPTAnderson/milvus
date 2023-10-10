@@ -17,13 +17,15 @@
 package importutil
 
 import (
-	"errors"
 	"math"
 	"strconv"
+	"strings"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
 
 // Extra option keys to pass through import API
@@ -33,12 +35,30 @@ const (
 	EndTs        = "end_ts"   // end timestamp to filter data, only data between StartTs and EndTs will be imported
 	OptionFormat = "start_ts: 10-digit physical timestamp, e.g. 1665995420, default 0 \n" +
 		"end_ts: 10-digit physical timestamp, e.g. 1665995420, default math.MaxInt \n"
+	BackupFlag = "backup"
 )
+
+type ImportOptions struct {
+	OnlyValidate bool
+	TsStartPoint uint64
+	TsEndPoint   uint64
+	IsBackup     bool // whether is triggered by backup tool
+}
+
+func DefaultImportOptions() ImportOptions {
+	options := ImportOptions{
+		OnlyValidate: false,
+		TsStartPoint: 0,
+		TsEndPoint:   math.MaxUint64,
+	}
+	return options
+}
 
 // ValidateOptions the options is illegal, return nil if illegal, return error if not.
 // Illegal options:
-//     start_ts: 10-digit physical timestamp, e.g. 1665995420
-//     end_ts: 10-digit physical timestamp, e.g. 1665995420
+//
+//	start_ts: 10-digit physical timestamp, e.g. 1665995420
+//	end_ts: 10-digit physical timestamp, e.g. 1665995420
 func ValidateOptions(options []*commonpb.KeyValuePair) error {
 	optionMap := funcutil.KeyValuePair2Map(options)
 	// StartTs should be int
@@ -91,4 +111,13 @@ func ParseTSFromOptions(options []*commonpb.KeyValuePair) (uint64, uint64, error
 		tsEnd = math.MaxUint64
 	}
 	return tsStart, tsEnd, nil
+}
+
+// IsBackup returns if the request is triggered by backup tool
+func IsBackup(options []*commonpb.KeyValuePair) bool {
+	isBackup, err := funcutil.GetAttrByKeyFromRepeatedKV(BackupFlag, options)
+	if err != nil || strings.ToLower(isBackup) != "true" {
+		return false
+	}
+	return true
 }

@@ -19,24 +19,36 @@
 FILE_COVERAGE_INFO="go_coverage.txt"
 FILE_COVERAGE_HTML="go_coverage.html"
 
-set -ex
-echo "mode: atomic" > ${FILE_COVERAGE_INFO}
-
 BASEDIR=$(dirname "$0")
 source $BASEDIR/setenv.sh
 
+set -ex
+echo "mode: atomic" > ${FILE_COVERAGE_INFO}
+
 # run unittest
-echo "Running unittest under ./internal"
-if [[ $(uname -s) == "Darwin" && "$(uname -m)" == "arm64" ]]; then
-    APPLE_SILICON_FLAG="-tags dynamic"
-fi
+echo "Running unittest under ./internal & ./pkg"
+
+# starting the timer
+beginTime=`date +%s`
 for d in $(go list ./internal/... | grep -v -e vendor -e kafka -e planparserv2/generated -e mocks); do
-    go test -race ${APPLE_SILICON_FLAG} -v -coverpkg=./... -coverprofile=profile.out -covermode=atomic "$d"
+    go test -race -tags dynamic -v -coverpkg=./... -coverprofile=profile.out -covermode=atomic "$d"
     if [ -f profile.out ]; then
         grep -v kafka profile.out | grep -v planparserv2/generated | grep -v mocks | sed '1d' >> ${FILE_COVERAGE_INFO}
         rm profile.out
     fi
 done
+pushd pkg
+for d in $(go list ./... | grep -v -e vendor -e kafka -e planparserv2/generated -e mocks); do
+    go test -race -tags dynamic -v -coverpkg=./... -coverprofile=profile.out -covermode=atomic "$d"
+    if [ -f profile.out ]; then
+        grep -v kafka profile.out | grep -v planparserv2/generated | grep -v mocks | sed '1d' >> ../${FILE_COVERAGE_INFO}
+        rm profile.out
+    fi
+done
+popd
+endTime=`date +%s`
+
+echo "Total time for go unittest:" $(($endTime-$beginTime)) "s"
 
 # generate html report
 go tool cover -html=./${FILE_COVERAGE_INFO} -o ./${FILE_COVERAGE_HTML}

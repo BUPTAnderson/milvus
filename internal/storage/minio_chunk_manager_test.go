@@ -18,13 +18,13 @@ package storage
 
 import (
 	"context"
+	"io"
+	"math/rand"
 	"path"
-	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,10 +32,9 @@ import (
 // TODO: NewMinioChunkManager is deprecated. Rewrite this unittest.
 func newMinIOChunkManager(ctx context.Context, bucketName string, rootPath string) (*MinioChunkManager, error) {
 	endPoint := getMinioAddress()
-	accessKeyID, _ := Params.Load("minio.accessKeyID")
-	secretAccessKey, _ := Params.Load("minio.secretAccessKey")
-	useSSLStr, _ := Params.Load("minio.useSSL")
-	useSSL, _ := strconv.ParseBool(useSSLStr)
+	accessKeyID := Params.MinioCfg.AccessKeyID.GetValue()
+	secretAccessKey := Params.MinioCfg.SecretAccessKey.GetValue()
+	useSSL := Params.MinioCfg.UseSSL.GetAsBool()
 	client, err := NewMinioChunkManager(ctx,
 		RootPath(rootPath),
 		Address(endPoint),
@@ -44,30 +43,31 @@ func newMinIOChunkManager(ctx context.Context, bucketName string, rootPath strin
 		UseSSL(useSSL),
 		BucketName(bucketName),
 		UseIAM(false),
+		CloudProvider("aws"),
 		IAMEndpoint(""),
 		CreateBucket(true),
+		UseVirtualHost(false),
+		Region(""),
 	)
 	return client, err
 }
 
 func getMinioAddress() string {
-	minioHost := Params.LoadWithDefault("minio.address", paramtable.DefaultMinioHost)
+	minioHost := Params.MinioCfg.Address.GetValue()
 	if strings.Contains(minioHost, ":") {
 		return minioHost
 	}
-	port := Params.LoadWithDefault("minio.port", paramtable.DefaultMinioPort)
+	port := Params.MinioCfg.Port.GetValue()
 	return minioHost + ":" + port
 }
 
 func TestMinIOCMFail(t *testing.T) {
 	ctx := context.Background()
-	endPoint, _ := Params.Load("9.9.9.9")
-	accessKeyID, _ := Params.Load("minio.accessKeyID")
-	secretAccessKey, _ := Params.Load("minio.secretAccessKey")
-	useSSLStr, _ := Params.Load("minio.useSSL")
-	useSSL, _ := strconv.ParseBool(useSSLStr)
+	accessKeyID := Params.MinioCfg.AccessKeyID.GetValue()
+	secretAccessKey := Params.MinioCfg.SecretAccessKey.GetValue()
+	useSSL := Params.MinioCfg.UseSSL.GetAsBool()
 	client, err := NewMinioChunkManager(ctx,
-		Address(endPoint),
+		Address("9.9.9.9:invalid"),
 		AccessKeyID(accessKeyID),
 		SecretAccessKeyID(secretAccessKey),
 		UseSSL(useSSL),
@@ -76,16 +76,12 @@ func TestMinIOCMFail(t *testing.T) {
 	)
 	assert.Error(t, err)
 	assert.Nil(t, client)
-
 }
 
 func TestMinIOCM(t *testing.T) {
-	Params.Init()
-	testBucket, err := Params.Load("minio.bucketName")
-	require.NoError(t, err)
+	testBucket := Params.MinioCfg.BucketName.GetValue()
 
-	configRoot, err := Params.Load("minio.rootPath")
-	require.NoError(t, err)
+	configRoot := Params.MinioCfg.RootPath.GetValue()
 
 	testMinIOKVRoot := path.Join(configRoot, "milvus-minio-ut-root")
 
@@ -210,11 +206,11 @@ func TestMinIOCM(t *testing.T) {
 		defer cancel()
 
 		testCM, err := newMinIOChunkManager(ctx, testBucket, testMultiSaveRoot)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer testCM.RemoveWithPrefix(ctx, testMultiSaveRoot)
 
 		err = testCM.Write(ctx, path.Join(testMultiSaveRoot, "key_1"), []byte("111"))
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		kvs := map[string][]byte{
 			path.Join(testMultiSaveRoot, "key_1"): []byte("123"),
@@ -222,10 +218,10 @@ func TestMinIOCM(t *testing.T) {
 		}
 
 		err = testCM.MultiWrite(ctx, kvs)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		val, err := testCM.Read(ctx, path.Join(testMultiSaveRoot, "key_1"))
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, []byte("123"), val)
 	})
 
@@ -235,7 +231,7 @@ func TestMinIOCM(t *testing.T) {
 		defer cancel()
 
 		testCM, err := newMinIOChunkManager(ctx, testBucket, testRemoveRoot)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer testCM.RemoveWithPrefix(ctx, testRemoveRoot)
 
 		prepareTests := []struct {
@@ -443,7 +439,6 @@ func TestMinIOCM(t *testing.T) {
 		r, err := testCM.Mmap(ctx, key)
 		assert.Error(t, err)
 		assert.Nil(t, r)
-
 	})
 
 	t.Run("test Prefix", func(t *testing.T) {
@@ -507,6 +502,26 @@ func TestMinIOCM(t *testing.T) {
 		_, _, err = testCM.ListWithPrefix(ctx, pathWrong, true)
 		assert.Error(t, err)
 	})
+
+	t.Run("test NoSuchKey", func(t *testing.T) {
+		testPrefix := path.Join(testMinIOKVRoot, "nokey")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		testCM, err := newMinIOChunkManager(ctx, testBucket, testPrefix)
+		require.NoError(t, err)
+		defer testCM.RemoveWithPrefix(ctx, testPrefix)
+
+		key := "a"
+
+		_, err = testCM.Read(ctx, key)
+		assert.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNoSuchKey))
+
+		_, err = testCM.ReadAt(ctx, key, 100, 1)
+		assert.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNoSuchKey))
+	})
 }
 
 func TestMinioChunkManager_normalizeRootPath(t *testing.T) {
@@ -548,4 +563,64 @@ func TestMinioChunkManager_normalizeRootPath(t *testing.T) {
 			assert.Equal(t, test.expected, mcm.normalizeRootPath(test.input))
 		})
 	}
+}
+
+func TestMinioChunkManager_Read(t *testing.T) {
+	var reader MockReader
+	reader.offset = new(int)
+	reader.value = make([]byte, 10)
+	reader.lastEOF = true
+	for i := 0; i < 10; i++ {
+		reader.value[i] = byte(i)
+	}
+	value, err := Read(reader, 10)
+	assert.Equal(t, len(value), 10)
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, value[i], byte(i))
+	}
+
+	assert.NoError(t, err)
+}
+
+func TestMinioChunkManager_ReadEOF(t *testing.T) {
+	var reader MockReader
+	reader.offset = new(int)
+	reader.value = make([]byte, 10)
+	reader.lastEOF = false
+	for i := 0; i < 10; i++ {
+		reader.value[i] = byte(i)
+	}
+	value, err := Read(reader, 10)
+	assert.Equal(t, len(value), 10)
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, value[i], byte(i))
+	}
+	assert.NoError(t, err)
+}
+
+type MockReader struct {
+	value   []byte
+	offset  *int
+	lastEOF bool
+}
+
+func (r MockReader) Read(p []byte) (n int, err error) {
+	if len(r.value) == *r.offset {
+		return 0, io.EOF
+	}
+
+	cap := len(r.value) - *r.offset
+	if cap < 5 {
+		copy(p, r.value[*r.offset:])
+		*r.offset = len(r.value)
+		if r.lastEOF {
+			return cap, io.EOF
+		}
+		return cap, nil
+	}
+
+	n = rand.Intn(5)
+	copy(p, r.value[*r.offset:(*r.offset+n)])
+	*r.offset += n
+	return n, nil
 }

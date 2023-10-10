@@ -8,7 +8,9 @@ import "common.proto";
 import "milvus.proto";
 import "internal.proto";
 import "schema.proto";
+import "msg.proto";
 import "data_coord.proto";
+import "index_coord.proto";
 
 service QueryCoord {
   rpc GetComponentStates(milvus.GetComponentStatesRequest) returns (milvus.ComponentStates) {}
@@ -22,6 +24,7 @@ service QueryCoord {
   rpc ReleasePartitions(ReleasePartitionsRequest) returns (common.Status) {}
   rpc LoadCollection(LoadCollectionRequest) returns (common.Status) {}
   rpc ReleaseCollection(ReleaseCollectionRequest) returns (common.Status) {}
+  rpc SyncNewCreatedPartition(SyncNewCreatedPartitionRequest) returns (common.Status) {}
 
   rpc GetPartitionStates(GetPartitionStatesRequest) returns (GetPartitionStatesResponse) {}
   rpc GetSegmentInfo(GetSegmentInfoRequest) returns (GetSegmentInfoResponse) {}
@@ -36,6 +39,13 @@ service QueryCoord {
   rpc GetShardLeaders(GetShardLeadersRequest) returns (GetShardLeadersResponse) {}
 
   rpc CheckHealth(milvus.CheckHealthRequest) returns (milvus.CheckHealthResponse) {}
+
+  rpc CreateResourceGroup(milvus.CreateResourceGroupRequest) returns (common.Status) {}
+  rpc DropResourceGroup(milvus.DropResourceGroupRequest) returns (common.Status) {}
+  rpc TransferNode(milvus.TransferNodeRequest) returns (common.Status) {}
+  rpc TransferReplica(TransferReplicaRequest) returns (common.Status) {}
+  rpc ListResourceGroups(milvus.ListResourceGroupsRequest) returns (milvus.ListResourceGroupsResponse) {}
+  rpc DescribeResourceGroup(DescribeResourceGroupRequest) returns (DescribeResourceGroupResponse) {}
 }
 
 service QueryNode {
@@ -47,6 +57,7 @@ service QueryNode {
   rpc UnsubDmChannel(UnsubDmChannelRequest) returns (common.Status) {}
   rpc LoadSegments(LoadSegmentsRequest) returns (common.Status) {}
   rpc ReleaseCollection(ReleaseCollectionRequest) returns (common.Status) {}
+  rpc LoadPartitions(LoadPartitionsRequest) returns (common.Status) {}
   rpc ReleasePartitions(ReleasePartitionsRequest) returns (common.Status) {}
   rpc ReleaseSegments(ReleaseSegmentsRequest) returns (common.Status) {}
   rpc GetSegmentInfo(GetSegmentInfoRequest) returns (GetSegmentInfoResponse) {}
@@ -54,7 +65,11 @@ service QueryNode {
 
   rpc GetStatistics(GetStatisticsRequest) returns (internal.GetStatisticsResponse) {}
   rpc Search(SearchRequest) returns (internal.SearchResults) {}
+  rpc SearchSegments(SearchRequest) returns (internal.SearchResults) {}
   rpc Query(QueryRequest) returns (internal.RetrieveResults) {}
+  rpc QueryStream(QueryRequest) returns (stream internal.RetrieveResults){}
+  rpc QuerySegments(QueryRequest) returns (internal.RetrieveResults) {}
+  rpc QueryStreamSegments(QueryRequest) returns (stream internal.RetrieveResults){}
 
   rpc ShowConfigurations(internal.ShowConfigurationsRequest) returns (internal.ShowConfigurationsResponse){}
   // https://wiki.lfaidata.foundation/display/MIL/MEP+8+--+Add+metrics+for+proxy
@@ -62,9 +77,11 @@ service QueryNode {
 
   rpc GetDataDistribution(GetDataDistributionRequest) returns (GetDataDistributionResponse) {}
   rpc SyncDistribution(SyncDistributionRequest) returns (common.Status) {}
+  rpc Delete(DeleteRequest) returns (common.Status) {}
 }
 
-//--------------------QueryCoord grpc request and response proto------------------
+// --------------------QueryCoord grpc request and response proto------------------
+
 message ShowCollectionsRequest {
   common.MsgBase base = 1;
   // Not useful for now
@@ -77,6 +94,7 @@ message ShowCollectionsResponse {
   repeated int64 collectionIDs = 2;
   repeated int64 inMemory_percentages = 3;
   repeated bool query_service_available = 4;
+  repeated int64 refresh_progress = 5;
 }
 
 message ShowPartitionsRequest {
@@ -90,6 +108,7 @@ message ShowPartitionsResponse {
   common.Status status = 1;
   repeated int64 partitionIDs = 2;
   repeated int64 inMemory_percentages = 3;
+  repeated int64 refresh_progress = 4;
 }
 
 message LoadCollectionRequest {
@@ -100,6 +119,9 @@ message LoadCollectionRequest {
   int32 replica_number = 5;
   // fieldID -> indexID
   map<int64, int64> field_indexID = 6;
+  bool refresh = 7;
+  // resource group names
+  repeated string resource_groups = 8;
 }
 
 message ReleaseCollectionRequest {
@@ -126,6 +148,10 @@ message LoadPartitionsRequest {
   int32 replica_number = 6;
   // fieldID -> indexID
   map<int64, int64> field_indexID = 7;
+  bool refresh = 8;
+  // resource group names
+  repeated string resource_groups = 9;
+  repeated index.IndexInfo index_info_list = 10;
 }
 
 message ReleasePartitionsRequest {
@@ -175,11 +201,19 @@ message ShardLeadersList {  // All leaders of all replicas of one shard
   repeated string node_addrs = 3;
 }
 
-//-----------------query node grpc request and response proto----------------
+message SyncNewCreatedPartitionRequest {
+  common.MsgBase base = 1;
+  int64 collectionID = 2;
+  int64 partitionID = 3;
+}
+
+// -----------------query node grpc request and response proto----------------
+
 message LoadMetaInfo {
   LoadType load_type = 1;
   int64 collectionID = 2;
   repeated int64 partitionIDs = 3;
+  string metric_type = 4;
 }
 
 message WatchDmChannelsRequest {
@@ -193,8 +227,11 @@ message WatchDmChannelsRequest {
   LoadMetaInfo load_meta = 8;
   int64 replicaID = 9;
   map<int64, data.SegmentInfo> segment_infos = 10;
+  // Deprecated
   // for node down load balance, need to remove offline node in time after every watchDmChannel finish.
   int64 offlineNodeID = 11;
+  int64 version = 12;
+  repeated index.IndexInfo index_info_list = 13;
 }
 
 message UnsubDmChannelRequest {
@@ -218,6 +255,9 @@ message SegmentLoadInfo {
   repeated FieldIndexInfo index_infos = 11;
   int64 segment_size = 12;
   string insert_channel = 13;
+  msg.MsgPosition start_position = 14;
+  msg.MsgPosition delta_position = 15;
+  int64 readableVersion = 16;
 }
 
 message FieldIndexInfo {
@@ -232,6 +272,13 @@ message FieldIndexInfo {
   int64 index_size = 8;
   int64 index_version = 9;
   int64 num_rows = 10;
+  int32 current_index_version = 11;
+}
+
+enum LoadScope {
+  Full = 0;
+  Delta = 1;
+  Index = 2;
 }
 
 message LoadSegmentsRequest {
@@ -243,9 +290,11 @@ message LoadSegmentsRequest {
   int64 collectionID = 6;
   LoadMetaInfo load_meta = 7;
   int64 replicaID = 8;
-  repeated internal.MsgPosition delta_positions = 9;
+  repeated msg.MsgPosition delta_positions = 9; // keep it for compatibility of rolling upgrade from 2.2.x to 2.3
   int64 version = 10;
   bool need_transfer = 11;
+  LoadScope load_scope = 12;
+  repeated index.IndexInfo index_info_list = 13;
 }
 
 message ReleaseSegmentsRequest {
@@ -267,6 +316,7 @@ message SearchRequest {
   repeated int64 segmentIDs = 3;
   bool from_shard_leader = 4;
   DataScope scope = 5; // All, Streaming, Historical
+  int32 total_channel_num = 6;
 }
 
 message QueryRequest {
@@ -290,7 +340,20 @@ message ReplicaSegmentsInfo {
   repeated int64 versions = 4;
 }
 
-//----------------request auto triggered by QueryCoord-----------------
+message GetLoadInfoRequest {
+  common.MsgBase base = 1;
+  int64 collection_id = 2;
+}
+
+message GetLoadInfoResponse {
+  common.Status status = 1;
+  schema.CollectionSchema schema = 2;
+  LoadType load_type = 3;
+  repeated int64 partitions = 4;
+}
+
+// ----------------request auto triggered by QueryCoord-----------------
+
 message HandoffSegmentsRequest {
   common.MsgBase base = 1;
   repeated SegmentInfo segmentInfos = 2;
@@ -306,7 +369,7 @@ message LoadBalanceRequest {
   int64 collectionID = 6;
 }
 
-//-------------------- internal meta proto------------------
+// -------------------- internal meta proto------------------
 
 enum DataScope {
   UnKnown = 0;
@@ -352,7 +415,7 @@ message QueryChannelInfo {
   string query_channel = 2;
   string query_result_channel = 3;
   repeated SegmentInfo global_sealed_segments = 4;
-  internal.MsgPosition seek_position = 5;
+  msg.MsgPosition seek_position = 5;
 }
 
 message PartitionStates {
@@ -404,7 +467,8 @@ message UnsubscribeChannelInfo {
   repeated UnsubscribeChannels collection_channels = 2;
 }
 
-//---- synchronize messages proto between QueryCoord and QueryNode -----
+// ---- synchronize messages proto between QueryCoord and QueryNode -----
+
 message SegmentChangeInfo {
   int64 online_nodeID = 1;
   repeated SegmentInfo online_segments = 2;
@@ -419,6 +483,7 @@ message SealedSegmentsChangeInfo {
 
 message GetDataDistributionRequest {
   common.MsgBase base = 1;
+  map<string, msg.MsgPosition> checkpoints = 2;
 }
 
 message GetDataDistributionResponse {
@@ -434,6 +499,8 @@ message LeaderView {
   string channel = 2;
   map<int64, SegmentDist> segment_dist = 3;
   repeated int64 growing_segmentIDs = 4;
+  map<int64, msg.MsgPosition> growing_segments = 5;
+  int64 TargetVersion = 6;
 }
 
 message SegmentDist {
@@ -448,6 +515,8 @@ message SegmentVersionInfo {
   int64 partition = 3;
   string channel = 4;
   int64 version = 5;
+  uint64 last_delta_timestamp = 6;
+  map<int64, FieldIndexInfo> index_info = 7;
 }
 
 message ChannelVersionInfo {
@@ -464,29 +533,35 @@ enum LoadStatus {
 
 message CollectionLoadInfo {
   int64 collectionID = 1;
-  repeated int64 released_partitions = 2;
+  repeated int64 released_partitions = 2; // Deprecated: No longer used; kept for compatibility.
   int32 replica_number = 3;
   LoadStatus status = 4;
   map<int64, int64> field_indexID = 5;
+  LoadType load_type = 6;
+  int32 recover_times = 7;
 }
 
 message PartitionLoadInfo {
   int64 collectionID = 1;
   int64 partitionID = 2;
-  int32 replica_number = 3;
+  int32 replica_number = 3; // Deprecated: No longer used; kept for compatibility.
   LoadStatus status = 4;
-  map<int64, int64> field_indexID = 5;
+  map<int64, int64> field_indexID = 5; // Deprecated: No longer used; kept for compatibility.
+  int32 recover_times = 7;
 }
 
 message Replica {
   int64 ID = 1;
   int64 collectionID = 2;
   repeated int64 nodes = 3;
+  string resource_group = 4;
 }
 
 enum SyncType {
   Remove = 0;
   Set = 1;
+  Amend = 2;
+  UpdateVersion = 3;
 }
 
 message SyncAction {
@@ -495,6 +570,11 @@ message SyncAction {
   int64 segmentID = 3;
   int64 nodeID = 4;
   int64 version = 5;
+  SegmentLoadInfo info = 6;
+  repeated int64 growingInTarget = 7;
+  repeated int64 sealedInTarget = 8;
+  int64 TargetVersion = 9;
+  repeated int64 droppedInTarget  = 10; 
 }
 
 message SyncDistributionRequest {
@@ -502,5 +582,54 @@ message SyncDistributionRequest {
   int64 collectionID = 2;
   string channel = 3;
   repeated SyncAction actions = 4;
+  schema.CollectionSchema schema = 5;
+  LoadMetaInfo load_meta = 6;
+  int64 replicaID = 7;
+  int64 version = 8;
 }
 
+message ResourceGroup {
+  string name = 1;
+  int32 capacity = 2;
+  repeated int64 nodes = 3;
+}
+
+// transfer `replicaNum` replicas in `collectionID` from `source_resource_group` to `target_resource_groups`
+message TransferReplicaRequest {
+  common.MsgBase base = 1;
+  string source_resource_group = 2;
+  string target_resource_group = 3;
+  int64  collectionID = 4;
+  int64  num_replica = 5;
+}
+
+message DescribeResourceGroupRequest {
+  common.MsgBase base = 1;
+  string resource_group = 2;
+}
+
+message DescribeResourceGroupResponse {
+  common.Status status = 1;
+  ResourceGroupInfo resource_group = 2;
+}
+
+message ResourceGroupInfo {
+  string name = 1;
+  int32 capacity = 2;
+  int32 num_available_node = 3;
+  // collection id -> loaded replica num
+  map<int64, int32> num_loaded_replica = 4;
+  // collection id -> accessed other rg's node num 
+  map<int64, int32> num_outgoing_node = 5;
+   // collection id -> be accessed node num by other rg
+  map<int64, int32> num_incoming_node = 6;
+}
+message DeleteRequest {
+  common.MsgBase base = 1;
+  int64 collection_id = 2;
+  int64 partition_id = 3;
+  string vchannel_name = 4;
+  int64 segment_id = 5;
+  schema.IDs primary_keys = 6;
+  repeated uint64 timestamps = 7; 
+}

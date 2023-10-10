@@ -21,39 +21,73 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus/internal/kv"
+	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/suite"
-	"go.uber.org/atomic"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type DistControllerTestSuite struct {
 	suite.Suite
-	controller    *Controller
+	controller    *ControllerImpl
 	mockCluster   *session.MockCluster
 	mockScheduler *task.MockScheduler
+
+	kv     kv.MetaKv
+	meta   *meta.Meta
+	broker *meta.MockBroker
 }
 
 func (suite *DistControllerTestSuite) SetupTest() {
-	Params.Init()
+	paramtable.Init()
+
+	var err error
+	config := GenerateEtcdConfig()
+	cli, err := etcd.GetEtcdClient(
+		config.UseEmbedEtcd.GetAsBool(),
+		config.EtcdUseSSL.GetAsBool(),
+		config.Endpoints.GetAsStrings(),
+		config.EtcdTLSCert.GetValue(),
+		config.EtcdTLSKey.GetValue(),
+		config.EtcdTLSCACert.GetValue(),
+		config.EtcdTLSMinVersion.GetValue())
+	suite.Require().NoError(err)
+	suite.kv = etcdkv.NewEtcdKV(cli, config.MetaRootPath.GetValue())
+
+	// meta
+	store := querycoord.NewCatalog(suite.kv)
+	idAllocator := RandomIncrementIDAllocator()
+	suite.meta = meta.NewMeta(idAllocator, store, session.NewNodeManager())
 
 	suite.mockCluster = session.NewMockCluster(suite.T())
 	nodeManager := session.NewNodeManager()
 	distManager := meta.NewDistributionManager()
-	targetManager := meta.NewTargetManager()
+	suite.broker = meta.NewMockBroker(suite.T())
+	targetManager := meta.NewTargetManager(suite.broker, suite.meta)
 	suite.mockScheduler = task.NewMockScheduler(suite.T())
 	suite.controller = NewDistController(suite.mockCluster, nodeManager, distManager, targetManager, suite.mockScheduler)
+}
+
+func (suite *DistControllerTestSuite) TearDownSuite() {
+	suite.kv.Close()
 }
 
 func (suite *DistControllerTestSuite) TestStart() {
 	dispatchCalled := atomic.NewBool(false)
 	suite.mockCluster.EXPECT().GetDataDistribution(mock.Anything, mock.Anything, mock.Anything).Return(
-		&querypb.GetDataDistributionResponse{NodeID: 1},
+		&querypb.GetDataDistributionResponse{Status: merr.Status(nil), NodeID: 1},
 		nil,
 	)
 	suite.mockScheduler.EXPECT().Dispatch(int64(1)).Run(func(node int64) { dispatchCalled.Store(true) })
@@ -81,7 +115,7 @@ func (suite *DistControllerTestSuite) TestStop() {
 	suite.controller.StartDistInstance(context.TODO(), 1)
 	called := atomic.NewBool(false)
 	suite.mockCluster.EXPECT().GetDataDistribution(mock.Anything, mock.Anything, mock.Anything).Maybe().Return(
-		&querypb.GetDataDistributionResponse{NodeID: 1},
+		&querypb.GetDataDistributionResponse{Status: merr.Status(nil), NodeID: 1},
 		nil,
 	).Run(func(args mock.Arguments) {
 		called.Store(true)
@@ -106,6 +140,7 @@ func (suite *DistControllerTestSuite) TestSyncAll() {
 	suite.mockCluster.EXPECT().GetDataDistribution(mock.Anything, mock.Anything, mock.Anything).Call.Return(
 		func(ctx context.Context, nodeID int64, req *querypb.GetDataDistributionRequest) *querypb.GetDataDistributionResponse {
 			return &querypb.GetDataDistributionResponse{
+				Status: merr.Status(nil),
 				NodeID: nodeID,
 			}
 		},

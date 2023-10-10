@@ -12,9 +12,10 @@
 package client
 
 import (
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/server"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/server"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 // assertion make sure implementation
@@ -52,7 +53,8 @@ func (p *producer) Topic() string {
 func (p *producer) Send(message *ProducerMessage) (UniqueID, error) {
 	ids, err := p.c.server.Produce(p.topic, []server.ProducerMessage{
 		{
-			Payload: message.Payload,
+			Payload:    message.Payload,
+			Properties: message.Properties,
 		},
 	})
 	if err != nil {

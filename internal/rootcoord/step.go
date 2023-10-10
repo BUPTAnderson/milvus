@@ -1,23 +1,38 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rootcoord
 
 import (
 	"context"
 	"fmt"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
 )
 
 type stepPriority int
 
 const (
-	stepPriorityLow = iota
-	stepPriorityNormal
-	stepPriorityImportant
-	stepPriorityUrgent
+	stepPriorityLow       = 0
+	stepPriorityNormal    = 1
+	stepPriorityImportant = 10
+	stepPriorityUrgent    = 1000
 )
 
 type nestedStep interface {
@@ -148,6 +163,7 @@ func (s *changeCollectionStateStep) Desc() string {
 
 type expireCacheStep struct {
 	baseStep
+	dbName          string
 	collectionNames []string
 	collectionID    UniqueID
 	ts              Timestamp
@@ -155,7 +171,7 @@ type expireCacheStep struct {
 }
 
 func (s *expireCacheStep) Execute(ctx context.Context) ([]nestedStep, error) {
-	err := s.core.ExpireMetaCache(ctx, s.collectionNames, s.collectionID, s.ts, s.opts...)
+	err := s.core.ExpireMetaCache(ctx, s.dbName, s.collectionNames, s.collectionID, s.ts, s.opts...)
 	return nil, err
 }
 
@@ -256,6 +272,44 @@ func (s *releaseCollectionStep) Weight() stepPriority {
 	return stepPriorityUrgent
 }
 
+type releasePartitionsStep struct {
+	baseStep
+	collectionID UniqueID
+	partitionIDs []UniqueID
+}
+
+func (s *releasePartitionsStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	err := s.core.broker.ReleasePartitions(ctx, s.collectionID, s.partitionIDs...)
+	return nil, err
+}
+
+func (s *releasePartitionsStep) Desc() string {
+	return fmt.Sprintf("release partitions, collectionID=%d, partitionIDs=%v", s.collectionID, s.partitionIDs)
+}
+
+func (s *releasePartitionsStep) Weight() stepPriority {
+	return stepPriorityUrgent
+}
+
+type syncNewCreatedPartitionStep struct {
+	baseStep
+	collectionID UniqueID
+	partitionID  UniqueID
+}
+
+func (s *syncNewCreatedPartitionStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	err := s.core.broker.SyncNewCreatedPartition(ctx, s.collectionID, s.partitionID)
+	return nil, err
+}
+
+func (s *syncNewCreatedPartitionStep) Desc() string {
+	return fmt.Sprintf("sync new partition, collectionID=%d, partitionID=%d", s.partitionID, s.partitionID)
+}
+
+func (s *syncNewCreatedPartitionStep) Weight() stepPriority {
+	return stepPriorityUrgent
+}
+
 type dropIndexStep struct {
 	baseStep
 	collID  UniqueID
@@ -309,13 +363,14 @@ func (s *changePartitionStateStep) Desc() string {
 
 type removePartitionMetaStep struct {
 	baseStep
+	dbID         UniqueID
 	collectionID UniqueID
 	partitionID  UniqueID
 	ts           Timestamp
 }
 
 func (s *removePartitionMetaStep) Execute(ctx context.Context) ([]nestedStep, error) {
-	err := s.core.meta.RemovePartition(ctx, s.collectionID, s.partitionID, s.ts)
+	err := s.core.meta.RemovePartition(ctx, s.dbID, s.collectionID, s.partitionID, s.ts)
 	return nil, err
 }
 
@@ -327,8 +382,7 @@ func (s *removePartitionMetaStep) Weight() stepPriority {
 	return stepPriorityNormal
 }
 
-type nullStep struct {
-}
+type nullStep struct{}
 
 func (s *nullStep) Execute(ctx context.Context) ([]nestedStep, error) {
 	return nil, nil
@@ -373,4 +427,77 @@ func (b *BroadcastAlteredCollectionStep) Execute(ctx context.Context) ([]nestedS
 
 func (b *BroadcastAlteredCollectionStep) Desc() string {
 	return fmt.Sprintf("broadcast altered collection, collectionID: %d", b.req.CollectionID)
+}
+
+var (
+	confirmGCInterval          = time.Minute * 20
+	allPartition      UniqueID = -1
+)
+
+type confirmGCStep struct {
+	baseStep
+	collectionID      UniqueID
+	partitionID       UniqueID
+	lastScheduledTime time.Time
+}
+
+func newConfirmGCStep(core *Core, collectionID, partitionID UniqueID) *confirmGCStep {
+	return &confirmGCStep{
+		baseStep:          baseStep{core: core},
+		collectionID:      collectionID,
+		partitionID:       partitionID,
+		lastScheduledTime: time.Now(),
+	}
+}
+
+func (b *confirmGCStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	if time.Since(b.lastScheduledTime) < confirmGCInterval {
+		return nil, fmt.Errorf("wait for reschedule to confirm GC, collection: %d, partition: %d, last scheduled time: %s, now: %s",
+			b.collectionID, b.partitionID, b.lastScheduledTime.String(), time.Now().String())
+	}
+
+	finished := b.core.broker.GcConfirm(ctx, b.collectionID, b.partitionID)
+	if finished {
+		return nil, nil
+	}
+
+	b.lastScheduledTime = time.Now()
+
+	return nil, fmt.Errorf("GC is not finished, collection: %d, partition: %d, last scheduled time: %s, now: %s",
+		b.collectionID, b.partitionID, b.lastScheduledTime.String(), time.Now().String())
+}
+
+func (b *confirmGCStep) Desc() string {
+	return fmt.Sprintf("wait for GC finished, collection: %d, partition: %d, last scheduled time: %s, now: %s",
+		b.collectionID, b.partitionID, b.lastScheduledTime.String(), time.Now().String())
+}
+
+func (b *confirmGCStep) Weight() stepPriority {
+	return stepPriorityLow
+}
+
+type simpleStep struct {
+	desc        string
+	weight      stepPriority
+	executeFunc func(ctx context.Context) ([]nestedStep, error)
+}
+
+func NewSimpleStep(desc string, executeFunc func(ctx context.Context) ([]nestedStep, error)) nestedStep {
+	return &simpleStep{
+		desc:        desc,
+		weight:      stepPriorityNormal,
+		executeFunc: executeFunc,
+	}
+}
+
+func (s *simpleStep) Execute(ctx context.Context) ([]nestedStep, error) {
+	return s.executeFunc(ctx)
+}
+
+func (s *simpleStep) Desc() string {
+	return s.desc
+}
+
+func (s *simpleStep) Weight() stepPriority {
+	return s.weight
 }

@@ -14,6 +14,7 @@
 #include "query/ExprImpl.h"
 #include "query/Plan.h"
 #include "query/generated/ShowExprVisitor.h"
+#include "common/Types.h"
 
 namespace milvus::query {
 using Json = nlohmann::json;
@@ -58,11 +59,13 @@ class ShowExprNodeVisitor : ExprVisitor {
 
 void
 ShowExprVisitor::visit(LogicalUnaryExpr& expr) {
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
     using OpType = LogicalUnaryExpr::OpType;
 
     // TODO: use magic_enum if available
-    AssertInfo(expr.op_type_ == OpType::LogicalNot, "[ShowExprVisitor]Expr op type isn't LogicNot");
+    AssertInfo(expr.op_type_ == OpType::LogicalNot,
+               "[ShowExprVisitor]Expr op type isn't LogicNot");
     auto op_name = "LogicalNot";
 
     Json extra{
@@ -74,7 +77,8 @@ ShowExprVisitor::visit(LogicalUnaryExpr& expr) {
 
 void
 ShowExprVisitor::visit(LogicalBinaryExpr& expr) {
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
     using OpType = LogicalBinaryExpr::OpType;
 
     // TODO: use magic_enum if available
@@ -87,7 +91,8 @@ ShowExprVisitor::visit(LogicalBinaryExpr& expr) {
             case OpType::LogicalXor:
                 return "LogicalXor";
             default:
-                PanicInfo("unsupported op");
+                PanicInfo(OpTypeInvalid,
+                          fmt::format("unsupported operation {}", op));
         }
     }(expr.op_type_);
 
@@ -108,10 +113,12 @@ TermExtract(const TermExpr& expr_raw) {
 
 void
 ShowExprVisitor::visit(TermExpr& expr) {
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
-    AssertInfo(datatype_is_vector(expr.data_type_) == false, "[ShowExprVisitor]Data type of expr isn't vector type");
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(datatype_is_vector(expr.column_.data_type) == false,
+               "[ShowExprVisitor]Data type of expr isn't vector type");
     auto terms = [&] {
-        switch (expr.data_type_) {
+        switch (expr.column_.data_type) {
             case DataType::BOOL:
                 return TermExtract<bool>(expr);
             case DataType::INT8:
@@ -126,14 +133,18 @@ ShowExprVisitor::visit(TermExpr& expr) {
                 return TermExtract<double>(expr);
             case DataType::FLOAT:
                 return TermExtract<float>(expr);
+            case DataType::JSON:
+                return TermExtract<milvus::Json>(expr);
             default:
-                PanicInfo("unsupported type");
+                PanicInfo(
+                    DataTypeInvalid,
+                    fmt::format("unsupported type {}", expr.column_.data_type));
         }
     }();
 
     Json res{{"expr_type", "Term"},
-             {"field_id", expr.field_id_.get()},
-             {"data_type", datatype_name(expr.data_type_)},
+             {"field_id", expr.column_.field_id.get()},
+             {"data_type", datatype_name(expr.column_.data_type)},
              {"terms", std::move(terms)}};
 
     json_opt_ = res;
@@ -145,10 +156,12 @@ UnaryRangeExtract(const UnaryRangeExpr& expr_raw) {
     using proto::plan::OpType;
     using proto::plan::OpType_Name;
     auto expr = dynamic_cast<const UnaryRangeExprImpl<T>*>(&expr_raw);
-    AssertInfo(expr, "[ShowExprVisitor]UnaryRangeExpr cast to UnaryRangeExprImpl failed");
+    AssertInfo(
+        expr,
+        "[ShowExprVisitor]UnaryRangeExpr cast to UnaryRangeExprImpl failed");
     Json res{{"expr_type", "UnaryRange"},
-             {"field_id", expr->field_id_.get()},
-             {"data_type", datatype_name(expr->data_type_)},
+             {"field_id", expr->column_.field_id.get()},
+             {"data_type", datatype_name(expr->column_.data_type)},
              {"op", OpType_Name(static_cast<OpType>(expr->op_type_))},
              {"value", expr->value_}};
     return res;
@@ -156,32 +169,36 @@ UnaryRangeExtract(const UnaryRangeExpr& expr_raw) {
 
 void
 ShowExprVisitor::visit(UnaryRangeExpr& expr) {
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
-    AssertInfo(datatype_is_vector(expr.data_type_) == false, "[ShowExprVisitor]Data type of expr isn't vector type");
-    switch (expr.data_type_) {
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(datatype_is_vector(expr.column_.data_type) == false,
+               "[ShowExprVisitor]Data type of expr isn't vector type");
+    switch (expr.column_.data_type) {
         case DataType::BOOL:
             json_opt_ = UnaryRangeExtract<bool>(expr);
             return;
+
+            // see also: https://github.com/milvus-io/milvus/issues/23646.
         case DataType::INT8:
-            json_opt_ = UnaryRangeExtract<int8_t>(expr);
-            return;
         case DataType::INT16:
-            json_opt_ = UnaryRangeExtract<int16_t>(expr);
-            return;
         case DataType::INT32:
-            json_opt_ = UnaryRangeExtract<int32_t>(expr);
-            return;
         case DataType::INT64:
             json_opt_ = UnaryRangeExtract<int64_t>(expr);
             return;
+
         case DataType::DOUBLE:
             json_opt_ = UnaryRangeExtract<double>(expr);
             return;
         case DataType::FLOAT:
             json_opt_ = UnaryRangeExtract<float>(expr);
             return;
+        case DataType::JSON:
+            json_opt_ = UnaryRangeExtract<milvus::Json>(expr);
+            return;
         default:
-            PanicInfo("unsupported type");
+            PanicInfo(
+                DataTypeInvalid,
+                fmt::format("unsupported type {}", expr.column_.data_type));
     }
 }
 
@@ -191,10 +208,12 @@ BinaryRangeExtract(const BinaryRangeExpr& expr_raw) {
     using proto::plan::OpType;
     using proto::plan::OpType_Name;
     auto expr = dynamic_cast<const BinaryRangeExprImpl<T>*>(&expr_raw);
-    AssertInfo(expr, "[ShowExprVisitor]BinaryRangeExpr cast to BinaryRangeExprImpl failed");
+    AssertInfo(
+        expr,
+        "[ShowExprVisitor]BinaryRangeExpr cast to BinaryRangeExprImpl failed");
     Json res{{"expr_type", "BinaryRange"},
-             {"field_id", expr->field_id_.get()},
-             {"data_type", datatype_name(expr->data_type_)},
+             {"field_id", expr->column_.field_id.get()},
+             {"data_type", datatype_name(expr->column_.data_type)},
              {"lower_inclusive", expr->lower_inclusive_},
              {"upper_inclusive", expr->upper_inclusive_},
              {"lower_value", expr->lower_value_},
@@ -204,9 +223,11 @@ BinaryRangeExtract(const BinaryRangeExpr& expr_raw) {
 
 void
 ShowExprVisitor::visit(BinaryRangeExpr& expr) {
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
-    AssertInfo(datatype_is_vector(expr.data_type_) == false, "[ShowExprVisitor]Data type of expr isn't vector type");
-    switch (expr.data_type_) {
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(datatype_is_vector(expr.column_.data_type) == false,
+               "[ShowExprVisitor]Data type of expr isn't vector type");
+    switch (expr.column_.data_type) {
         case DataType::BOOL:
             json_opt_ = BinaryRangeExtract<bool>(expr);
             return;
@@ -228,8 +249,13 @@ ShowExprVisitor::visit(BinaryRangeExpr& expr) {
         case DataType::FLOAT:
             json_opt_ = BinaryRangeExtract<float>(expr);
             return;
+        case DataType::JSON:
+            json_opt_ = BinaryRangeExtract<milvus::Json>(expr);
+            return;
         default:
-            PanicInfo("unsupported type");
+            PanicInfo(
+                DataTypeInvalid,
+                fmt::format("unsupported type {}", expr.column_.data_type));
     }
 }
 
@@ -237,7 +263,8 @@ void
 ShowExprVisitor::visit(CompareExpr& expr) {
     using proto::plan::OpType;
     using proto::plan::OpType_Name;
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
 
     Json res{{"expr_type", "Compare"},
              {"left_field_id", expr.left_field_id_.get()},
@@ -256,13 +283,17 @@ BinaryArithOpEvalRangeExtract(const BinaryArithOpEvalRangeExpr& expr_raw) {
     using proto::plan::OpType;
     using proto::plan::OpType_Name;
 
-    auto expr = dynamic_cast<const BinaryArithOpEvalRangeExprImpl<T>*>(&expr_raw);
-    AssertInfo(expr, "[ShowExprVisitor]BinaryArithOpEvalRangeExpr cast to BinaryArithOpEvalRangeExprImpl failed");
+    auto expr =
+        dynamic_cast<const BinaryArithOpEvalRangeExprImpl<T>*>(&expr_raw);
+    AssertInfo(expr,
+               "[ShowExprVisitor]BinaryArithOpEvalRangeExpr cast to "
+               "BinaryArithOpEvalRangeExprImpl failed");
 
     Json res{{"expr_type", "BinaryArithOpEvalRange"},
-             {"field_offset", expr->field_id_.get()},
-             {"data_type", datatype_name(expr->data_type_)},
-             {"arith_op", ArithOpType_Name(static_cast<ArithOpType>(expr->arith_op_))},
+             {"field_offset", expr->column_.field_id.get()},
+             {"data_type", datatype_name(expr->column_.data_type)},
+             {"arith_op",
+              ArithOpType_Name(static_cast<ArithOpType>(expr->arith_op_))},
              {"right_operand", expr->right_operand_},
              {"op", OpType_Name(static_cast<OpType>(expr->op_type_))},
              {"value", expr->value_}};
@@ -271,30 +302,72 @@ BinaryArithOpEvalRangeExtract(const BinaryArithOpEvalRangeExpr& expr_raw) {
 
 void
 ShowExprVisitor::visit(BinaryArithOpEvalRangeExpr& expr) {
-    AssertInfo(!json_opt_.has_value(), "[ShowExprVisitor]Ret json already has value before visit");
-    AssertInfo(datatype_is_vector(expr.data_type_) == false, "[ShowExprVisitor]Data type of expr isn't vector type");
-    switch (expr.data_type_) {
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+    AssertInfo(datatype_is_vector(expr.column_.data_type) == false,
+               "[ShowExprVisitor]Data type of expr isn't vector type");
+    switch (expr.column_.data_type) {
+        // see also: https://github.com/milvus-io/milvus/issues/23646.
         case DataType::INT8:
-            json_opt_ = BinaryArithOpEvalRangeExtract<int8_t>(expr);
-            return;
         case DataType::INT16:
-            json_opt_ = BinaryArithOpEvalRangeExtract<int16_t>(expr);
-            return;
         case DataType::INT32:
-            json_opt_ = BinaryArithOpEvalRangeExtract<int32_t>(expr);
-            return;
         case DataType::INT64:
             json_opt_ = BinaryArithOpEvalRangeExtract<int64_t>(expr);
             return;
+
         case DataType::DOUBLE:
             json_opt_ = BinaryArithOpEvalRangeExtract<double>(expr);
             return;
         case DataType::FLOAT:
             json_opt_ = BinaryArithOpEvalRangeExtract<float>(expr);
             return;
+        case DataType::JSON:
+            json_opt_ = BinaryArithOpEvalRangeExtract<milvus::Json>(expr);
+            return;
         default:
-            PanicInfo("unsupported type");
+            PanicInfo(
+                DataTypeInvalid,
+                fmt::format("unsupported type {}", expr.column_.data_type));
     }
+}
+
+void
+ShowExprVisitor::visit(ExistsExpr& expr) {
+    using proto::plan::OpType;
+    using proto::plan::OpType_Name;
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+
+    Json res{{"expr_type", "Exists"},
+             {"field_id", expr.column_.field_id.get()},
+             {"data_type", expr.column_.data_type},
+             {"nested_path", expr.column_.nested_path}};
+    json_opt_ = res;
+}
+
+void
+ShowExprVisitor::visit(AlwaysTrueExpr& expr) {
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+    Json res{{"expr_type", "AlwaysTrue"}};
+    json_opt_ = res;
+}
+
+void
+ShowExprVisitor::visit(JsonContainsExpr& expr) {
+    using proto::plan::OpType;
+    using proto::plan::OpType_Name;
+    AssertInfo(!json_opt_.has_value(),
+               "[ShowExprVisitor]Ret json already has value before visit");
+
+    Json res{{"expr_type", "JsonContains"},
+             {"field_id", expr.column_.field_id.get()},
+             {"data_type", expr.column_.data_type},
+             {"nested_path", expr.column_.nested_path},
+             {"same_type", expr.same_type_},
+             {"op", expr.op_},
+             {"val_case", expr.val_case_}};
+    json_opt_ = res;
 }
 
 }  // namespace milvus::query

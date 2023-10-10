@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/cmd/roles"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/hardware"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/hardware"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 const (
@@ -27,8 +28,8 @@ type run struct {
 	svrAlias         string
 	enableRootCoord  bool
 	enableQueryCoord bool
-	enableIndexCoord bool
 	enableDataCoord  bool
+	enableIndexCoord bool
 	enableQueryNode  bool
 	enableDataNode   bool
 	enableIndexNode  bool
@@ -50,8 +51,11 @@ func (c *run) execute(args []string, flags *flag.FlagSet) {
 	c.serverType = args[2]
 	c.formatFlags(args, flags)
 
-	var local = false
-	role := roles.MilvusRoles{}
+	// make go ignore SIGPIPE when all cgo threads set mask of SIGPIPE
+	signal.Ignore(syscall.SIGPIPE)
+
+	role := roles.NewMilvusRoles()
+	role.Local = false
 	switch c.serverType {
 	case typeutil.RootCoordRole:
 		role.EnableRootCoord = true
@@ -78,7 +82,8 @@ func (c *run) execute(args []string, flags *flag.FlagSet) {
 		role.EnableDataNode = true
 		role.EnableIndexCoord = true
 		role.EnableIndexNode = true
-		local = true
+		role.Local = true
+		role.Embedded = c.serverType == typeutil.EmbeddedRole
 	case roleMixture:
 		role.EnableRootCoord = c.enableRootCoord
 		role.EnableQueryCoord = c.enableQueryCoord
@@ -93,20 +98,6 @@ func (c *run) execute(args []string, flags *flag.FlagSet) {
 		os.Exit(-1)
 	}
 
-	// Setup logger in advance for standalone and embedded Milvus.
-	// Any log from this point on is under control.
-	if c.serverType == typeutil.StandaloneRole || c.serverType == typeutil.EmbeddedRole {
-		var params paramtable.BaseTable
-		if c.serverType == typeutil.EmbeddedRole {
-			params.GlobalInitWithYaml("embedded-milvus.yaml")
-		} else {
-			params.Init()
-		}
-		params.SetLogConfig()
-		params.RoleName = c.serverType
-		params.SetLogger(0)
-	}
-
 	runtimeDir := createRuntimeDir(c.serverType)
 	filename := getPidFileName(c.serverType, c.svrAlias)
 
@@ -117,7 +108,7 @@ func (c *run) execute(args []string, flags *flag.FlagSet) {
 		panic(err)
 	}
 	defer removePidFile(lock)
-	role.Run(local, c.svrAlias)
+	role.Run(c.svrAlias)
 }
 
 func (c *run) formatFlags(args []string, flags *flag.FlagSet) {

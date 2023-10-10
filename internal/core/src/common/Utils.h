@@ -11,50 +11,73 @@
 
 #pragma once
 
+#include <fcntl.h>
+#include <fmt/core.h>
 #include <google/protobuf/text_format.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cstring>
+#include <filesystem>
+#include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "common/Consts.h"
-#include "config/ConfigChunkManager.h"
-#include "exceptions/EasyAssert.h"
-#include "knowhere/index/vector_index/adapter/VectorAdapter.h"
-#include "knowhere/index/vector_index/helpers/IndexParameter.h"
+#include "common/FieldMeta.h"
+#include "common/LoadInfo.h"
+#include "common/Types.h"
+#include "common/EasyAssert.h"
+#include "knowhere/dataset.h"
+#include "knowhere/expected.h"
+#include "simdjson.h"
 
 namespace milvus {
+#define FIELD_DATA(data_array, type) \
+    (data_array->scalars().type##_data().data())
+
+#define VEC_FIELD_DATA(data_array, type) \
+    (data_array->vectors().type##_vector().data())
 
 inline DatasetPtr
 GenDataset(const int64_t nb, const int64_t dim, const void* xb) {
-    return knowhere::GenDataset(nb, dim, xb);
+    return knowhere::GenDataSet(nb, dim, xb);
 }
 
 inline const float*
 GetDatasetDistance(const DatasetPtr& dataset) {
-    return knowhere::GetDatasetDistance(dataset);
+    return dataset->GetDistance();
 }
 
 inline const int64_t*
 GetDatasetIDs(const DatasetPtr& dataset) {
-    return knowhere::GetDatasetIDs(dataset);
+    return dataset->GetIds();
 }
 
 inline int64_t
 GetDatasetRows(const DatasetPtr& dataset) {
-    return knowhere::GetDatasetRows(dataset);
+    return dataset->GetRows();
 }
 
 inline const void*
 GetDatasetTensor(const DatasetPtr& dataset) {
-    return knowhere::GetDatasetTensor(dataset);
+    return dataset->GetTensor();
 }
 
 inline int64_t
 GetDatasetDim(const DatasetPtr& dataset) {
-    return knowhere::GetDatasetDim(dataset);
+    return dataset->GetDim();
+}
+
+inline const size_t*
+GetDatasetLims(const DatasetPtr& dataset) {
+    return dataset->GetLims();
 }
 
 inline bool
-PrefixMatch(const std::string& str, const std::string& prefix) {
-    auto ret = strncmp(str.c_str(), prefix.c_str(), prefix.length());
+PrefixMatch(const std::string_view str, const std::string_view prefix) {
+    auto ret = strncmp(str.data(), prefix.data(), prefix.length());
     if (ret != 0) {
         return false;
     }
@@ -62,14 +85,38 @@ PrefixMatch(const std::string& str, const std::string& prefix) {
     return true;
 }
 
+inline DatasetPtr
+GenIdsDataset(const int64_t count, const int64_t* ids) {
+    auto ret_ds = std::make_shared<Dataset>();
+    ret_ds->SetRows(count);
+    ret_ds->SetDim(1);
+    ret_ds->SetIds(ids);
+    ret_ds->SetIsOwner(false);
+    return ret_ds;
+}
+
+inline DatasetPtr
+GenResultDataset(const int64_t nq,
+                 const int64_t topk,
+                 const int64_t* ids,
+                 const float* distance) {
+    auto ret_ds = std::make_shared<Dataset>();
+    ret_ds->SetRows(nq);
+    ret_ds->SetDim(topk);
+    ret_ds->SetIds(ids);
+    ret_ds->SetDistance(distance);
+    ret_ds->SetIsOwner(true);
+    return ret_ds;
+}
+
 inline bool
-PostfixMatch(const std::string& str, const std::string& postfix) {
+PostfixMatch(const std::string_view str, const std::string_view postfix) {
     if (postfix.length() > str.length()) {
         return false;
     }
 
     int offset = str.length() - postfix.length();
-    auto ret = strncmp(str.c_str() + offset, postfix.c_str(), postfix.length());
+    auto ret = strncmp(str.data() + offset, postfix.data(), postfix.length());
     if (ret != 0) {
         return false;
     }
@@ -87,25 +134,59 @@ PostfixMatch(const std::string& str, const std::string& postfix) {
 inline int64_t
 upper_align(int64_t value, int64_t align) {
     Assert(align > 0);
-    auto groups = (value + align - 1) / align;
+    auto groups = value / align + (value % align != 0);
     return groups * align;
 }
 
 inline int64_t
 upper_div(int64_t value, int64_t align) {
     Assert(align > 0);
-    auto groups = (value + align - 1) / align;
+    auto groups = value / align + (value % align != 0);
     return groups;
 }
 
 inline bool
-IsMetricType(const std::string& str, const knowhere::MetricType& metric_type) {
-    return !strcasecmp(str.c_str(), metric_type.c_str());
+IsMetricType(const std::string_view str,
+             const knowhere::MetricType& metric_type) {
+    return !strcasecmp(str.data(), metric_type.c_str());
+}
+
+inline bool
+IsFloatMetricType(const knowhere::MetricType& metric_type) {
+    return IsMetricType(metric_type, knowhere::metric::L2) ||
+           IsMetricType(metric_type, knowhere::metric::IP) ||
+           IsMetricType(metric_type, knowhere::metric::COSINE);
 }
 
 inline bool
 PositivelyRelated(const knowhere::MetricType& metric_type) {
-    return IsMetricType(metric_type, knowhere::metric::IP);
+    return IsMetricType(metric_type, knowhere::metric::IP) ||
+           IsMetricType(metric_type, knowhere::metric::COSINE);
+}
+
+inline std::string
+KnowhereStatusString(knowhere::Status status) {
+    return knowhere::Status2String(status);
+}
+
+inline std::vector<IndexType>
+DISK_INDEX_LIST() {
+    static std::vector<IndexType> ret{
+        knowhere::IndexEnum::INDEX_DISKANN,
+    };
+    return ret;
+}
+
+template <typename T>
+inline bool
+is_in_list(const T& t, std::function<std::vector<T>()> list_func) {
+    auto l = list_func();
+    return std::find(l.begin(), l.end(), t) != l.end();
+}
+
+inline bool
+is_in_disk_list(const IndexType& index_type) {
+    return is_in_list<IndexType>(index_type, DISK_INDEX_LIST);
 }
 
 }  // namespace milvus

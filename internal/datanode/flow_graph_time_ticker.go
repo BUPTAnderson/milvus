@@ -20,9 +20,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"golang.org/x/exp/maps"
 
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 type sendTimeTick func(Timestamp, []int64) error
@@ -66,24 +68,18 @@ func (mt *mergedTimeTickerSender) bufferTs(ts Timestamp, segmentIDs []int64) {
 	for _, sid := range segmentIDs {
 		mt.segmentIDs[sid] = struct{}{}
 	}
-
-	if !mt.lastSent.IsZero() && time.Since(mt.lastSent) > time.Millisecond*100 {
-		mt.cond.L.Lock()
-		defer mt.cond.L.Unlock()
-		mt.cond.Signal()
-	}
 }
 
 func (mt *mergedTimeTickerSender) tick() {
 	defer mt.wg.Done()
 	// this duration might be configuable in the future
-	t := time.NewTicker(time.Millisecond * 100) // 100 millisecond, 1/2 of rootcoord timetick duration
+	t := time.NewTicker(Params.DataNodeCfg.DataNodeTimeTickInterval.GetAsDuration(time.Millisecond)) // 500 millisecond
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
 			mt.cond.L.Lock()
-			mt.cond.Signal() // allow worker to check every 0.1s
+			mt.cond.Signal()
 			mt.cond.L.Unlock()
 		case <-mt.closeCh:
 			return
@@ -104,6 +100,10 @@ func (mt *mergedTimeTickerSender) work() {
 	defer mt.wg.Done()
 	lastTs := uint64(0)
 	for {
+		var (
+			isDiffTs bool
+			sids     []int64
+		)
 		mt.cond.L.Lock()
 		if mt.isClosed() {
 			mt.cond.L.Unlock()
@@ -113,20 +113,28 @@ func (mt *mergedTimeTickerSender) work() {
 		mt.cond.L.Unlock()
 
 		mt.mu.Lock()
-		if mt.ts != lastTs {
-			var sids []int64
+		isDiffTs = mt.ts != lastTs
+		if isDiffTs {
 			for sid := range mt.segmentIDs {
 				sids = append(sids, sid)
 			}
-			mt.segmentIDs = make(map[int64]struct{})
+			// we will reset the timer but not the segmentIDs, since if we sent the timetick fail we may block forever due to flush stuck
 			lastTs = mt.ts
 			mt.lastSent = time.Now()
-
-			if err := mt.send(mt.ts, sids); err != nil {
-				log.Error("send hard time tick failed", zap.Error(err))
-			}
+			mt.segmentIDs = make(map[int64]struct{})
 		}
 		mt.mu.Unlock()
+
+		if isDiffTs {
+			if err := mt.send(lastTs, sids); err != nil {
+				log.Error("send hard time tick failed", zap.Error(err))
+				mt.mu.Lock()
+				maps.Copy(mt.segmentIDs, lo.SliceToMap(sids, func(t int64) (int64, struct{}) {
+					return t, struct{}{}
+				}))
+				mt.mu.Unlock()
+			}
+		}
 	}
 }
 

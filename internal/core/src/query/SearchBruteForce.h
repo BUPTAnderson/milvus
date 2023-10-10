@@ -12,15 +12,23 @@
 #pragma once
 
 #include "common/BitsetView.h"
+#include "common/FieldMeta.h"
+#include "common/QueryInfo.h"
 #include "query/SubSearchResult.h"
 #include "query/helper.h"
 
 namespace milvus::query {
 
+void
+CheckBruteForceSearchParam(const FieldMeta& field,
+                           const SearchInfo& search_info);
+
 SubSearchResult
 BruteForceSearch(const dataset::SearchDataset& dataset,
                  const void* chunk_data_raw,
                  int64_t chunk_rows,
-                 const BitsetView& bitset);
+                 const knowhere::Json& conf,
+                 const BitsetView& bitset,
+                 DataType data_type = DataType::VECTOR_FLOAT);
 
 }  // namespace milvus::query

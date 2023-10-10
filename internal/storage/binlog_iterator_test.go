@@ -19,11 +19,11 @@ package storage
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/proto/etcdpb"
-
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/common"
 )
 
 func generateTestData(t *testing.T, num int) []*Blob {
@@ -34,7 +34,7 @@ func generateTestData(t *testing.T, num int) []*Blob {
 		{FieldID: 102, Name: "floatVector", DataType: schemapb.DataType_FloatVector},
 		{FieldID: 103, Name: "binaryVector", DataType: schemapb.DataType_BinaryVector},
 	}}
-	insertCodec := NewInsertCodec(&etcdpb.CollectionMeta{ID: 1, Schema: schema})
+	insertCodec := NewInsertCodecWithSchema(&etcdpb.CollectionMeta{ID: 1, Schema: schema})
 
 	var (
 		field0   []int64
@@ -63,19 +63,17 @@ func generateTestData(t *testing.T, num int) []*Blob {
 		common.TimeStampField: &Int64FieldData{Data: field1},
 		101:                   &Int32FieldData{Data: field101},
 		102: &FloatVectorFieldData{
-			NumRows: []int64{int64(num)},
-			Data:    field102,
-			Dim:     8,
+			Data: field102,
+			Dim:  8,
 		},
 		103: &BinaryVectorFieldData{
-			NumRows: []int64{int64(num)},
-			Data:    field103,
-			Dim:     8,
+			Data: field103,
+			Dim:  8,
 		},
 	}}
 
-	blobs, _, err := insertCodec.Serialize(1, 1, data)
-	assert.Nil(t, err)
+	blobs, err := insertCodec.Serialize(1, 1, data)
+	assert.NoError(t, err)
 	return blobs
 }
 
@@ -92,7 +90,7 @@ func TestInsertlogIterator(t *testing.T) {
 	t.Run("test dispose", func(t *testing.T) {
 		blobs := generateTestData(t, 1)
 		itr, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		itr.Dispose()
 		assert.False(t, itr.HasNext())
@@ -103,12 +101,12 @@ func TestInsertlogIterator(t *testing.T) {
 	t.Run("not empty iterator", func(t *testing.T) {
 		blobs := generateTestData(t, 3)
 		itr, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		for i := 1; i <= 3; i++ {
 			assert.True(t, itr.HasNext())
 			v, err := itr.Next()
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			value := v.(*Value)
 
 			f102 := make([]float32, 8)
@@ -158,7 +156,7 @@ func TestMergeIterator(t *testing.T) {
 	t.Run("empty and non-empty iterators", func(t *testing.T) {
 		blobs := generateTestData(t, 3)
 		insertItr, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		iterators := []Iterator{
 			&InsertBinlogIterator{data: &InsertData{}},
 			insertItr,
@@ -169,7 +167,7 @@ func TestMergeIterator(t *testing.T) {
 		for i := 1; i <= 3; i++ {
 			assert.True(t, itr.HasNext())
 			v, err := itr.Next()
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			value := v.(*Value)
 			f102 := make([]float32, 8)
 			for j := range f102 {
@@ -202,9 +200,9 @@ func TestMergeIterator(t *testing.T) {
 	t.Run("non-empty iterators", func(t *testing.T) {
 		blobs := generateTestData(t, 3)
 		itr1, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		itr2, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		iterators := []Iterator{itr1, itr2}
 		itr := NewMergeIterator(iterators)
 
@@ -233,7 +231,7 @@ func TestMergeIterator(t *testing.T) {
 			for j := 0; j < 2; j++ {
 				assert.True(t, itr.HasNext())
 				v, err := itr.Next()
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 				value := v.(*Value)
 				assert.EqualValues(t, expected, value)
 			}
@@ -247,7 +245,7 @@ func TestMergeIterator(t *testing.T) {
 	t.Run("test dispose", func(t *testing.T) {
 		blobs := generateTestData(t, 3)
 		itr1, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		itr := NewMergeIterator([]Iterator{itr1})
 
 		itr.Dispose()

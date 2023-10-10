@@ -14,6 +14,10 @@ spec:
       value: "true"
     - name: DOCKER_VOLUME_DIRECTORY
       value: "/mnt/disk/.docker"
+    - name: DOCKER_CLIENT_TIMEOUT
+      value: 240
+    - name: COMPOSE_HTTP_TIMEOUT
+      value: 240
     tty: true
     securityContext:
       privileged: true
@@ -41,7 +45,7 @@ spec:
     - mountPath: /ci-logs
       name: ci-logs  
   - name: pytest
-    image: harbor.milvus.io/dockerhub/milvusdb/pytest:20220826-1bd87e7
+    image: harbor.milvus.io/dockerhub/milvusdb/pytest:20230919-de139e3
     resources:
       limits:
         cpu: "6"

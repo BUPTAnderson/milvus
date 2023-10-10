@@ -10,7 +10,6 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
 set(MILVUS_QUERY_SRCS
-        deprecated/BinaryQuery.cpp
         generated/PlanNode.cpp
         generated/Expr.cpp
         visitors/ShowPlanNodeVisitor.cpp
@@ -21,7 +20,6 @@ set(MILVUS_QUERY_SRCS
         visitors/VerifyExprVisitor.cpp
         visitors/ExtractInfoPlanNodeVisitor.cpp
         visitors/ExtractInfoExprVisitor.cpp
-        Parser.cpp
         Plan.cpp
         SearchOnGrowing.cpp
         SearchOnSealed.cpp
@@ -31,4 +29,8 @@ set(MILVUS_QUERY_SRCS
         PlanProto.cpp
         )
 add_library(milvus_query ${MILVUS_QUERY_SRCS})
-target_link_libraries(milvus_query milvus_index)
+if(USE_DYNAMIC_SIMD)
+        target_link_libraries(milvus_query milvus_index milvus_simd)
+else()
+        target_link_libraries(milvus_query milvus_index)
+endif()

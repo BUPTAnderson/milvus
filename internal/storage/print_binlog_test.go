@@ -23,16 +23,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
-
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
 )
 
 func TestPrintBinlogFilesInt64(t *testing.T) {
@@ -41,46 +42,45 @@ func TestPrintBinlogFilesInt64(t *testing.T) {
 	curTS := time.Now().UnixNano() / int64(time.Millisecond)
 
 	e1, err := w.NextInsertEventWriter()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = e1.AddDataToPayload([]int64{1, 2, 3})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = e1.AddDataToPayload([]int32{4, 5, 6})
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	err = e1.AddDataToPayload([]int64{4, 5, 6})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	e1.SetEventTimestamp(tsoutil.ComposeTS(curTS+10*60*1000, 0), tsoutil.ComposeTS(curTS+20*60*1000, 0))
 
 	e2, err := w.NextInsertEventWriter()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = e2.AddDataToPayload([]int64{7, 8, 9})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	err = e2.AddDataToPayload([]bool{true, false, true})
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	err = e2.AddDataToPayload([]int64{10, 11, 12})
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	e2.SetEventTimestamp(tsoutil.ComposeTS(curTS+30*60*1000, 0), tsoutil.ComposeTS(curTS+40*60*1000, 0))
 
 	w.SetEventTimeStamp(tsoutil.ComposeTS(curTS, 0), tsoutil.ComposeTS(curTS+3600*1000, 0))
 
 	_, err = w.GetBuffer()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	sizeTotal := 20000000
 	w.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
 	err = w.Finish()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	buf, err := w.GetBuffer()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	w.Close()
 
 	fd, err := ioutil.TempFile("", "binlog_int64.db")
 	defer os.RemoveAll(fd.Name())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	num, err := fd.Write(buf)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, num, len(buf))
 	err = fd.Close()
-	assert.Nil(t, err)
-
+	assert.NoError(t, err)
 }
 
 func TestPrintBinlogFiles(t *testing.T) {
@@ -178,61 +178,62 @@ func TestPrintBinlogFiles(t *testing.T) {
 					Description:  "description_11",
 					DataType:     schemapb.DataType_FloatVector,
 				},
+				{
+					FieldID:      110,
+					Name:         "field_json",
+					IsPrimaryKey: false,
+					Description:  "description_12",
+					DataType:     schemapb.DataType_JSON,
+				},
 			},
 		},
 	}
-	insertCodec := NewInsertCodec(Schema)
+	insertCodec := NewInsertCodecWithSchema(Schema)
 	insertDataFirst := &InsertData{
 		Data: map[int64]FieldData{
 			0: &Int64FieldData{
-				NumRows: []int64{2},
-				Data:    []int64{3, 4},
+				Data: []int64{3, 4},
 			},
 			1: &Int64FieldData{
-				NumRows: []int64{2},
-				Data:    []int64{3, 4},
+				Data: []int64{3, 4},
 			},
 			100: &BoolFieldData{
-				NumRows: []int64{2},
-				Data:    []bool{true, false},
+				Data: []bool{true, false},
 			},
 			101: &Int8FieldData{
-				NumRows: []int64{2},
-				Data:    []int8{3, 4},
+				Data: []int8{3, 4},
 			},
 			102: &Int16FieldData{
-				NumRows: []int64{2},
-				Data:    []int16{3, 4},
+				Data: []int16{3, 4},
 			},
 			103: &Int32FieldData{
-				NumRows: []int64{2},
-				Data:    []int32{3, 4},
+				Data: []int32{3, 4},
 			},
 			104: &Int64FieldData{
-				NumRows: []int64{2},
-				Data:    []int64{3, 4},
+				Data: []int64{3, 4},
 			},
 			105: &FloatFieldData{
-				NumRows: []int64{2},
-				Data:    []float32{3, 4},
+				Data: []float32{3, 4},
 			},
 			106: &DoubleFieldData{
-				NumRows: []int64{2},
-				Data:    []float64{3, 4},
+				Data: []float64{3, 4},
 			},
 			107: &StringFieldData{
-				NumRows: []int64{2},
-				Data:    []string{"3", "4"},
+				Data: []string{"3", "4"},
 			},
 			108: &BinaryVectorFieldData{
-				NumRows: []int64{2},
-				Data:    []byte{0, 255},
-				Dim:     8,
+				Data: []byte{0, 255},
+				Dim:  8,
 			},
 			109: &FloatVectorFieldData{
-				NumRows: []int64{2},
-				Data:    []float32{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
-				Dim:     8,
+				Data: []float32{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
+				Dim:  8,
+			},
+			110: &JSONFieldData{
+				Data: [][]byte{
+					[]byte(`{}`),
+					[]byte(`{"key":"hello"}`),
+				},
 			},
 		},
 	}
@@ -240,85 +241,79 @@ func TestPrintBinlogFiles(t *testing.T) {
 	insertDataSecond := &InsertData{
 		Data: map[int64]FieldData{
 			0: &Int64FieldData{
-				NumRows: []int64{2},
-				Data:    []int64{1, 2},
+				Data: []int64{1, 2},
 			},
 			1: &Int64FieldData{
-				NumRows: []int64{2},
-				Data:    []int64{1, 2},
+				Data: []int64{1, 2},
 			},
 			100: &BoolFieldData{
-				NumRows: []int64{2},
-				Data:    []bool{true, false},
+				Data: []bool{true, false},
 			},
 			101: &Int8FieldData{
-				NumRows: []int64{2},
-				Data:    []int8{1, 2},
+				Data: []int8{1, 2},
 			},
 			102: &Int16FieldData{
-				NumRows: []int64{2},
-				Data:    []int16{1, 2},
+				Data: []int16{1, 2},
 			},
 			103: &Int32FieldData{
-				NumRows: []int64{2},
-				Data:    []int32{1, 2},
+				Data: []int32{1, 2},
 			},
 			104: &Int64FieldData{
-				NumRows: []int64{2},
-				Data:    []int64{1, 2},
+				Data: []int64{1, 2},
 			},
 			105: &FloatFieldData{
-				NumRows: []int64{2},
-				Data:    []float32{1, 2},
+				Data: []float32{1, 2},
 			},
 			106: &DoubleFieldData{
-				NumRows: []int64{2},
-				Data:    []float64{1, 2},
+				Data: []float64{1, 2},
 			},
 			107: &StringFieldData{
-				NumRows: []int64{2},
-				Data:    []string{"1", "2"},
+				Data: []string{"1", "2"},
 			},
 			108: &BinaryVectorFieldData{
-				NumRows: []int64{2},
-				Data:    []byte{0, 255},
-				Dim:     8,
+				Data: []byte{0, 255},
+				Dim:  8,
 			},
 			109: &FloatVectorFieldData{
-				NumRows: []int64{2},
-				Data:    []float32{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
-				Dim:     8,
+				Data: []float32{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
+				Dim:  8,
+			},
+			110: &JSONFieldData{
+				Data: [][]byte{
+					[]byte(`{}`),
+					[]byte(`{"key":"world"}`),
+				},
 			},
 		},
 	}
-	firstBlobs, _, err := insertCodec.Serialize(1, 1, insertDataFirst)
-	assert.Nil(t, err)
+	firstBlobs, err := insertCodec.Serialize(1, 1, insertDataFirst)
+	assert.NoError(t, err)
 	var binlogFiles []string
 	for index, blob := range firstBlobs {
 		blob.Key = fmt.Sprintf("1/insert_log/2/3/4/5/%d", 100)
 		fileName := fmt.Sprintf("/tmp/firstblob_%d.db", index)
 		binlogFiles = append(binlogFiles, fileName)
 		fd, err := os.Create(fileName)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		num, err := fd.Write(blob.GetValue())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, num, len(blob.GetValue()))
 		err = fd.Close()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
-	secondBlobs, _, err := insertCodec.Serialize(1, 1, insertDataSecond)
-	assert.Nil(t, err)
+	secondBlobs, err := insertCodec.Serialize(1, 1, insertDataSecond)
+	assert.NoError(t, err)
 	for index, blob := range secondBlobs {
 		blob.Key = fmt.Sprintf("1/insert_log/2/3/4/5/%d", 99)
 		fileName := fmt.Sprintf("/tmp/secondblob_%d.db", index)
 		binlogFiles = append(binlogFiles, fileName)
 		fd, err := os.Create(fileName)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		num, err := fd.Write(blob.GetValue())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, num, len(blob.GetValue()))
 		err = fd.Close()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 	binlogFiles = append(binlogFiles, "test")
 
@@ -340,7 +335,7 @@ func TestPrintDDFiles(t *testing.T) {
 	partitionID := int64(1)
 	collName := "test"
 	partitionName := "test"
-	createCollReq := internalpb.CreateCollectionRequest{
+	createCollReq := msgpb.CreateCollectionRequest{
 		Base: &commonpb.MsgBase{
 			MsgType:   commonpb.MsgType_CreateCollection,
 			MsgID:     1,
@@ -354,9 +349,9 @@ func TestPrintDDFiles(t *testing.T) {
 		DbID:           UniqueID(0),
 	}
 	createCollString, err := proto.Marshal(&createCollReq)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	dropCollReq := internalpb.DropCollectionRequest{
+	dropCollReq := msgpb.DropCollectionRequest{
 		Base: &commonpb.MsgBase{
 			MsgType:   commonpb.MsgType_DropCollection,
 			MsgID:     2,
@@ -369,9 +364,9 @@ func TestPrintDDFiles(t *testing.T) {
 		DbID:           UniqueID(0),
 	}
 	dropCollString, err := proto.Marshal(&dropCollReq)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	createPartitionReq := internalpb.CreatePartitionRequest{
+	createPartitionReq := msgpb.CreatePartitionRequest{
 		Base: &commonpb.MsgBase{
 			MsgType:   commonpb.MsgType_CreatePartition,
 			MsgID:     3,
@@ -386,9 +381,9 @@ func TestPrintDDFiles(t *testing.T) {
 		DbID:           UniqueID(0),
 	}
 	createPartitionString, err := proto.Marshal(&createPartitionReq)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	dropPartitionReq := internalpb.DropPartitionRequest{
+	dropPartitionReq := msgpb.DropPartitionRequest{
 		Base: &commonpb.MsgBase{
 			MsgType:   commonpb.MsgType_DropPartition,
 			MsgID:     4,
@@ -403,7 +398,7 @@ func TestPrintDDFiles(t *testing.T) {
 		DbID:           UniqueID(0),
 	}
 	dropPartitionString, err := proto.Marshal(&dropPartitionReq)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	ddRequests := []string{
 		string(createCollString[:]),
 		string(dropCollString[:]),
@@ -417,22 +412,22 @@ func TestPrintDDFiles(t *testing.T) {
 		DropPartitionEventType,
 	}
 	blobs, err := dataDefinitionCodec.Serialize(ts, ddRequests, eventTypeCodes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	var binlogFiles []string
 	for index, blob := range blobs {
 		blob.Key = fmt.Sprintf("1/data_definition/3/4/5/%d", 99)
 		fileName := fmt.Sprintf("/tmp/ddblob_%d.db", index)
 		binlogFiles = append(binlogFiles, fileName)
 		fd, err := os.Create(fileName)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		num, err := fd.Write(blob.GetValue())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, num, len(blob.GetValue()))
 		err = fd.Close()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 	resultTs, resultRequests, err := dataDefinitionCodec.Deserialize(blobs)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, resultTs, ts)
 	assert.Equal(t, resultRequests, ddRequests)
 
@@ -453,7 +448,7 @@ func TestPrintIndexFile(t *testing.T) {
 	indexName := funcutil.GenRandomStr()
 	indexID := UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
 	indexParams := make(map[string]string)
-	indexParams["index_type"] = "IVF_FLAT"
+	indexParams[common.IndexTypeKey] = "IVF_FLAT"
 	datas := []*Blob{
 		{
 			Key:   "ivf1",
@@ -472,23 +467,23 @@ func TestPrintIndexFile(t *testing.T) {
 	codec := NewIndexFileBinlogCodec()
 
 	serializedBlobs, err := codec.Serialize(indexBuildID, version, collectionID, partitionID, segmentID, fieldID, indexParams, indexName, indexID, datas)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	var binlogFiles []string
 	for index, blob := range serializedBlobs {
 		fileName := fmt.Sprintf("/tmp/index_blob_%d.binlog", index)
 		binlogFiles = append(binlogFiles, fileName)
 		fd, err := os.Create(fileName)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		num, err := fd.Write(blob.GetValue())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, num, len(blob.GetValue()))
 		err = fd.Close()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 
 	err = PrintBinlogFiles(binlogFiles)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	// remove tmp files
 	for _, file := range binlogFiles {

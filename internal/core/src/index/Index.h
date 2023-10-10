@@ -18,13 +18,19 @@
 
 #include <memory>
 #include <boost/dynamic_bitset.hpp>
-
+#include "common/EasyAssert.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
 #include "common/Types.h"
+
+const std::string kMmapFilepath = "mmap_filepath";
+const std::string kEnableMmap = "enable_mmap";
 
 namespace milvus::index {
 
 class IndexBase {
  public:
+    IndexBase() = default;
     virtual ~IndexBase() = default;
 
     virtual BinarySet
@@ -34,17 +40,48 @@ class IndexBase {
     Load(const BinarySet& binary_set, const Config& config = {}) = 0;
 
     virtual void
-    BuildWithRawData(size_t n, const void* values, const Config& config = {}) = 0;
+    Load(const Config& config = {}) = 0;
+
+    virtual void
+    BuildWithRawData(size_t n,
+                     const void* values,
+                     const Config& config = {}) = 0;
 
     virtual void
     BuildWithDataset(const DatasetPtr& dataset, const Config& config = {}) = 0;
 
+    virtual void
+    Build(const Config& config = {}) = 0;
+
     virtual int64_t
     Count() = 0;
 
+    virtual BinarySet
+    Upload(const Config& config = {}) = 0;
+
+    bool
+    IsMmapSupported() const {
+        return index_type_ == knowhere::IndexEnum::INDEX_HNSW ||
+               //    index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT ||    IVF_FLAT is not supported as it doesn't stores the vectors
+               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC ||
+               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFPQ ||
+               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IVFSQ8 ||
+               index_type_ == knowhere::IndexEnum::INDEX_FAISS_BIN_IVFFLAT ||
+               index_type_ == knowhere::IndexEnum::INDEX_FAISS_IDMAP ||
+               index_type_ == knowhere::IndexEnum::INDEX_FAISS_BIN_IDMAP;
+    }
+
+    const IndexType&
+    Type() const {
+        return index_type_;
+    }
+
  protected:
+    explicit IndexBase(IndexType index_type)
+        : index_type_(std::move(index_type)) {
+    }
+
     IndexType index_type_ = "";
-    IndexMode index_mode_ = IndexMode::MODE_CPU;
 };
 
 using IndexBasePtr = std::unique_ptr<IndexBase>;

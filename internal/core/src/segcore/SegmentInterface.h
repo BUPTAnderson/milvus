@@ -47,11 +47,17 @@ class SegmentInterface {
     virtual void
     FillTargetEntry(const query::Plan* plan, SearchResult& results) const = 0;
 
+    virtual bool
+    Contain(const PkType& pk) const = 0;
+
     virtual std::unique_ptr<SearchResult>
-    Search(const query::Plan* Plan, const query::PlaceholderGroup* placeholder_group, Timestamp timestamp) const = 0;
+    Search(const query::Plan* Plan,
+           const query::PlaceholderGroup* placeholder_group) const = 0;
 
     virtual std::unique_ptr<proto::segcore::RetrieveResults>
-    Retrieve(const query::RetrievePlan* Plan, Timestamp timestamp) const = 0;
+    Retrieve(const query::RetrievePlan* Plan,
+             Timestamp timestamp,
+             int64_t limit_size) const = 0;
 
     // TODO: memory use is not correct when load string or load string index
     virtual int64_t
@@ -70,16 +76,36 @@ class SegmentInterface {
     get_real_count() const = 0;
 
     virtual int64_t
-    PreDelete(int64_t size) = 0;
+    get_field_avg_size(FieldId field_id) const = 0;
 
-    virtual Status
-    Delete(int64_t reserved_offset, int64_t size, const IdArray* pks, const Timestamp* timestamps) = 0;
+    virtual void
+    set_field_avg_size(FieldId field_id,
+                       int64_t num_rows,
+                       int64_t field_size) = 0;
+
+    //  virtual int64_t
+    //  PreDelete(int64_t size) = 0;
+
+    virtual SegcoreError
+    Delete(int64_t reserved_offset,
+           int64_t size,
+           const IdArray* pks,
+           const Timestamp* timestamps) = 0;
 
     virtual void
     LoadDeletedRecord(const LoadDeletedRecordInfo& info) = 0;
 
+    virtual void
+    LoadFieldData(const LoadFieldDataInfo& info) = 0;
+
     virtual int64_t
     get_segment_id() const = 0;
+
+    virtual SegmentType
+    type() const = 0;
+
+    virtual bool
+    HasRawData(int64_t field_id) const = 0;
 };
 
 // internal API for DSL calculation
@@ -105,17 +131,20 @@ class SegmentInternalInterface : public SegmentInterface {
 
     std::unique_ptr<SearchResult>
     Search(const query::Plan* Plan,
-           const query::PlaceholderGroup* placeholder_group,
-           Timestamp timestamp) const override;
+           const query::PlaceholderGroup* placeholder_group) const override;
 
     void
-    FillPrimaryKeys(const query::Plan* plan, SearchResult& results) const override;
+    FillPrimaryKeys(const query::Plan* plan,
+                    SearchResult& results) const override;
 
     void
-    FillTargetEntry(const query::Plan* plan, SearchResult& results) const override;
+    FillTargetEntry(const query::Plan* plan,
+                    SearchResult& results) const override;
 
     std::unique_ptr<proto::segcore::RetrieveResults>
-    Retrieve(const query::RetrievePlan* plan, Timestamp timestamp) const override;
+    Retrieve(const query::RetrievePlan* Plan,
+             Timestamp timestamp,
+             int64_t limit_size) const override;
 
     virtual bool
     HasIndex(FieldId field_id) const = 0;
@@ -129,6 +158,14 @@ class SegmentInternalInterface : public SegmentInterface {
     int64_t
     get_real_count() const override;
 
+    int64_t
+    get_field_avg_size(FieldId field_id) const override;
+
+    void
+    set_field_avg_size(FieldId field_id,
+                       int64_t num_rows,
+                       int64_t field_size) override;
+
  public:
     virtual void
     vector_search(SearchInfo& search_info,
@@ -139,7 +176,9 @@ class SegmentInternalInterface : public SegmentInterface {
                   SearchResult& output) const = 0;
 
     virtual void
-    mask_with_delete(BitsetType& bitset, int64_t ins_barrier, Timestamp timestamp) const = 0;
+    mask_with_delete(BitsetType& bitset,
+                     int64_t ins_barrier,
+                     Timestamp timestamp) const = 0;
 
     // count of chunk that has index available
     virtual int64_t
@@ -150,7 +189,8 @@ class SegmentInternalInterface : public SegmentInterface {
     num_chunk_data(FieldId field_id) const = 0;
 
     virtual void
-    mask_with_timestamps(BitsetType& bitset_chunk, Timestamp timestamp) const = 0;
+    mask_with_timestamps(BitsetType& bitset_chunk,
+                         Timestamp timestamp) const = 0;
 
     // count of chunks
     virtual int64_t
@@ -163,14 +203,50 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual int64_t
     get_active_count(Timestamp ts) const = 0;
 
-    virtual std::vector<SegOffset>
-    search_ids(const BitsetType& view, Timestamp timestamp) const = 0;
-
-    virtual std::vector<SegOffset>
-    search_ids(const BitsetView& view, Timestamp timestamp) const = 0;
-
     virtual std::pair<std::unique_ptr<IdArray>, std::vector<SegOffset>>
     search_ids(const IdArray& id_array, Timestamp timestamp) const = 0;
+
+    /**
+     * Apply timestamp filtering on bitset, the query can't see an entity whose
+     * timestamp is bigger than the timestamp of query.
+     *
+     * @param bitset The final bitset after scalar filtering and delta filtering,
+     *  `false` means that the entity will be filtered out.
+     * @param timestamp The timestamp of query.
+     */
+    void
+    timestamp_filter(BitsetType& bitset, Timestamp timestamp) const;
+
+    /**
+     * Apply timestamp filtering on bitset, the query can't see an entity whose
+     * timestamp is bigger than the timestamp of query. The passed offsets are
+     * all candidate entities.
+     *
+     * @param bitset The final bitset after scalar filtering and delta filtering,
+     *  `true` means that the entity will be filtered out.
+     * @param offsets The segment offsets of all candidates.
+     * @param timestamp The timestamp of query.
+     */
+    void
+    timestamp_filter(BitsetType& bitset,
+                     const std::vector<int64_t>& offsets,
+                     Timestamp timestamp) const;
+
+    /**
+     * Sort all candidates in ascending order, and then return the limit smallest.
+     * Bitset is used to check if the candidate will be filtered out. `false_filtered_out`
+     * determines how to filter out candidates. If `false_filtered_out` is true, we will
+     * filter all candidates whose related bit is false.
+     *
+     * @param limit
+     * @param bitset
+     * @param false_filtered_out
+     * @return All candidates offsets.
+     */
+    virtual std::vector<OffsetMap::OffsetType>
+    find_first(int64_t limit,
+               const BitsetType& bitset,
+               bool false_filtered_out) const = 0;
 
  protected:
     // internal API: return chunk_data in span
@@ -181,20 +257,30 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual const index::IndexBase*
     chunk_index_impl(FieldId field_id, int64_t chunk_id) const = 0;
 
-    // TODO remove system fields
     // calculate output[i] = Vec[seg_offsets[i]}, where Vec binds to system_type
     virtual void
-    bulk_subscript(SystemFieldType system_type, const int64_t* seg_offsets, int64_t count, void* output) const = 0;
+    bulk_subscript(SystemFieldType system_type,
+                   const int64_t* seg_offsets,
+                   int64_t count,
+                   void* output) const = 0;
 
     // calculate output[i] = Vec[seg_offsets[i]}, where Vec binds to field_offset
     virtual std::unique_ptr<DataArray>
-    bulk_subscript(FieldId field_id, const int64_t* seg_offsets, int64_t count) const = 0;
+    bulk_subscript(FieldId field_id,
+                   const int64_t* seg_offsets,
+                   int64_t count) const = 0;
 
     virtual void
     check_search(const query::Plan* plan) const = 0;
 
+    virtual const ConcurrentVector<Timestamp>&
+    get_timestamps() const = 0;
+
  protected:
     mutable std::shared_mutex mutex_;
+    // fieldID -> std::pair<num_rows, avg_size>
+    std::unordered_map<FieldId, std::pair<int64_t, int64_t>>
+        variable_fields_avg_size_;  // bytes
 };
 
 }  // namespace milvus::segcore

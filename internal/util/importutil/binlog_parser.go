@@ -18,25 +18,27 @@ package importutil
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 type BinlogParser struct {
-	ctx              context.Context            // for canceling parse process
-	collectionSchema *schemapb.CollectionSchema // collection schema
-	shardNum         int32                      // sharding number of the collection
-	blockSize        int64                      // maximum size of a read block(unit:byte)
-	chunkManager     storage.ChunkManager       // storage interfaces to browse/read the files
-	callFlushFunc    ImportFlushFunc            // call back function to flush segment
+	ctx                context.Context      // for canceling parse process
+	collectionInfo     *CollectionInfo      // collection details including schema
+	shardNum           int32                // sharding number of the collection
+	blockSize          int64                // maximum size of a read block(unit:byte)
+	chunkManager       storage.ChunkManager // storage interfaces to browse/read the files
+	callFlushFunc      ImportFlushFunc      // call back function to flush segment
+	updateProgressFunc func(percent int64)  // update working progress percent value
 
 	// a timestamp to define the start time point of restore, data before this time point will be ignored
 	// set this value to 0, all the data will be imported
@@ -52,43 +54,44 @@ type BinlogParser struct {
 }
 
 func NewBinlogParser(ctx context.Context,
-	collectionSchema *schemapb.CollectionSchema,
-	shardNum int32,
+	collectionInfo *CollectionInfo,
 	blockSize int64,
 	chunkManager storage.ChunkManager,
 	flushFunc ImportFlushFunc,
+	updateProgressFunc func(percent int64),
 	tsStartPoint uint64,
-	tsEndPoint uint64) (*BinlogParser, error) {
-	if collectionSchema == nil {
-		log.Error("Binlog parser: collection schema is nil")
+	tsEndPoint uint64,
+) (*BinlogParser, error) {
+	if collectionInfo == nil {
+		log.Warn("Binlog parser: collection schema is nil")
 		return nil, errors.New("collection schema is nil")
 	}
 
 	if chunkManager == nil {
-		log.Error("Binlog parser: chunk manager pointer is nil")
+		log.Warn("Binlog parser: chunk manager pointer is nil")
 		return nil, errors.New("chunk manager pointer is nil")
 	}
 
 	if flushFunc == nil {
-		log.Error("Binlog parser: flush function is nil")
+		log.Warn("Binlog parser: flush function is nil")
 		return nil, errors.New("flush function is nil")
 	}
 
 	if tsStartPoint > tsEndPoint {
-		log.Error("Binlog parser: the tsStartPoint should be less than tsEndPoint",
+		log.Warn("Binlog parser: the tsStartPoint should be less than tsEndPoint",
 			zap.Uint64("tsStartPoint", tsStartPoint), zap.Uint64("tsEndPoint", tsEndPoint))
 		return nil, fmt.Errorf("Binlog parser: the tsStartPoint %d should be less than tsEndPoint %d", tsStartPoint, tsEndPoint)
 	}
 
 	v := &BinlogParser{
-		ctx:              ctx,
-		collectionSchema: collectionSchema,
-		shardNum:         shardNum,
-		blockSize:        blockSize,
-		chunkManager:     chunkManager,
-		callFlushFunc:    flushFunc,
-		tsStartPoint:     tsStartPoint,
-		tsEndPoint:       tsEndPoint,
+		ctx:                ctx,
+		collectionInfo:     collectionInfo,
+		blockSize:          blockSize,
+		chunkManager:       chunkManager,
+		callFlushFunc:      flushFunc,
+		updateProgressFunc: updateProgressFunc,
+		tsStartPoint:       tsStartPoint,
+		tsEndPoint:         tsEndPoint,
 	}
 
 	return v, nil
@@ -117,28 +120,34 @@ func (p *BinlogParser) constructSegmentHolders(insertlogRoot string, deltalogRoo
 	// TODO add context
 	insertlogs, _, err := p.chunkManager.ListWithPrefix(context.TODO(), insertlogRoot, true)
 	if err != nil {
-		log.Error("Binlog parser: list insert logs error", zap.Error(err))
-		return nil, err
+		log.Warn("Binlog parser: list insert logs error", zap.Error(err))
+		return nil, fmt.Errorf("failed to list insert logs with root path %s, error: %w", insertlogRoot, err)
 	}
 
 	// collect insert log paths
 	log.Info("Binlog parser: list insert logs", zap.Int("logsCount", len(insertlogs)))
 	for _, insertlog := range insertlogs {
 		log.Info("Binlog parser: mapping insert log to segment", zap.String("insertlog", insertlog))
+		filePath := path.Base(insertlog)
+		// skip file with prefix '.', such as .success .DS_Store
+		if strings.HasPrefix(filePath, ".") {
+			log.Debug("file path might not be a real bin log", zap.String("filePath", filePath))
+			continue
+		}
 		fieldPath := path.Dir(insertlog)
 		fieldStrID := path.Base(fieldPath)
 		fieldID, err := strconv.ParseInt(fieldStrID, 10, 64)
 		if err != nil {
-			log.Error("Binlog parser: parse field id error", zap.String("fieldPath", fieldPath), zap.Error(err))
-			return nil, err
+			log.Warn("Binlog parser: failed to parse field id", zap.String("fieldPath", fieldPath), zap.Error(err))
+			return nil, fmt.Errorf("failed to parse field id from insert log path %s, error: %w", insertlog, err)
 		}
 
 		segmentPath := path.Dir(fieldPath)
 		segmentStrID := path.Base(segmentPath)
 		segmentID, err := strconv.ParseInt(segmentStrID, 10, 64)
 		if err != nil {
-			log.Error("Binlog parser: parse segment id error", zap.String("segmentPath", segmentPath), zap.Error(err))
-			return nil, err
+			log.Warn("Binlog parser: failed to parse segment id", zap.String("segmentPath", segmentPath), zap.Error(err))
+			return nil, fmt.Errorf("failed to parse segment id from insert log path %s, error: %w", insertlog, err)
 		}
 
 		holder, ok := holders[segmentID]
@@ -176,8 +185,8 @@ func (p *BinlogParser) constructSegmentHolders(insertlogRoot string, deltalogRoo
 		// TODO add context
 		deltalogs, _, err := p.chunkManager.ListWithPrefix(context.TODO(), deltalogRoot, true)
 		if err != nil {
-			log.Error("Binlog parser: list delta logs error", zap.Error(err))
-			return nil, err
+			log.Warn("Binlog parser: failed to list delta logs", zap.Error(err))
+			return nil, fmt.Errorf("failed to list delta logs, error: %w", err)
 		}
 
 		log.Info("Binlog parser: list delta logs", zap.Int("logsCount", len(deltalogs)))
@@ -187,8 +196,8 @@ func (p *BinlogParser) constructSegmentHolders(insertlogRoot string, deltalogRoo
 			segmentStrID := path.Base(segmentPath)
 			segmentID, err := strconv.ParseInt(segmentStrID, 10, 64)
 			if err != nil {
-				log.Error("Binlog parser: parse segment id error", zap.String("segmentPath", segmentPath), zap.Error(err))
-				return nil, err
+				log.Warn("Binlog parser: failed to parse segment id", zap.String("segmentPath", segmentPath), zap.Error(err))
+				return nil, fmt.Errorf("failed to parse segment id from delta log path %s, error: %w", deltalog, err)
 			}
 
 			// if the segment id doesn't exist, no need to process this deltalog
@@ -211,15 +220,15 @@ func (p *BinlogParser) constructSegmentHolders(insertlogRoot string, deltalogRoo
 
 func (p *BinlogParser) parseSegmentFiles(segmentHolder *SegmentFilesHolder) error {
 	if segmentHolder == nil {
-		log.Error("Binlog parser: segment files holder is nil")
+		log.Warn("Binlog parser: segment files holder is nil")
 		return errors.New("segment files holder is nil")
 	}
 
-	adapter, err := NewBinlogAdapter(p.ctx, p.collectionSchema, p.shardNum, p.blockSize,
+	adapter, err := NewBinlogAdapter(p.ctx, p.collectionInfo, p.blockSize,
 		MaxTotalSizeInMemory, p.chunkManager, p.callFlushFunc, p.tsStartPoint, p.tsEndPoint)
 	if err != nil {
-		log.Error("Binlog parser: failed to create binlog adapter", zap.Error(err))
-		return err
+		log.Warn("Binlog parser: failed to create binlog adapter", zap.Error(err))
+		return fmt.Errorf("failed to create binlog adapter, error: %w", err)
 	}
 
 	return adapter.Read(segmentHolder)
@@ -230,8 +239,8 @@ func (p *BinlogParser) parseSegmentFiles(segmentHolder *SegmentFilesHolder) erro
 // 2. the delta log path of a partiion (optional)
 func (p *BinlogParser) Parse(filePaths []string) error {
 	if len(filePaths) != 1 && len(filePaths) != 2 {
-		log.Error("Binlog parser: illegal paths for binlog import")
-		return errors.New("illegal paths for binlog import, partition binlog path and partition delta path are required")
+		log.Warn("Binlog parser: illegal paths for binlog import, partition binlog path and delta path are required")
+		return errors.New("illegal paths for binlog import, partition binlog path and delta path are required")
 	}
 
 	insertlogPath := filePaths[0]
@@ -248,11 +257,21 @@ func (p *BinlogParser) Parse(filePaths []string) error {
 		return err
 	}
 
-	for _, segmentHolder := range segmentHolders {
+	updateProgress := func(readBatch int) {
+		if p.updateProgressFunc != nil && len(segmentHolders) != 0 {
+			percent := (readBatch * ProgressValueForPersist) / len(segmentHolders)
+			log.Debug("Binlog parser: working progress", zap.Int("readBatch", readBatch),
+				zap.Int("totalBatchCount", len(segmentHolders)), zap.Int("percent", percent))
+			p.updateProgressFunc(int64(percent))
+		}
+	}
+
+	for i, segmentHolder := range segmentHolders {
 		err = p.parseSegmentFiles(segmentHolder)
 		if err != nil {
 			return err
 		}
+		updateProgress(i + 1)
 
 		// trigger gb after each segment finished
 		triggerGC()

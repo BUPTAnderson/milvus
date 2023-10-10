@@ -17,17 +17,17 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <string_view>
 
 #include "common/Utils.h"
 #include "index/ScalarIndexSort.h"
 #include "index/StringIndex.h"
-#include "knowhere/index/vector_index/adapter/VectorAdapter.h"
 
 namespace milvus::index {
 // TODO: should inherit from StringIndex?
 class StringIndexSort : public ScalarIndexSort<std::string> {
  public:
-    const TargetBitmapPtr
+    const TargetBitmap
     Query(const DatasetPtr& dataset) override {
         auto op = dataset->Get<OpType>(OPERATOR_TYPE);
         if (op == OpType::PrefixMatch) {
@@ -37,14 +37,21 @@ class StringIndexSort : public ScalarIndexSort<std::string> {
         return ScalarIndex<std::string>::Query(dataset);
     }
 
-    const TargetBitmapPtr
-    PrefixMatch(std::string prefix) {
+    const TargetBitmap
+    PrefixMatch(std::string_view prefix) {
         auto data = GetData();
-        TargetBitmapPtr bitset = std::make_unique<TargetBitmap>(data.size());
-        for (size_t i = 0; i < data.size(); i++) {
-            if (milvus::PrefixMatch(data[i].a_, prefix)) {
-                bitset->set(data[i].idx_);
+        TargetBitmap bitset(data.size());
+        auto it = std::lower_bound(
+            data.begin(),
+            data.end(),
+            prefix,
+            [](const IndexStructure<std::string>& value,
+               std::string_view prefix) { return value.a_ < prefix; });
+        for (; it != data.end(); ++it) {
+            if (!milvus::PrefixMatch(it->a_, prefix)) {
+                break;
             }
+            bitset[it->idx_] = true;
         }
         return bitset;
     }

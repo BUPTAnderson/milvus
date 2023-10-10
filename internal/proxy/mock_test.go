@@ -22,14 +22,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
 )
 
 type mockTimestampAllocatorInterface struct {
@@ -37,7 +41,7 @@ type mockTimestampAllocatorInterface struct {
 	mtx    sync.Mutex
 }
 
-func (tso *mockTimestampAllocatorInterface) AllocTimestamp(ctx context.Context, req *rootcoordpb.AllocTimestampRequest) (*rootcoordpb.AllocTimestampResponse, error) {
+func (tso *mockTimestampAllocatorInterface) AllocTimestamp(ctx context.Context, req *rootcoordpb.AllocTimestampRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocTimestampResponse, error) {
 	tso.mtx.Lock()
 	defer tso.mtx.Unlock()
 
@@ -48,10 +52,7 @@ func (tso *mockTimestampAllocatorInterface) AllocTimestamp(ctx context.Context, 
 
 	tso.lastTs = ts
 	return &rootcoordpb.AllocTimestampResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:    merr.Status(nil),
 		Timestamp: ts,
 		Count:     req.Count,
 	}, nil
@@ -64,14 +65,34 @@ func newMockTimestampAllocatorInterface() timestampAllocatorInterface {
 }
 
 type mockTsoAllocator struct {
+	mu        sync.Mutex
+	logicPart uint32
 }
 
-func (tso *mockTsoAllocator) AllocOne() (Timestamp, error) {
-	return Timestamp(time.Now().UnixNano()), nil
+func (tso *mockTsoAllocator) AllocOne(ctx context.Context) (Timestamp, error) {
+	tso.mu.Lock()
+	defer tso.mu.Unlock()
+	tso.logicPart++
+	physical := uint64(time.Now().UnixMilli())
+	return (physical << 18) + uint64(tso.logicPart), nil
 }
 
 func newMockTsoAllocator() tsoAllocator {
 	return &mockTsoAllocator{}
+}
+
+type mockIDAllocatorInterface struct{}
+
+func (m *mockIDAllocatorInterface) AllocOne() (UniqueID, error) {
+	return UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()), nil
+}
+
+func (m *mockIDAllocatorInterface) Alloc(count uint32) (UniqueID, UniqueID, error) {
+	return UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()), UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt() + int(count)), nil
+}
+
+func newMockIDAllocatorInterface() allocator.Interface {
+	return &mockIDAllocatorInterface{}
 }
 
 type mockTask struct {
@@ -164,19 +185,12 @@ type mockDmlTask struct {
 	pchans []pChan
 }
 
-func (m *mockDmlTask) getChannels() ([]vChan, error) {
-	return m.vchans, nil
+func (m *mockDmlTask) setChannels() error {
+	return nil
 }
 
-func (m *mockDmlTask) getPChanStats() (map[pChan]pChanStatistics, error) {
-	ret := make(map[pChan]pChanStatistics)
-	for _, pchan := range m.pchans {
-		ret[pchan] = pChanStatistics{
-			minTs: m.ts,
-			maxTs: m.ts,
-		}
-	}
-	return ret, nil
+func (m *mockDmlTask) getChannels() []vChan {
+	return m.vchans
 }
 
 func newMockDmlTask(ctx context.Context) *mockDmlTask {
@@ -192,6 +206,8 @@ func newMockDmlTask(ctx context.Context) *mockDmlTask {
 
 	return &mockDmlTask{
 		mockTask: newMockTask(ctx),
+		vchans:   vchans,
+		pchans:   pchans,
 	}
 }
 
@@ -220,9 +236,6 @@ type simpleMockMsgStream struct {
 	msgCountMtx sync.RWMutex
 }
 
-func (ms *simpleMockMsgStream) Start() {
-}
-
 func (ms *simpleMockMsgStream) Close() {
 }
 
@@ -240,27 +253,8 @@ func (ms *simpleMockMsgStream) Chan() <-chan *msgstream.MsgPack {
 func (ms *simpleMockMsgStream) AsProducer(channels []string) {
 }
 
-func (ms *simpleMockMsgStream) AsConsumer(channels []string, subName string, position mqwrapper.SubscriptionInitialPosition) {
-}
-
-func (ms *simpleMockMsgStream) ComputeProduceChannelIndexes(tsMsgs []msgstream.TsMsg) [][]int32 {
-	if len(tsMsgs) <= 0 {
-		return nil
-	}
-	reBucketValues := make([][]int32, len(tsMsgs))
-	channelNum := uint32(1)
-	if channelNum == 0 {
-		return nil
-	}
-	for idx, tsMsg := range tsMsgs {
-		hashValues := tsMsg.HashKeys()
-		bucketValues := make([]int32, len(hashValues))
-		for index, hashValue := range hashValues {
-			bucketValues[index] = int32(hashValue % channelNum)
-		}
-		reBucketValues[idx] = bucketValues
-	}
-	return reBucketValues
+func (ms *simpleMockMsgStream) AsConsumer(ctx context.Context, channels []string, subName string, position mqwrapper.SubscriptionInitialPosition) error {
+	return nil
 }
 
 func (ms *simpleMockMsgStream) SetRepackFunc(repackFunc msgstream.RepackFunc) {
@@ -292,18 +286,7 @@ func (ms *simpleMockMsgStream) Produce(pack *msgstream.MsgPack) error {
 	return nil
 }
 
-func (ms *simpleMockMsgStream) ProduceMark(pack *msgstream.MsgPack) (map[string][]msgstream.MessageID, error) {
-	defer ms.increaseMsgCount(1)
-	ms.msgChan <- pack
-
-	return map[string][]msgstream.MessageID{}, nil
-}
-
-func (ms *simpleMockMsgStream) Broadcast(pack *msgstream.MsgPack) error {
-	return nil
-}
-
-func (ms *simpleMockMsgStream) BroadcastMark(pack *msgstream.MsgPack) (map[string][]msgstream.MessageID, error) {
+func (ms *simpleMockMsgStream) Broadcast(pack *msgstream.MsgPack) (map[string][]msgstream.MessageID, error) {
 	return map[string][]msgstream.MessageID{}, nil
 }
 
@@ -311,12 +294,16 @@ func (ms *simpleMockMsgStream) GetProduceChannels() []string {
 	return nil
 }
 
-func (ms *simpleMockMsgStream) Seek(offset []*msgstream.MsgPosition) error {
+func (ms *simpleMockMsgStream) Seek(ctx context.Context, offset []*msgstream.MsgPosition) error {
 	return nil
 }
 
 func (ms *simpleMockMsgStream) GetLatestMsgID(channel string) (msgstream.MessageID, error) {
 	return nil, nil
+}
+
+func (ms *simpleMockMsgStream) CheckTopicValid(topic string) error {
+	return nil
 }
 
 func newSimpleMockMsgStream() *simpleMockMsgStream {
@@ -326,8 +313,7 @@ func newSimpleMockMsgStream() *simpleMockMsgStream {
 	}
 }
 
-type simpleMockMsgStreamFactory struct {
-}
+type simpleMockMsgStreamFactory struct{}
 
 func (factory *simpleMockMsgStreamFactory) Init(param *paramtable.ComponentParam) error {
 	return nil
@@ -338,10 +324,6 @@ func (factory *simpleMockMsgStreamFactory) NewMsgStream(ctx context.Context) (ms
 }
 
 func (factory *simpleMockMsgStreamFactory) NewTtMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
-	return newSimpleMockMsgStream(), nil
-}
-
-func (factory *simpleMockMsgStreamFactory) NewQueryMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
 	return newSimpleMockMsgStream(), nil
 }
 
@@ -360,7 +342,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 	}
 	switch dataType {
 	case schemapb.DataType_Bool:
-		fieldData.FieldName = testBoolField
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
 				Data: &schemapb.ScalarField_BoolData{
@@ -371,7 +353,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_Int32:
-		fieldData.FieldName = testInt32Field
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
 				Data: &schemapb.ScalarField_IntData{
@@ -382,7 +364,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_Int64:
-		fieldData.FieldName = testInt64Field
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
 				Data: &schemapb.ScalarField_LongData{
@@ -393,7 +375,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_Float:
-		fieldData.FieldName = testFloatField
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
 				Data: &schemapb.ScalarField_FloatData{
@@ -404,7 +386,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_Double:
-		fieldData.FieldName = testDoubleField
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
 				Data: &schemapb.ScalarField_DoubleData{
@@ -415,7 +397,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_VarChar:
-		fieldData.FieldName = testVarCharField
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Scalars{
 			Scalars: &schemapb.ScalarField{
 				Data: &schemapb.ScalarField_StringData{
@@ -426,7 +408,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_FloatVector:
-		fieldData.FieldName = testFloatVecField
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Vectors{
 			Vectors: &schemapb.VectorField{
 				Dim: int64(testVecDim),
@@ -438,7 +420,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	case schemapb.DataType_BinaryVector:
-		fieldData.FieldName = testBinaryVecField
+		fieldData.FieldName = fieldName
 		fieldData.Field = &schemapb.FieldData_Vectors{
 			Vectors: &schemapb.VectorField{
 				Dim: int64(testVecDim),
@@ -448,7 +430,7 @@ func generateFieldData(dataType schemapb.DataType, fieldName string, numRows int
 			},
 		}
 	default:
-		//TODO::
+		// TODO::
 	}
 
 	return fieldData

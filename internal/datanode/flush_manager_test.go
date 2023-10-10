@@ -19,20 +19,24 @@ package datanode
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/retry"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/retry"
 )
 
 var flushTestDir = "/tmp/milvus_test/flush"
@@ -80,13 +84,13 @@ func TestOrderFlushQueue_Execute(t *testing.T) {
 	wg.Add(2 * size)
 	for i := 0; i < size; i++ {
 		go func(id []byte) {
-			q.enqueueDelFlush(&emptyFlushTask{}, &DelDataBuf{}, &internalpb.MsgPosition{
+			q.enqueueDelFlush(&emptyFlushTask{}, &DelDataBuf{}, &msgpb.MsgPosition{
 				MsgID: id,
 			})
 			wg.Done()
 		}(ids[i])
 		go func(id []byte) {
-			q.enqueueInsertFlush(&emptyFlushTask{}, map[UniqueID]*datapb.Binlog{}, map[UniqueID]*datapb.Binlog{}, false, false, &internalpb.MsgPosition{
+			q.enqueueInsertFlush(&emptyFlushTask{}, map[UniqueID]*datapb.Binlog{}, map[UniqueID]*datapb.Binlog{}, false, false, &msgpb.MsgPosition{
 				MsgID: id,
 			})
 			wg.Done()
@@ -97,6 +101,7 @@ func TestOrderFlushQueue_Execute(t *testing.T) {
 
 	assert.EqualValues(t, size, counter.Load())
 }
+
 func TestOrderFlushQueue_Order(t *testing.T) {
 	counter := atomic.Int64{}
 	finish := sync.WaitGroup{}
@@ -121,10 +126,10 @@ func TestOrderFlushQueue_Order(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(size)
 	for i := 0; i < size; i++ {
-		q.enqueueDelFlush(&emptyFlushTask{}, &DelDataBuf{}, &internalpb.MsgPosition{
+		q.enqueueDelFlush(&emptyFlushTask{}, &DelDataBuf{}, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
-		q.enqueueInsertFlush(&emptyFlushTask{}, map[UniqueID]*datapb.Binlog{}, map[UniqueID]*datapb.Binlog{}, false, false, &internalpb.MsgPosition{
+		q.enqueueInsertFlush(&emptyFlushTask{}, map[UniqueID]*datapb.Binlog{}, map[UniqueID]*datapb.Binlog{}, false, false, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
 		wg.Done()
@@ -142,7 +147,15 @@ func TestOrderFlushQueue_Order(t *testing.T) {
 
 func newTestChannel() *ChannelMeta {
 	return &ChannelMeta{
-		segments: make(map[UniqueID]*Segment),
+		segments:     make(map[UniqueID]*Segment),
+		collectionID: 1,
+		collSchema: &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{{
+				FieldID:      100,
+				DataType:     schemapb.DataType_Int64,
+				IsPrimaryKey: true,
+			}},
+		},
 	}
 }
 
@@ -150,15 +163,30 @@ func TestRendezvousFlushManager(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
-	defer cm.RemoveWithPrefix(ctx, "")
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 	size := 1000
 	var counter atomic.Int64
-	finish := sync.WaitGroup{}
-	finish.Add(size)
-	m := NewRendezvousFlushManager(&allocator{}, cm, newTestChannel(), func(pack *segmentFlushPack) {
+	alloc := allocator.NewMockAllocator(t)
+	channel := newTestChannel()
+	hisotricalStats := storage.NewPrimaryKeyStats(100, 5, 10)
+	testSeg := &Segment{
+		collectionID: 1,
+		segmentID:    3,
+		// flush segment will merge all historial stats
+		historyStats: []*storage.PkStatistics{
+			{
+				PkFilter: hisotricalStats.BF,
+				MinPK:    hisotricalStats.MinPk,
+				MaxPK:    hisotricalStats.MaxPk,
+			},
+		},
+	}
+	testSeg.setType(datapb.SegmentType_New)
+	channel.segments[testSeg.segmentID] = testSeg
+
+	m := NewRendezvousFlushManager(alloc, cm, channel, func(pack *segmentFlushPack) {
 		counter.Inc()
-		finish.Done()
 	}, emptyFlushAndDropFunc)
 
 	ids := make([][]byte, 0, size)
@@ -168,41 +196,57 @@ func TestRendezvousFlushManager(t *testing.T) {
 		ids = append(ids, id)
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(size)
 	for i := 0; i < size; i++ {
-		m.flushDelData(nil, 1, &internalpb.MsgPosition{
+		err := m.flushDelData(nil, testSeg.segmentID, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
-		m.flushBufferData(nil, nil, 1, true, false, &internalpb.MsgPosition{
-			MsgID: ids[i],
-		})
-		wg.Done()
-	}
-	wg.Wait()
-	finish.Wait()
+		assert.NoError(t, err)
 
-	assert.EqualValues(t, size, counter.Load())
+		_, err = m.flushBufferData(nil, testSeg.segmentID, true, false, &msgpb.MsgPosition{
+			MsgID: ids[i],
+		})
+		assert.NoError(t, err)
+	}
+	assert.Eventually(t, func() bool { return counter.Load() == int64(size) }, 3*time.Second, 100*time.Millisecond)
+
+	_, _, err := m.serializePkStatsLog(0, false, nil, &storage.InsertCodec{Schema: &etcdpb.CollectionMeta{Schema: &schemapb.CollectionSchema{}, ID: 0}})
+	assert.Error(t, err)
 }
 
 func TestRendezvousFlushManager_Inject(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
-	defer cm.RemoveWithPrefix(ctx, "")
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 	size := 1000
 	var counter atomic.Int64
-	finish := sync.WaitGroup{}
-	finish.Add(size)
 	var packMut sync.Mutex
 	packs := make([]*segmentFlushPack, 0, size+3)
-	m := NewRendezvousFlushManager(&allocator{}, cm, newTestChannel(), func(pack *segmentFlushPack) {
+	alloc := allocator.NewMockAllocator(t)
+
+	channel := newTestChannel()
+	segments := []*Segment{{
+		collectionID: 1,
+		segmentID:    1,
+	}, {
+		collectionID: 1,
+		segmentID:    2,
+	}, {
+		collectionID: 1,
+		segmentID:    3,
+	}}
+
+	for _, seg := range segments {
+		seg.setType(datapb.SegmentType_New)
+		channel.segments[seg.segmentID] = seg
+	}
+
+	m := NewRendezvousFlushManager(alloc, cm, channel, func(pack *segmentFlushPack) {
 		packMut.Lock()
 		packs = append(packs, pack)
 		packMut.Unlock()
 		counter.Inc()
-		finish.Done()
 	}, emptyFlushAndDropFunc)
 
 	ti := newTaskInjection(1, func(*segmentFlushPack) {})
@@ -217,58 +261,61 @@ func TestRendezvousFlushManager_Inject(t *testing.T) {
 		ids = append(ids, id)
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(size)
 	for i := 0; i < size; i++ {
-		m.flushDelData(nil, 1, &internalpb.MsgPosition{
+		err := m.flushDelData(nil, 1, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
-		m.flushBufferData(nil, nil, 1, true, false, &internalpb.MsgPosition{
+		assert.NoError(t, err)
+
+		_, err = m.flushBufferData(nil, 1, true, false, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
-		wg.Done()
+		assert.NoError(t, err)
 	}
-	wg.Wait()
-	finish.Wait()
+	assert.Eventually(t, func() bool { return counter.Load() == int64(size) }, 3*time.Second, 100*time.Millisecond)
 
-	assert.EqualValues(t, size, counter.Load())
-
-	finish.Add(2)
 	id := make([]byte, 10)
 	rand.Read(id)
 	id2 := make([]byte, 10)
 	rand.Read(id2)
-	m.flushBufferData(nil, nil, 2, true, false, &internalpb.MsgPosition{
+	_, err := m.flushBufferData(nil, 2, true, false, &msgpb.MsgPosition{
 		MsgID: id,
 	})
-	m.flushBufferData(nil, nil, 3, true, false, &internalpb.MsgPosition{
+
+	assert.NoError(t, err)
+	_, err = m.flushBufferData(nil, 3, true, false, &msgpb.MsgPosition{
 		MsgID: id2,
 	})
+	assert.NoError(t, err)
 
 	ti = newTaskInjection(2, func(pack *segmentFlushPack) {
 		pack.segmentID = 4
 	})
 	m.injectFlush(ti, 2, 3)
 
-	m.flushDelData(nil, 2, &internalpb.MsgPosition{
+	err = m.flushDelData(nil, 2, &msgpb.MsgPosition{
 		MsgID: id,
 	})
-	m.flushDelData(nil, 3, &internalpb.MsgPosition{
+	assert.NoError(t, err)
+
+	err = m.flushDelData(nil, 3, &msgpb.MsgPosition{
 		MsgID: id2,
 	})
+	assert.NoError(t, err)
+
 	<-ti.Injected()
 	ti.injectDone(true)
 
-	finish.Wait()
-	assert.EqualValues(t, size+2, counter.Load())
+	assert.Eventually(t, func() bool { return counter.Load() == int64(size+2) }, 3*time.Second, 100*time.Millisecond)
 	assert.EqualValues(t, 4, packs[size].segmentID)
 
-	finish.Add(1)
 	rand.Read(id)
 
-	m.flushBufferData(nil, nil, 2, false, false, &internalpb.MsgPosition{
+	_, err = m.flushBufferData(nil, 2, false, false, &msgpb.MsgPosition{
 		MsgID: id,
 	})
+	assert.NoError(t, err)
+
 	ti = newTaskInjection(1, func(pack *segmentFlushPack) {
 		pack.segmentID = 5
 	})
@@ -278,24 +325,26 @@ func TestRendezvousFlushManager_Inject(t *testing.T) {
 	}()
 	m.injectFlush(ti, 2)
 
-	m.flushDelData(nil, 2, &internalpb.MsgPosition{
+	m.flushDelData(nil, 2, &msgpb.MsgPosition{
 		MsgID: id,
 	})
-	finish.Wait()
-	assert.EqualValues(t, size+3, counter.Load())
+	assert.Eventually(t, func() bool { return counter.Load() == int64(size+3) }, 3*time.Second, 100*time.Millisecond)
 	assert.EqualValues(t, 4, packs[size+1].segmentID)
-
 }
 
 func TestRendezvousFlushManager_getSegmentMeta(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
+
 	channel := newTestChannel()
 	channel.collSchema = &schemapb.CollectionSchema{}
-	fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, channel, func(*segmentFlushPack) {
+	fm := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, channel, func(*segmentFlushPack) {
 	}, emptyFlushAndDropFunc)
 
 	// non exists segment
-	_, _, _, err := fm.getSegmentMeta(-1, &internalpb.MsgPosition{})
+	_, _, _, err := fm.getSegmentMeta(-1, &msgpb.MsgPosition{})
 	assert.Error(t, err)
 
 	seg0 := Segment{segmentID: -1}
@@ -307,23 +356,31 @@ func TestRendezvousFlushManager_getSegmentMeta(t *testing.T) {
 	channel.segments[1] = &seg1
 
 	// // injected get part/coll id error
-	// _, _, _, err = fm.getSegmentMeta(-1, &internalpb.MsgPosition{})
+	// _, _, _, err = fm.getSegmentMeta(-1, &msgpb.MsgPosition{})
 	// assert.Error(t, err)
 	// // injected get schema  error
-	// _, _, _, err = fm.getSegmentMeta(1, &internalpb.MsgPosition{})
+	// _, _, _, err = fm.getSegmentMeta(1, &msgpb.MsgPosition{})
 	// assert.Error(t, err)
 }
 
 func TestRendezvousFlushManager_waitForAllFlushQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
+
+	channel := newTestChannel()
+	testSeg := &Segment{
+		collectionID: 1,
+		segmentID:    1,
+	}
+	testSeg.setType(datapb.SegmentType_New)
+	channel.segments[testSeg.segmentID] = testSeg
 
 	size := 1000
 	var counter atomic.Int64
-	var finish sync.WaitGroup
-	finish.Add(size)
-	m := NewRendezvousFlushManager(&allocator{}, cm, newTestChannel(), func(pack *segmentFlushPack) {
+	m := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, channel, func(pack *segmentFlushPack) {
 		counter.Inc()
-		finish.Done()
 	}, emptyFlushAndDropFunc)
 
 	ids := make([][]byte, 0, size)
@@ -334,9 +391,10 @@ func TestRendezvousFlushManager_waitForAllFlushQueue(t *testing.T) {
 	}
 
 	for i := 0; i < size; i++ {
-		m.flushDelData(nil, 1, &internalpb.MsgPosition{
+		err := m.flushDelData(nil, 1, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
+		assert.NoError(t, err)
 	}
 
 	var finished bool
@@ -356,9 +414,10 @@ func TestRendezvousFlushManager_waitForAllFlushQueue(t *testing.T) {
 	mut.RUnlock()
 
 	for i := 0; i < size/2; i++ {
-		m.flushBufferData(nil, nil, 1, true, false, &internalpb.MsgPosition{
+		_, err := m.flushBufferData(nil, 1, true, false, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
+		assert.NoError(t, err)
 	}
 
 	mut.RLock()
@@ -366,14 +425,14 @@ func TestRendezvousFlushManager_waitForAllFlushQueue(t *testing.T) {
 	mut.RUnlock()
 
 	for i := size / 2; i < size; i++ {
-		m.flushBufferData(nil, nil, 1, true, false, &internalpb.MsgPosition{
+		_, err := m.flushBufferData(nil, 1, true, false, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
+		assert.NoError(t, err)
 	}
 
-	timeout := time.NewTimer(time.Second)
 	select {
-	case <-timeout.C:
+	case <-time.After(time.Second):
 		t.FailNow()
 	case <-signal:
 	}
@@ -384,14 +443,39 @@ func TestRendezvousFlushManager_waitForAllFlushQueue(t *testing.T) {
 }
 
 func TestRendezvousFlushManager_dropMode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	t.Run("test drop mode", func(t *testing.T) {
 		cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+		defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 		var mut sync.Mutex
 		var result []*segmentFlushPack
 		signal := make(chan struct{})
 
-		m := NewRendezvousFlushManager(&allocator{}, cm, newTestChannel(), func(pack *segmentFlushPack) {
+		channel := newTestChannel()
+		targets := make(map[int64]struct{})
+		// init failed segment
+		testSeg := &Segment{
+			collectionID: 1,
+			segmentID:    -1,
+		}
+		testSeg.setType(datapb.SegmentType_New)
+		channel.segments[testSeg.segmentID] = testSeg
+
+		// init target segment
+		for i := 1; i < 11; i++ {
+			targets[int64(i)] = struct{}{}
+			testSeg := &Segment{
+				collectionID: 1,
+				segmentID:    int64(i),
+			}
+			testSeg.setType(datapb.SegmentType_New)
+			channel.segments[testSeg.segmentID] = testSeg
+		}
+
+		// init flush manager
+		m := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, channel, func(pack *segmentFlushPack) {
 		}, func(packs []*segmentFlushPack) {
 			mut.Lock()
 			result = packs
@@ -400,25 +484,28 @@ func TestRendezvousFlushManager_dropMode(t *testing.T) {
 		})
 
 		halfMsgID := []byte{1, 1, 1}
-		m.flushBufferData(nil, nil, -1, true, false, &internalpb.MsgPosition{
+		_, err := m.flushBufferData(nil, -1, true, false, &msgpb.MsgPosition{
 			MsgID: halfMsgID,
 		})
+		assert.NoError(t, err)
 
 		m.startDropping()
 		// half normal, half drop mode, should not appear in final packs
-		m.flushDelData(nil, -1, &internalpb.MsgPosition{
+		err = m.flushDelData(nil, -1, &msgpb.MsgPosition{
 			MsgID: halfMsgID,
 		})
+		assert.NoError(t, err)
 
-		target := make(map[int64]struct{})
-		for i := 1; i < 11; i++ {
-			target[int64(i)] = struct{}{}
-			m.flushBufferData(nil, nil, int64(i), true, false, &internalpb.MsgPosition{
-				MsgID: []byte{1},
+		for target := range targets {
+			_, err := m.flushBufferData(nil, target, true, false, &msgpb.MsgPosition{
+				MsgID: []byte{byte(target)},
 			})
-			m.flushDelData(nil, int64(i), &internalpb.MsgPosition{
-				MsgID: []byte{1},
+			assert.NoError(t, err)
+
+			err = m.flushDelData(nil, target, &msgpb.MsgPosition{
+				MsgID: []byte{byte(target)},
 			})
+			assert.NoError(t, err)
 		}
 
 		m.notifyAllFlushed()
@@ -431,19 +518,39 @@ func TestRendezvousFlushManager_dropMode(t *testing.T) {
 		for _, pack := range result {
 			assert.NotEqual(t, -1, pack.segmentID)
 			output[pack.segmentID] = struct{}{}
-			_, has := target[pack.segmentID]
+			_, has := targets[pack.segmentID]
 			assert.True(t, has)
 		}
-		assert.Equal(t, len(target), len(output))
+		assert.Equal(t, len(targets), len(output))
 	})
+
 	t.Run("test drop mode with injection", func(t *testing.T) {
 		cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+		defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 		var mut sync.Mutex
 		var result []*segmentFlushPack
 		signal := make(chan struct{})
+		channel := newTestChannel()
+		// init failed segment
+		testSeg := &Segment{
+			collectionID: 1,
+			segmentID:    -1,
+		}
+		testSeg.setType(datapb.SegmentType_New)
+		channel.segments[testSeg.segmentID] = testSeg
 
-		m := NewRendezvousFlushManager(&allocator{}, cm, newTestChannel(), func(pack *segmentFlushPack) {
+		// init target segment
+		for i := 1; i < 11; i++ {
+			seg := &Segment{
+				collectionID: 1,
+				segmentID:    int64(i),
+			}
+			seg.setType(datapb.SegmentType_New)
+			channel.segments[seg.segmentID] = seg
+		}
+
+		m := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, channel, func(pack *segmentFlushPack) {
 		}, func(packs []*segmentFlushPack) {
 			mut.Lock()
 			result = packs
@@ -451,11 +558,14 @@ func TestRendezvousFlushManager_dropMode(t *testing.T) {
 			close(signal)
 		})
 
+		// flush failed segment before start drop mode
 		halfMsgID := []byte{1, 1, 1}
-		m.flushBufferData(nil, nil, -1, true, false, &internalpb.MsgPosition{
+		_, err := m.flushBufferData(nil, -1, true, false, &msgpb.MsgPosition{
 			MsgID: halfMsgID,
 		})
+		assert.NoError(t, err)
 
+		// inject target segment
 		injFunc := func(pack *segmentFlushPack) {
 			pack.segmentID = 100
 		}
@@ -468,22 +578,24 @@ func TestRendezvousFlushManager_dropMode(t *testing.T) {
 
 		m.startDropping()
 		// half normal, half drop mode, should not appear in final packs
-		m.flushDelData(nil, -1, &internalpb.MsgPosition{
+		err = m.flushDelData(nil, -1, &msgpb.MsgPosition{
 			MsgID: halfMsgID,
 		})
+		assert.NoError(t, err)
 
 		for i := 1; i < 11; i++ {
-			m.flushBufferData(nil, nil, int64(i), true, false, &internalpb.MsgPosition{
-				MsgID: []byte{1},
+			_, err = m.flushBufferData(nil, int64(i), true, false, &msgpb.MsgPosition{
+				MsgID: []byte{byte(i)},
 			})
-			m.flushDelData(nil, int64(i), &internalpb.MsgPosition{
-				MsgID: []byte{1},
+			assert.NoError(t, err)
+
+			err = m.flushDelData(nil, int64(i), &msgpb.MsgPosition{
+				MsgID: []byte{byte(i)},
 			})
+			assert.NoError(t, err)
 		}
 
 		m.notifyAllFlushed()
-
-		<-signal
 		mut.Lock()
 		defer mut.Unlock()
 
@@ -492,19 +604,29 @@ func TestRendezvousFlushManager_dropMode(t *testing.T) {
 			assert.Equal(t, int64(100), pack.segmentID)
 		}
 	})
-
 }
 
 func TestRendezvousFlushManager_close(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 	size := 1000
 	var counter atomic.Int64
-	finish := sync.WaitGroup{}
-	finish.Add(size)
-	m := NewRendezvousFlushManager(&allocator{}, cm, newTestChannel(), func(pack *segmentFlushPack) {
+
+	channel := newTestChannel()
+
+	// init test segment
+	testSeg := &Segment{
+		collectionID: 1,
+		segmentID:    1,
+	}
+	testSeg.setType(datapb.SegmentType_New)
+	channel.segments[testSeg.segmentID] = testSeg
+
+	m := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, channel, func(pack *segmentFlushPack) {
 		counter.Inc()
-		finish.Done()
 	}, emptyFlushAndDropFunc)
 
 	ids := make([][]byte, 0, size)
@@ -514,29 +636,30 @@ func TestRendezvousFlushManager_close(t *testing.T) {
 		ids = append(ids, id)
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(size)
 	for i := 0; i < size; i++ {
-		m.flushDelData(nil, 1, &internalpb.MsgPosition{
+		err := m.flushDelData(nil, 1, &msgpb.MsgPosition{
 			MsgID: ids[i],
 		})
-		m.flushBufferData(nil, nil, 1, true, false, &internalpb.MsgPosition{
-			MsgID: ids[i],
-		})
-		wg.Done()
-	}
-	wg.Wait()
-	finish.Wait()
-	m.close()
+		assert.NoError(t, err)
 
-	assert.EqualValues(t, size, counter.Load())
+		_, err = m.flushBufferData(nil, 1, true, false, &msgpb.MsgPosition{
+			MsgID: ids[i],
+		})
+		assert.NoError(t, err)
+	}
+
+	m.close()
+	assert.Eventually(t, func() bool { return counter.Load() == int64(size) }, 3*time.Second, 100*time.Millisecond)
 }
 
 func TestFlushNotifyFunc(t *testing.T) {
 	rcf := &RootCoordFactory{
 		pkType: schemapb.DataType_Int64,
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
 
 	channel := newChannel("channel", 1, nil, rcf, cm)
 
@@ -570,21 +693,14 @@ func TestFlushNotifyFunc(t *testing.T) {
 	})
 
 	t.Run("datacoord save fails", func(t *testing.T) {
-		dataCoord.SaveBinlogPathStatus = commonpb.ErrorCode_UnexpectedError
+		dataCoord.SaveBinlogPathStatus = merr.Status(merr.WrapErrCollectionNotFound("collection"))
 		assert.Panics(t, func() {
 			notifyFunc(&segmentFlushPack{})
 		})
 	})
 
-	t.Run("normal segment not found", func(t *testing.T) {
-		dataCoord.SaveBinlogPathStatus = commonpb.ErrorCode_SegmentNotFound
-		assert.Panics(t, func() {
-			notifyFunc(&segmentFlushPack{flushed: true})
-		})
-	})
-
 	t.Run("stale segment not found", func(t *testing.T) {
-		dataCoord.SaveBinlogPathStatus = commonpb.ErrorCode_SegmentNotFound
+		dataCoord.SaveBinlogPathStatus = merr.Status(merr.WrapErrSegmentNotFound(100))
 		assert.NotPanics(t, func() {
 			notifyFunc(&segmentFlushPack{flushed: false})
 		})
@@ -593,7 +709,7 @@ func TestFlushNotifyFunc(t *testing.T) {
 	// issue https://github.com/milvus-io/milvus/issues/17097
 	// meta error, datanode shall not panic, just drop the virtual channel
 	t.Run("datacoord found meta error", func(t *testing.T) {
-		dataCoord.SaveBinlogPathStatus = commonpb.ErrorCode_MetaFailed
+		dataCoord.SaveBinlogPathStatus = merr.Status(merr.WrapErrChannelNotFound("channel"))
 		assert.NotPanics(t, func() {
 			notifyFunc(&segmentFlushPack{})
 		})
@@ -613,7 +729,11 @@ func TestDropVirtualChannelFunc(t *testing.T) {
 	}
 	vchanName := "vchan_01"
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(flushTestDir))
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
+
 	channel := newChannel(vchanName, 1, nil, rcf, cm)
 
 	dataCoord := &DataCoordFactory{}
@@ -628,16 +748,18 @@ func TestDropVirtualChannelFunc(t *testing.T) {
 	dropFunc := dropVirtualChannelFunc(dsService, retry.Attempts(1))
 	t.Run("normal run", func(t *testing.T) {
 		channel.addSegment(
+			context.TODO(),
 			addSegmentReq{
 				segType:     datapb.SegmentType_New,
 				segID:       2,
 				collID:      1,
 				partitionID: 10,
-				startPos: &internalpb.MsgPosition{
+				startPos: &msgpb.MsgPosition{
 					ChannelName: vchanName,
 					MsgID:       []byte{1, 2, 3},
 					Timestamp:   10,
-				}, endPos: nil})
+				}, endPos: nil,
+			})
 		assert.NotPanics(t, func() {
 			dropFunc([]*segmentFlushPack{
 				{
@@ -645,7 +767,7 @@ func TestDropVirtualChannelFunc(t *testing.T) {
 					insertLogs: map[UniqueID]*datapb.Binlog{1: {LogPath: "/dev/test/id"}},
 					statsLogs:  map[UniqueID]*datapb.Binlog{1: {LogPath: "/dev/test/id-stats"}},
 					deltaLogs:  []*datapb.Binlog{{LogPath: "/dev/test/del"}},
-					pos: &internalpb.MsgPosition{
+					pos: &msgpb.MsgPosition{
 						ChannelName: vchanName,
 						MsgID:       []byte{1, 2, 3},
 						Timestamp:   10,
@@ -656,7 +778,7 @@ func TestDropVirtualChannelFunc(t *testing.T) {
 					insertLogs: map[UniqueID]*datapb.Binlog{1: {LogPath: "/dev/test/idi_2"}},
 					statsLogs:  map[UniqueID]*datapb.Binlog{1: {LogPath: "/dev/test/id-stats-2"}},
 					deltaLogs:  []*datapb.Binlog{{LogPath: "/dev/test/del-2"}},
-					pos: &internalpb.MsgPosition{
+					pos: &msgpb.MsgPosition{
 						ChannelName: vchanName,
 						MsgID:       []byte{1, 2, 3},
 						Timestamp:   30,
@@ -673,7 +795,6 @@ func TestDropVirtualChannelFunc(t *testing.T) {
 	})
 
 	t.Run("datacoord call error", func(t *testing.T) {
-
 		dataCoord.DropVirtualChannelStatus = commonpb.ErrorCode_UnexpectedError
 		dataCoord.DropVirtualChannelError = true
 		assert.Panics(t, func() {
@@ -690,5 +811,4 @@ func TestDropVirtualChannelFunc(t *testing.T) {
 			dropFunc(nil)
 		})
 	})
-
 }

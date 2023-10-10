@@ -17,16 +17,17 @@
 package datacoord
 
 import (
+	"context"
+	"math"
 	"sort"
 	"strconv"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"stathat.com/c/consistent"
+
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 // RegisterPolicy decides the channels mapping after registering the nodeID
@@ -59,28 +60,29 @@ func AvgAssignRegisterPolicy(store ROChannelStore, nodeID int64) ChannelOpSet {
 	}
 
 	// Get a list of available node-channel info.
-	avaNodeChannel := filterNode(store.GetNodesChannels(), nodeID)
+	avaNodes := filterNode(store.GetNodesChannels(), nodeID)
 
 	channelNum := 0
-	for _, info := range avaNodeChannel {
+	for _, info := range avaNodes {
 		channelNum += len(info.Channels)
 	}
-	chPerNode := channelNum / (len(store.GetNodes()) + 1)
+	// store already add the new node
+	chPerNode := channelNum / len(store.GetNodes())
 	if chPerNode == 0 {
 		return nil
 	}
 
 	// sort in descending order and reallocate
-	sort.Slice(avaNodeChannel, func(i, j int) bool {
-		return len(avaNodeChannel[i].Channels) > len(avaNodeChannel[j].Channels)
+	sort.Slice(avaNodes, func(i, j int) bool {
+		return len(avaNodes[i].Channels) > len(avaNodes[j].Channels)
 	})
 
 	releases := make(map[int64][]*channel)
 	for i := 0; i < chPerNode; i++ {
 		// Pick a node with its channel to release.
-		toRelease := avaNodeChannel[i%len(avaNodeChannel)]
+		toRelease := avaNodes[i%len(avaNodes)]
 		// Pick a channel that will be reassigned to the new node later.
-		chIdx := i / len(avaNodeChannel)
+		chIdx := i / len(avaNodes)
 		if chIdx >= len(toRelease.Channels) {
 			// Node has too few channels, simply skip. No re-picking.
 			// TODO: Consider re-picking in case assignment is extremely uneven?
@@ -167,29 +169,29 @@ type ChannelAssignPolicy func(store ROChannelStore, channels []*channel) Channel
 
 // AverageAssignPolicy ensure that the number of channels per nodes is approximately the same
 func AverageAssignPolicy(store ROChannelStore, channels []*channel) ChannelOpSet {
-	filteredChannels := filterChannels(store, channels)
-	if len(filteredChannels) == 0 {
+	newChannels := filterChannels(store, channels)
+	if len(newChannels) == 0 {
 		return nil
 	}
 
 	opSet := ChannelOpSet{}
-	dataNodesChannels := store.GetNodesChannels()
+	allDataNodes := store.GetNodesChannels()
 
 	// If no datanode alive, save channels in buffer
-	if len(dataNodesChannels) == 0 {
+	if len(allDataNodes) == 0 {
 		opSet.Add(bufferID, channels)
 		return opSet
 	}
 
 	// sort and assign
-	sort.Slice(dataNodesChannels, func(i, j int) bool {
-		return len(dataNodesChannels[i].Channels) <= len(dataNodesChannels[j].Channels)
+	sort.Slice(allDataNodes, func(i, j int) bool {
+		return len(allDataNodes[i].Channels) <= len(allDataNodes[j].Channels)
 	})
 
 	updates := make(map[int64][]*channel)
-	for i, channel := range filteredChannels {
-		n := dataNodesChannels[i%len(dataNodesChannels)].NodeID
-		updates[n] = append(updates[n], channel)
+	for i, newChannel := range newChannels {
+		n := allDataNodes[i%len(allDataNodes)].NodeID
+		updates[n] = append(updates[n], newChannel)
 	}
 
 	for id, chs := range updates {
@@ -276,34 +278,34 @@ func EmptyDeregisterPolicy(store ROChannelStore, nodeID int64) ChannelOpSet {
 
 // AvgAssignUnregisteredChannels evenly assign the unregistered channels
 func AvgAssignUnregisteredChannels(store ROChannelStore, nodeID int64) ChannelOpSet {
-	channels := store.GetNodesChannels()
-	filteredChannels := make([]*NodeChannelInfo, 0, len(channels))
+	allNodes := store.GetNodesChannels()
+	avaNodes := make([]*NodeChannelInfo, 0, len(allNodes))
 	unregisteredChannels := make([]*channel, 0)
 	opSet := ChannelOpSet{}
 
-	for _, c := range channels {
+	for _, c := range allNodes {
 		if c.NodeID == nodeID {
 			opSet.Delete(nodeID, c.Channels)
 			unregisteredChannels = append(unregisteredChannels, c.Channels...)
 			continue
 		}
-		filteredChannels = append(filteredChannels, c)
+		avaNodes = append(avaNodes, c)
 	}
 
-	if len(filteredChannels) == 0 {
+	if len(avaNodes) == 0 {
 		opSet.Add(bufferID, unregisteredChannels)
 		return opSet
 	}
 
 	// sort and assign
-	sort.Slice(filteredChannels, func(i, j int) bool {
-		return len(filteredChannels[i].Channels) <= len(filteredChannels[j].Channels)
+	sort.Slice(avaNodes, func(i, j int) bool {
+		return len(avaNodes[i].Channels) <= len(avaNodes[j].Channels)
 	})
 
 	updates := make(map[int64][]*channel)
-	for i, channel := range unregisteredChannels {
-		n := filteredChannels[i%len(filteredChannels)].NodeID
-		updates[n] = append(updates[n], channel)
+	for i, unregisteredChannel := range unregisteredChannels {
+		n := avaNodes[i%len(avaNodes)].NodeID
+		updates[n] = append(updates[n], unregisteredChannel)
 	}
 
 	for id, chs := range updates {
@@ -363,6 +365,27 @@ func ConsistentHashDeregisterPolicy(hashRing *consistent.Consistent) DeregisterP
 	}
 }
 
+type BalanceChannelPolicy func(store ROChannelStore, ts time.Time) ChannelOpSet
+
+func AvgBalanceChannelPolicy(store ROChannelStore, ts time.Time) ChannelOpSet {
+	channelOps := make(ChannelOpSet, 0)
+	reAllocates, err := BgBalanceCheck(store.GetNodesChannels(), ts)
+	if err != nil {
+		log.Error("failed to balance node channels", zap.Error(err))
+		return channelOps
+	}
+	for _, reAlloc := range reAllocates {
+		toRelease := &ChannelOp{
+			Type:     Add,
+			Channels: reAlloc.Channels,
+			NodeID:   reAlloc.NodeID,
+		}
+		channelOps = append(channelOps, toRelease)
+	}
+
+	return channelOps
+}
+
 // ChannelReassignPolicy is a policy for reassigning channels
 type ChannelReassignPolicy func(store ROChannelStore, reassigns []*NodeChannelInfo) ChannelOpSet
 
@@ -371,29 +394,36 @@ func EmptyReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) Cha
 	return nil
 }
 
-// AverageReassignPolicy is a reassigning policy that evenly assign channels
-func AverageReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) ChannelOpSet {
-	channels := store.GetNodesChannels()
+// EmptyBalancePolicy is a dummy balance policy
+func EmptyBalancePolicy(store ROChannelStore, ts time.Time) ChannelOpSet {
+	return nil
+}
+
+// RoundRobinReassignPolicy is a reassigning policy that evenly assign channels
+func RoundRobinReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) ChannelOpSet {
+	allNodes := store.GetNodesChannels()
 	filterMap := make(map[int64]struct{})
 	for _, reassign := range reassigns {
 		filterMap[reassign.NodeID] = struct{}{}
 	}
-	filterChannels := make([]*NodeChannelInfo, 0, len(channels))
-	for _, c := range channels {
+	avaNodes := make([]*NodeChannelInfo, 0, len(allNodes))
+	for _, c := range allNodes {
 		if _, ok := filterMap[c.NodeID]; ok {
 			continue
 		}
-		filterChannels = append(filterChannels, c)
+		avaNodes = append(avaNodes, c)
 	}
-
-	if len(filterChannels) == 0 {
+	ret := make([]*ChannelOp, 0)
+	if len(avaNodes) == 0 {
 		// if no node is left, do not reassign
-		return nil
+		return ret
 	}
+	sort.Slice(avaNodes, func(i, j int) bool {
+		return len(avaNodes[i].Channels) <= len(avaNodes[j].Channels)
+	})
 
 	// reassign channels to remaining nodes
 	i := 0
-	ret := make([]*ChannelOp, 0)
 	addUpdates := make(map[int64]*ChannelOp)
 	for _, reassign := range reassigns {
 		deleteUpdate := &ChannelOp{
@@ -403,7 +433,7 @@ func AverageReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) C
 		}
 		ret = append(ret, deleteUpdate)
 		for _, ch := range reassign.Channels {
-			targetID := filterChannels[i%len(filterChannels)].NodeID
+			targetID := avaNodes[i%len(avaNodes)].NodeID
 			i++
 			if _, ok := addUpdates[targetID]; !ok {
 				addUpdates[targetID] = &ChannelOp{
@@ -414,7 +444,95 @@ func AverageReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) C
 			} else {
 				addUpdates[targetID].Channels = append(addUpdates[targetID].Channels, ch)
 			}
+		}
+	}
+	for _, update := range addUpdates {
+		ret = append(ret, update)
+	}
+	return ret
+}
 
+// AverageReassignPolicy is a reassigning policy that evenly balance channels among datanodes
+// which is used by bgChecker
+func AverageReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) ChannelOpSet {
+	allNodes := store.GetNodesChannels()
+	filterMap := make(map[int64]struct{})
+	toReassignTotalNum := 0
+	for _, reassign := range reassigns {
+		filterMap[reassign.NodeID] = struct{}{}
+		toReassignTotalNum += len(reassign.Channels)
+	}
+	avaNodes := make([]*NodeChannelInfo, 0, len(allNodes))
+	avaNodesChannelSum := 0
+	for _, node := range allNodes {
+		if _, ok := filterMap[node.NodeID]; ok {
+			continue
+		}
+		avaNodes = append(avaNodes, node)
+		avaNodesChannelSum += len(node.Channels)
+	}
+	log.Info("AverageReassignPolicy working", zap.Int("avaNodesCount", len(avaNodes)),
+		zap.Int("toAssignChannelNum", toReassignTotalNum), zap.Int("avaNodesChannelSum", avaNodesChannelSum))
+	ret := make([]*ChannelOp, 0)
+	if len(avaNodes) == 0 {
+		// if no node is left, do not reassign
+		log.Warn("there is no available nodes when reassigning, return")
+		return ret
+	}
+
+	avgChannelCount := int(math.Ceil(float64(avaNodesChannelSum+toReassignTotalNum) / (float64(len(avaNodes)))))
+	sort.Slice(avaNodes, func(i, j int) bool {
+		if len(avaNodes[i].Channels) == len(avaNodes[j].Channels) {
+			return avaNodes[i].NodeID < avaNodes[j].NodeID
+		}
+		return len(avaNodes[i].Channels) < len(avaNodes[j].Channels)
+	})
+
+	// reassign channels to remaining nodes
+	addUpdates := make(map[int64]*ChannelOp)
+	for _, reassign := range reassigns {
+		deleteUpdate := &ChannelOp{
+			Type:     Delete,
+			Channels: reassign.Channels,
+			NodeID:   reassign.NodeID,
+		}
+		ret = append(ret, deleteUpdate)
+		for _, ch := range reassign.Channels {
+			nodeIdx := 0
+			for {
+				targetID := avaNodes[nodeIdx%len(avaNodes)].NodeID
+				if nodeIdx < len(avaNodes) {
+					existedChannelCount := store.GetNodeChannelCount(targetID)
+					if _, ok := addUpdates[targetID]; !ok {
+						if existedChannelCount >= avgChannelCount {
+							log.Debug("targetNodeID has had more channels than average, skip", zap.Int64("targetID",
+								targetID), zap.Int("existedChannelCount", existedChannelCount))
+							nodeIdx++
+							continue
+						}
+					} else {
+						addingChannelCount := len(addUpdates[targetID].Channels)
+						if existedChannelCount+addingChannelCount >= avgChannelCount {
+							log.Debug("targetNodeID has had more channels than average, skip", zap.Int64("targetID",
+								targetID), zap.Int("currentChannelCount", existedChannelCount+addingChannelCount))
+							nodeIdx++
+							continue
+						}
+					}
+				} else {
+					nodeIdx++
+				}
+				if _, ok := addUpdates[targetID]; !ok {
+					addUpdates[targetID] = &ChannelOp{
+						Type:     Add,
+						NodeID:   targetID,
+						Channels: []*channel{ch},
+					}
+				} else {
+					addUpdates[targetID].Channels = append(addUpdates[targetID].Channels, ch)
+				}
+				break
+			}
 		}
 	}
 	for _, update := range addUpdates {
@@ -424,50 +542,68 @@ func AverageReassignPolicy(store ROChannelStore, reassigns []*NodeChannelInfo) C
 }
 
 // ChannelBGChecker check nodes' channels and return the channels needed to be reallocated.
-type ChannelBGChecker func(channels []*NodeChannelInfo, ts time.Time) ([]*NodeChannelInfo, error)
+type ChannelBGChecker func(ctx context.Context)
 
 // EmptyBgChecker does nothing
 func EmptyBgChecker(channels []*NodeChannelInfo, ts time.Time) ([]*NodeChannelInfo, error) {
 	return nil, nil
 }
 
-// BgCheckWithMaxWatchDuration returns a ChannelBGChecker with the maxWatchDuration
-func BgCheckWithMaxWatchDuration(kv kv.TxnKV) ChannelBGChecker {
-	return func(channels []*NodeChannelInfo, ts time.Time) ([]*NodeChannelInfo, error) {
-		reAllocations := make([]*NodeChannelInfo, 0, len(channels))
-		for _, ch := range channels {
-			cinfo := &NodeChannelInfo{
-				NodeID:   ch.NodeID,
-				Channels: make([]*channel, 0),
+type ReAllocates []*NodeChannelInfo
+
+func (rallocates ReAllocates) MarshalLogArray(enc zapcore.ArrayEncoder) error {
+	for _, nChannelInfo := range rallocates {
+		enc.AppendString("nodeID:")
+		enc.AppendInt64(nChannelInfo.NodeID)
+		cstr := "["
+		if len(nChannelInfo.Channels) > 0 {
+			for _, s := range nChannelInfo.Channels {
+				cstr += s.Name
+				cstr += ", "
 			}
-			for _, c := range ch.Channels {
-				k := buildNodeChannelKey(ch.NodeID, c.Name)
-				v, err := kv.Load(k)
-				if err != nil {
-					return nil, err
-				}
-				watchInfo := &datapb.ChannelWatchInfo{}
-				if err := proto.Unmarshal([]byte(v), watchInfo); err != nil {
-					return nil, err
-				}
-				reviseVChannelInfo(watchInfo.GetVchan())
-				// if a channel is not watched after maxWatchDuration,
-				// then we reallocate it to another node
-				if watchInfo.State == datapb.ChannelWatchState_Complete || watchInfo.State == datapb.ChannelWatchState_WatchSuccess {
-					continue
-				}
-				startTime := time.Unix(watchInfo.StartTs, 0)
-				d := ts.Sub(startTime)
-				if d >= maxWatchDuration {
-					cinfo.Channels = append(cinfo.Channels, c)
-				}
-			}
-			if len(cinfo.Channels) != 0 {
-				reAllocations = append(reAllocations, cinfo)
-			}
+			cstr = cstr[:len(cstr)-2]
 		}
+		cstr += "]"
+		enc.AppendString(cstr)
+	}
+	return nil
+}
+
+func BgBalanceCheck(nodeChannels []*NodeChannelInfo, ts time.Time) ([]*NodeChannelInfo, error) {
+	avaNodeNum := len(nodeChannels)
+	reAllocations := make(ReAllocates, 0, avaNodeNum)
+	if avaNodeNum == 0 {
 		return reAllocations, nil
 	}
+	totalChannelNum := 0
+	for _, nodeChs := range nodeChannels {
+		totalChannelNum += len(nodeChs.Channels)
+	}
+	channelCountPerNode := totalChannelNum / avaNodeNum
+	for _, nChannels := range nodeChannels {
+		chCount := len(nChannels.Channels)
+		if chCount <= channelCountPerNode+1 {
+			log.Info("node channel count is not much larger than average, skip reallocate",
+				zap.Int64("nodeID", nChannels.NodeID), zap.Int("channelCount", chCount),
+				zap.Int("channelCountPerNode", channelCountPerNode))
+			continue
+		}
+		reallocate := &NodeChannelInfo{
+			NodeID:   nChannels.NodeID,
+			Channels: make([]*channel, 0),
+		}
+		toReleaseCount := chCount - channelCountPerNode - 1
+		for _, ch := range nChannels.Channels {
+			reallocate.Channels = append(reallocate.Channels, ch)
+			toReleaseCount--
+			if toReleaseCount <= 0 {
+				break
+			}
+		}
+		reAllocations = append(reAllocations, reallocate)
+	}
+	log.Info("Channel Balancer got new reAllocations:", zap.Array("reAllocations", reAllocations))
+	return reAllocations, nil
 }
 
 func formatNodeIDs(ids []int64) []string {

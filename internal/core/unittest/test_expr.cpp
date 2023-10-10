@@ -11,99 +11,110 @@
 
 #include <boost/format.hpp>
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <memory>
 #include <regex>
+#include <vector>
+#include <chrono>
 
+#include "common/Json.h"
+#include "common/Types.h"
+#include "pb/plan.pb.h"
 #include "query/Expr.h"
+#include "query/ExprImpl.h"
 #include "query/Plan.h"
 #include "query/PlanNode.h"
+#include "query/PlanProto.h"
 #include "query/generated/ShowPlanNodeVisitor.h"
 #include "query/generated/ExecExprVisitor.h"
 #include "segcore/SegmentGrowingImpl.h"
+#include "simdjson/padded_string.h"
+#include "segcore/segment_c.h"
 #include "test_utils/DataGen.h"
 #include "index/IndexFactory.h"
-
-using namespace milvus;
-
-TEST(Expr, Naive) {
-    SUCCEED();
-    std::string dsl_string = R"(
-{
-    "bool": {
-        "must": [
-            {
-                "term": {
-                    "A": [
-                        1,
-                        2,
-                        5
-                    ]
-                }
-            },
-            {
-                "range": {
-                    "B": {
-                        "GT": 1,
-                        "LT": 100
-                    }
-                }
-            },
-            {
-                "vector": {
-                    "Vec": {
-                        "metric_type": "L2",
-                        "params": {
-                            "nprobe": 10
-                        },
-                        "query": "$0",
-                        "topk": 10
-                    }
-                }
-            }
-        ]
-    }
-})";
-}
 
 TEST(Expr, Range) {
     SUCCEED();
     using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::string dsl_string = R"({
-        "bool": {
-            "must": [
-                {
-                    "range": {
-                        "age": {
-                            "GT": 1,
-                            "LT": 100
-                        }
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
-        }
-    })";
+    // std::string dsl_string = R"({
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "range": {
+    //                     "age": {
+    //                         "GT": 1,
+    //                         "LT": 100
+    //                     }
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "L2",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10,
+    //                         "round_decimal": 3
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
+
+    const char* raw_plan = R"(vector_anns: <
+                                field_id: 100
+                                predicates: <
+                                  binary_expr: <
+                                    op: LogicalAnd
+                                    left: <
+                                      unary_range_expr: <
+                                        column_info: <
+                                          field_id: 101
+                                          data_type: Int32
+                                        >
+                                        op: GreaterThan
+                                        value: <
+                                          int64_val: 1
+                                        >
+                                      >
+                                    >
+                                    right: <
+                                      unary_range_expr: <
+                                        column_info: <
+                                          field_id: 101
+                                          data_type: Int32
+                                        >
+                                        op: LessThan
+                                        value: <
+                                          int64_val: 100
+                                        >
+                                      >
+                                    >
+                                  >
+                                >
+                                query_info: <
+                                  topk: 10
+                                  round_decimal: 3
+                                  metric_type: "L2"
+                                  search_params: "{\"nprobe\": 10}"
+                                >
+                                placeholder_tag: "$0"
+     >)";
+    auto plan_str = translate_text_plan_to_binary_plan(raw_plan);
     auto schema = std::make_shared<Schema>();
-    schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     schema->AddDebugField("age", DataType::INT32);
-    auto plan = CreatePlan(*schema, dsl_string);
+    auto plan =
+        CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
     ShowPlanNodeVisitor shower;
-    Assert(plan->tag2field_.at("$0") == schema->get_field_id(FieldName("fakevec")));
-    auto out = shower.call_child(*plan->plan_node_);
-    std::cout << out.dump(4);
+    Assert(plan->tag2field_.at("$0") ==
+           schema->get_field_id(FieldName("fakevec")));
 }
 
 TEST(Expr, RangeBinary) {
@@ -111,41 +122,82 @@ TEST(Expr, RangeBinary) {
     using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::string dsl_string = R"({
-        "bool": {
-            "must": [
-                {
-                    "range": {
-                        "age": {
-                            "GT": 1,
-                            "LT": 100
-                        }
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "Jaccard",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
-        }
-    })";
+    // std::string dsl_string = R"({
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "range": {
+    //                     "age": {
+    //                         "GT": 1,
+    //                         "LT": 100
+    //                     }
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "Jaccard",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10,
+    //                         "round_decimal": 3
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
+    const char* raw_plan = R"(vector_anns: <
+                                field_id: 100
+                                predicates: <
+                                  binary_expr: <
+                                    op: LogicalAnd
+                                    left: <
+                                      unary_range_expr: <
+                                        column_info: <
+                                          field_id: 101
+                                          data_type: Int32
+                                        >
+                                        op: GreaterThan
+                                        value: <
+                                          int64_val: 1
+                                        >
+                                      >
+                                    >
+                                    right: <
+                                      unary_range_expr: <
+                                        column_info: <
+                                          field_id: 101
+                                          data_type: Int32
+                                        >
+                                        op: LessThan
+                                        value: <
+                                          int64_val: 100
+                                        >
+                                      >
+                                    >
+                                  >
+                                >
+                                query_info: <
+                                  topk: 10
+                                  round_decimal: 3
+                                  metric_type: "JACCARD"
+                                  search_params: "{\"nprobe\": 10}"
+                                >
+                                placeholder_tag: "$0"
+     >)";
+    auto plan_str = translate_text_plan_to_binary_plan(raw_plan);
     auto schema = std::make_shared<Schema>();
-    schema->AddDebugField("fakevec", DataType::VECTOR_BINARY, 512, knowhere::metric::JACCARD);
+    schema->AddDebugField(
+        "fakevec", DataType::VECTOR_BINARY, 512, knowhere::metric::JACCARD);
     schema->AddDebugField("age", DataType::INT32);
-    auto plan = CreatePlan(*schema, dsl_string);
+    auto plan =
+        CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
     ShowPlanNodeVisitor shower;
-    Assert(plan->tag2field_.at("$0") == schema->get_field_id(FieldName("fakevec")));
-    auto out = shower.call_child(*plan->plan_node_);
-    std::cout << out.dump(4);
+    Assert(plan->tag2field_.at("$0") ==
+           schema->get_field_id(FieldName("fakevec")));
 }
 
 TEST(Expr, InvalidRange) {
@@ -153,84 +205,90 @@ TEST(Expr, InvalidRange) {
     using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::string dsl_string = R"(
-{
-    "bool": {
-        "must": [
-            {
-                "range": {
-                    "age": {
-                        "GT": 1,
-                        "LT": "100"
-                    }
-                }
-            },
-            {
-                "vector": {
-                    "fakevec": {
-                        "metric_type": "L2",
-                        "params": {
-                            "nprobe": 10
-                        },
-                        "query": "$0",
-                        "topk": 10
-                    }
-                }
-            }
-        ]
-    }
-})";
+    //     std::string dsl_string = R"(
+    // {
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "range": {
+    //                     "age": {
+    //                         "GT": 1,
+    //                         "LT": "100"
+    //                     }
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "L2",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
+    const char* raw_plan = R"(vector_anns: <
+                                field_id: 100
+                                predicates: <
+                                  binary_expr: <
+                                    op: LogicalAnd
+                                    left: <
+                                      unary_range_expr: <
+                                        column_info: <
+                                          field_id: 102
+                                          data_type: Int64
+                                        >
+                                        op: GreaterThan
+                                        value: <
+                                          int64_val: 1
+                                        >
+                                      >
+                                    >
+                                    right: <
+                                      unary_range_expr: <
+                                        column_info: <
+                                          field_id: 101
+                                          data_type: Int64
+                                        >
+                                        op: LessThan
+                                        value: <
+                                          int64_val: 100
+                                        >
+                                      >
+                                    >
+                                  >
+                                >
+                                query_info: <
+                                  topk: 10
+                                  round_decimal: 3
+                                  metric_type: "L2"
+                                  search_params: "{\"nprobe\": 10}"
+                                >
+                                placeholder_tag: "$0"
+     >)";
+    auto plan_str = translate_text_plan_to_binary_plan(raw_plan);
     auto schema = std::make_shared<Schema>();
-    schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     schema->AddDebugField("age", DataType::INT32);
-    ASSERT_ANY_THROW(CreatePlan(*schema, dsl_string));
-}
-
-TEST(Expr, InvalidDSL) {
-    SUCCEED();
-    using namespace milvus;
-    using namespace milvus::query;
-    using namespace milvus::segcore;
-    std::string dsl_string = R"({
-        "float": {
-            "must": [
-                {
-                    "range": {
-                        "age": {
-                            "GT": 1,
-                            "LT": 100
-                        }
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10
-                        }
-                    }
-                }
-            ]
-        }
-    })";
-
-    auto schema = std::make_shared<Schema>();
-    schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
-    schema->AddDebugField("age", DataType::INT32);
-    ASSERT_ANY_THROW(CreatePlan(*schema, dsl_string));
+    ASSERT_ANY_THROW(
+        CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size()));
 }
 
 TEST(Expr, ShowExecutor) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
     auto node = std::make_unique<FloatVectorANNS>();
     auto schema = std::make_shared<Schema>();
     auto metric_type = knowhere::metric::L2;
-    auto field_id = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, metric_type);
+    auto field_id = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, metric_type);
     int64_t num_queries = 100L;
     auto raw_data = DataGen(schema, num_queries);
     auto& info = node->search_info_;
@@ -248,71 +306,209 @@ TEST(Expr, ShowExecutor) {
 }
 
 TEST(Expr, TestRange) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
     std::vector<std::tuple<std::string, std::function<bool(int)>>> testcases = {
-        {R"("GT": 2000, "LT": 3000)", [](int v) { return 2000 < v && v < 3000; }},
-        {R"("GE": 2000, "LT": 3000)", [](int v) { return 2000 <= v && v < 3000; }},
-        {R"("GT": 2000, "LE": 3000)", [](int v) { return 2000 < v && v <= 3000; }},
-        {R"("GE": 2000, "LE": 3000)", [](int v) { return 2000 <= v && v <= 3000; }},
-        {R"("GE": 2000)", [](int v) { return v >= 2000; }},
-        {R"("GT": 2000)", [](int v) { return v > 2000; }},
-        {R"("LE": 2000)", [](int v) { return v <= 2000; }},
-        {R"("LT": 2000)", [](int v) { return v < 2000; }},
-        {R"("EQ": 2000)", [](int v) { return v == 2000; }},
-        {R"("NE": 2000)", [](int v) { return v != 2000; }},
+        {R"(binary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              lower_inclusive: false,
+              upper_inclusive: false,
+              lower_value: <
+                int64_val: 2000
+              >
+              upper_value: <
+                int64_val: 3000
+              >
+        >)",
+         [](int v) { return 2000 < v && v < 3000; }},
+        {R"(binary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              lower_inclusive: true,
+              upper_inclusive: false,
+              lower_value: <
+                int64_val: 2000
+              >
+              upper_value: <
+                int64_val: 3000
+              >
+        >)",
+         [](int v) { return 2000 <= v && v < 3000; }},
+        {R"(binary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              lower_inclusive: false,
+              upper_inclusive: true,
+              lower_value: <
+                int64_val: 2000
+              >
+              upper_value: <
+                int64_val: 3000
+              >
+        >)",
+         [](int v) { return 2000 < v && v <= 3000; }},
+        {R"(binary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              lower_inclusive: true,
+              upper_inclusive: true,
+              lower_value: <
+                int64_val: 2000
+              >
+              upper_value: <
+                int64_val: 3000
+              >
+        >)",
+         [](int v) { return 2000 <= v && v <= 3000; }},
+        {R"(unary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              op: GreaterEqual,
+              value: <
+                int64_val: 2000
+              >
+        >)",
+         [](int v) { return v >= 2000; }},
+        {R"(unary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              op: GreaterThan,
+              value: <
+                int64_val: 2000
+              >
+        >)",
+         [](int v) { return v > 2000; }},
+        {R"(unary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              op: LessEqual,
+              value: <
+                int64_val: 2000
+              >
+        >)",
+         [](int v) { return v <= 2000; }},
+        {R"(unary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              op: LessThan,
+              value: <
+                int64_val: 2000
+              >
+        >)",
+         [](int v) { return v < 2000; }},
+        {R"(unary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              op: Equal,
+              value: <
+                int64_val: 2000
+              >
+        >)",
+         [](int v) { return v == 2000; }},
+        {R"(unary_range_expr: <
+              column_info: <
+                field_id: 101
+                data_type: Int64
+              >
+              op: NotEqual,
+              value: <
+                int64_val: 2000
+              >
+        >)",
+         [](int v) { return v != 2000; }},
     };
 
-    std::string dsl_string_tmp = R"({
-        "bool": {
-            "must": [
-                {
-                    "range": {
-                        "age": {
-                            @@@@
-                        }
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
-        }
-    })";
+    // std::string dsl_string_tmp = R"({
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "range": {
+    //                     "age": {
+    //                         @@@@
+    //                     }
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "L2",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10,
+    //                         "round_decimal": 3
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
+    std::string raw_plan_tmp = R"(vector_anns: <
+                                    field_id: 100
+                                    predicates: <
+                                      @@@@
+                                    >
+                                    query_info: <
+                                      topk: 10
+                                      round_decimal: 3
+                                      metric_type: "L2"
+                                      search_params: "{\"nprobe\": 10}"
+                                    >
+                                    placeholder_tag: "$0"
+     >)";
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto i64_fid = schema->AddDebugField("age", DataType::INT64);
     schema->set_primary_field_id(i64_fid);
 
-    auto seg = CreateGrowingSegment(schema);
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
     std::vector<int> age_col;
-    int num_iters = 100;
+    int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
         auto new_age_col = raw_data.get_col<int>(i64_fid);
         age_col.insert(age_col.end(), new_age_col.begin(), new_age_col.end());
         seg->PreInsert(N);
-        seg->Insert(iter * N, N, raw_data.row_ids_.data(), raw_data.timestamps_.data(), raw_data.raw_);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    ExecExprVisitor visitor(*seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
     for (auto [clause, ref_func] : testcases) {
-        auto loc = dsl_string_tmp.find("@@@@");
-        auto dsl_string = dsl_string_tmp;
-        dsl_string.replace(loc, 4, clause);
-        auto plan = CreatePlan(*schema, dsl_string);
+        auto loc = raw_plan_tmp.find("@@@@");
+        auto raw_plan = raw_plan_tmp;
+        raw_plan.replace(loc, 4, clause);
+        auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
+        auto plan =
+            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N * num_iters);
 
@@ -322,62 +518,488 @@ TEST(Expr, TestRange) {
             auto val = age_col[i];
             auto ref = ref_func(val);
             ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+        }
+    }
+}
+
+TEST(Expr, TestBinaryRangeJSON) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    struct Testcase {
+        bool lower_inclusive;
+        bool upper_inclusive;
+        int64_t lower;
+        int64_t upper;
+        std::vector<std::string> nested_path;
+    };
+    std::vector<Testcase> testcases{
+        {true, false, 10, 20, {"int"}},
+        {true, true, 20, 30, {"int"}},
+        {false, true, 30, 40, {"int"}},
+        {false, false, 40, 50, {"int"}},
+        {true, false, 10, 20, {"double"}},
+        {true, true, 20, 30, {"double"}},
+        {false, true, 30, 40, {"double"}},
+        {false, false, 40, 50, {"double"}},
+    };
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    for (auto testcase : testcases) {
+        auto check = [&](int64_t value) {
+            int64_t lower = testcase.lower, upper = testcase.upper;
+            if (!testcase.lower_inclusive) {
+                lower++;
+            }
+            if (!testcase.upper_inclusive) {
+                upper--;
+            }
+            return lower <= value && value <= upper;
+        };
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        RetrievePlanNode plan;
+        plan.predicate_ = std::make_unique<BinaryRangeExprImpl<int64_t>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            proto::plan::GenericValue::ValCase::kInt64Val,
+            testcase.lower_inclusive,
+            testcase.upper_inclusive,
+            testcase.lower,
+            testcase.upper);
+        auto final = visitor.call_child(*plan.predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+
+            if (testcase.nested_path[0] == "int") {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<int64_t>(pointer)
+                               .value();
+                auto ref = check(val);
+                ASSERT_EQ(ans, ref)
+                    << val << testcase.lower_inclusive << testcase.lower
+                    << testcase.upper_inclusive << testcase.upper;
+            } else {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<double>(pointer)
+                               .value();
+                auto ref = check(val);
+                ASSERT_EQ(ans, ref)
+                    << val << testcase.lower_inclusive << testcase.lower
+                    << testcase.upper_inclusive << testcase.upper;
+            }
+        }
+    }
+}
+
+TEST(Expr, TestExistsJson) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    struct Testcase {
+        std::vector<std::string> nested_path;
+    };
+    std::vector<Testcase> testcases{
+        {{"A"}},
+        {{"int"}},
+        {{"double"}},
+        {{"B"}},
+    };
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    for (auto testcase : testcases) {
+        auto check = [&](bool value) { return value; };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<ExistsExprImpl>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path));
+        auto final = visitor.call_child(*plan.predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                           .exist(pointer);
+            auto ref = check(val);
+            ASSERT_EQ(ans, ref);
+        }
+    }
+}
+
+TEST(Expr, TestUnaryRangeJson) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    struct Testcase {
+        int64_t val;
+        std::vector<std::string> nested_path;
+    };
+    std::vector<Testcase> testcases{
+        {10, {"int"}},
+        {20, {"int"}},
+        {30, {"int"}},
+        {40, {"int"}},
+        {10, {"double"}},
+        {20, {"double"}},
+        {30, {"double"}},
+        {40, {"double"}},
+    };
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    std::vector<OpType> ops{
+        OpType::Equal,
+        OpType::NotEqual,
+        OpType::GreaterThan,
+        OpType::GreaterEqual,
+        OpType::LessThan,
+        OpType::LessEqual,
+    };
+    for (const auto& testcase : testcases) {
+        auto check = [&](int64_t value) { return value == testcase.val; };
+        std::function<bool(int64_t)> f = check;
+        for (auto& op : ops) {
+            switch (op) {
+                case OpType::Equal: {
+                    f = [&](int64_t value) { return value == testcase.val; };
+                    break;
+                }
+                case OpType::NotEqual: {
+                    f = [&](int64_t value) { return value != testcase.val; };
+                    break;
+                }
+                case OpType::GreaterEqual: {
+                    f = [&](int64_t value) { return value >= testcase.val; };
+                    break;
+                }
+                case OpType::GreaterThan: {
+                    f = [&](int64_t value) { return value > testcase.val; };
+                    break;
+                }
+                case OpType::LessEqual: {
+                    f = [&](int64_t value) { return value <= testcase.val; };
+                    break;
+                }
+                case OpType::LessThan: {
+                    f = [&](int64_t value) { return value < testcase.val; };
+                    break;
+                }
+                default: {
+                    PanicInfo(Unsupported, "unsupported range node");
+                }
+            }
+
+            RetrievePlanNode plan;
+            auto pointer = milvus::Json::pointer(testcase.nested_path);
+            plan.predicate_ = std::make_unique<UnaryRangeExprImpl<int64_t>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                op,
+                testcase.val,
+                proto::plan::GenericValue::ValCase::kInt64Val);
+            auto final = visitor.call_child(*plan.predicate_.value());
+            EXPECT_EQ(final.size(), N * num_iters);
+
+            for (int i = 0; i < N * num_iters; ++i) {
+                auto ans = final[i];
+                if (testcase.nested_path[0] == "int") {
+                    auto val =
+                        milvus::Json(simdjson::padded_string(json_col[i]))
+                            .template at<int64_t>(pointer)
+                            .value();
+                    auto ref = f(val);
+                    ASSERT_EQ(ans, ref);
+                } else {
+                    auto val =
+                        milvus::Json(simdjson::padded_string(json_col[i]))
+                            .template at<double>(pointer)
+                            .value();
+                    auto ref = f(val);
+                    ASSERT_EQ(ans, ref);
+                }
+            }
+        }
+    }
+
+    struct TestArrayCase {
+        proto::plan::Array val;
+        std::vector<std::string> nested_path;
+    };
+
+    proto::plan::Array arr;
+    arr.set_same_type(true);
+    proto::plan::GenericValue int_val1;
+    int_val1.set_int64_val(int64_t(1));
+    arr.add_array()->CopyFrom(int_val1);
+
+    proto::plan::GenericValue int_val2;
+    int_val2.set_int64_val(int64_t(2));
+    arr.add_array()->CopyFrom(int_val2);
+
+    proto::plan::GenericValue int_val3;
+    int_val3.set_int64_val(int64_t(3));
+    arr.add_array()->CopyFrom(int_val3);
+
+    std::vector<TestArrayCase> array_cases = {{arr, {"array"}}};
+
+    for (const auto& testcase : array_cases) {
+        auto check = [&](OpType op) {
+            if (testcase.nested_path[0] == "array" && op == OpType::Equal) {
+                return true;
+            }
+            return false;
+        };
+        for (auto& op : ops) {
+            RetrievePlanNode plan;
+            auto pointer = milvus::Json::pointer(testcase.nested_path);
+            plan.predicate_ =
+                std::make_unique<UnaryRangeExprImpl<proto::plan::Array>>(
+                    ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                    op,
+                    testcase.val,
+                    proto::plan::GenericValue::ValCase::kArrayVal);
+            auto final = visitor.call_child(*plan.predicate_.value());
+            EXPECT_EQ(final.size(), N * num_iters);
+
+            for (int i = 0; i < N * num_iters; ++i) {
+                auto ans = final[i];
+                auto ref = check(op);
+                ASSERT_EQ(ans, ref);
+            }
+        }
+    }
+}
+
+TEST(Expr, TestTermJson) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    struct Testcase {
+        std::vector<int64_t> term;
+        std::vector<std::string> nested_path;
+    };
+    std::vector<Testcase> testcases{
+        {{1, 2, 3, 4}, {"int"}},
+        {{10, 100, 1000, 10000}, {"int"}},
+        {{100, 10000, 9999, 444}, {"int"}},
+        {{23, 42, 66, 17, 25}, {"int"}},
+    };
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 100;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    for (auto testcase : testcases) {
+        auto check = [&](int64_t value) {
+            std::unordered_set<int64_t> term_set(testcase.term.begin(),
+                                                 testcase.term.end());
+            return term_set.find(value) != term_set.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<TermExprImpl<int64_t>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            proto::plan::GenericValue::ValCase::kInt64Val);
+        auto final = visitor.call_child(*plan.predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                           .template at<int64_t>(pointer)
+                           .value();
+            auto ref = check(val);
+            ASSERT_EQ(ans, ref);
         }
     }
 }
 
 TEST(Expr, TestTerm) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
     auto vec_2k_3k = [] {
-        std::string buf = "[";
-        for (int i = 2000; i < 3000 - 1; ++i) {
-            buf += std::to_string(i) + ", ";
+        std::string buf;
+        for (int i = 2000; i < 3000; ++i) {
+            buf += "values: < int64_val: " + std::to_string(i) + " >\n";
         }
-        buf += std::to_string(2999) + "]";
         return buf;
     }();
 
     std::vector<std::tuple<std::string, std::function<bool(int)>>> testcases = {
-        {R"([2000, 3000])", [](int v) { return v == 2000 || v == 3000; }},
-        {R"([2000])", [](int v) { return v == 2000; }},
-        {R"([3000])", [](int v) { return v == 3000; }},
-        {R"([])", [](int v) { return false; }},
+        {R"(values: <
+                int64_val: 2000
+            >
+            values: <
+                int64_val: 3000
+            >
+        )",
+         [](int v) { return v == 2000 || v == 3000; }},
+        {R"(values: <
+                int64_val: 2000
+            >)",
+         [](int v) { return v == 2000; }},
+        {R"(values: <
+                int64_val: 3000
+            >)",
+         [](int v) { return v == 3000; }},
+        {R"()", [](int v) { return false; }},
         {vec_2k_3k, [](int v) { return 2000 <= v && v < 3000; }},
     };
 
-    std::string dsl_string_tmp = R"({
-        "bool": {
-            "must": [
-                {
-                    "term": {
-                        "age": {
-                            "values": @@@@
-                        }
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
-        }
-    })";
+    // std::string dsl_string_tmp = R"({
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "term": {
+    //                     "age": {
+    //                         "values": @@@@,
+    //                         "is_in_field" : false
+    //                     }
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "L2",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10,
+    //                         "round_decimal": 3
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
+    std::string raw_plan_tmp = R"(vector_anns: <
+                                    field_id: 100
+                                    predicates: <
+                                      term_expr: <
+                                        column_info: <
+                                          field_id: 101
+                                          data_type: Int64
+                                        >
+                                        @@@@
+                                      >
+                                    >
+                                    query_info: <
+                                      topk: 10
+                                      round_decimal: 3
+                                      metric_type: "L2"
+                                      search_params: "{\"nprobe\": 10}"
+                                    >
+                                    placeholder_tag: "$0"
+     >)";
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto i64_fid = schema->AddDebugField("age", DataType::INT64);
     schema->set_primary_field_id(i64_fid);
 
-    auto seg = CreateGrowingSegment(schema);
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
     std::vector<int> age_col;
     int num_iters = 100;
@@ -386,121 +1008,29 @@ TEST(Expr, TestTerm) {
         auto new_age_col = raw_data.get_col<int>(i64_fid);
         age_col.insert(age_col.end(), new_age_col.begin(), new_age_col.end());
         seg->PreInsert(N);
-        seg->Insert(iter * N, N, raw_data.row_ids_.data(), raw_data.timestamps_.data(), raw_data.raw_);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    ExecExprVisitor visitor(*seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
     for (auto [clause, ref_func] : testcases) {
-        auto loc = dsl_string_tmp.find("@@@@");
-        auto dsl_string = dsl_string_tmp;
-        dsl_string.replace(loc, 4, clause);
-        auto plan = CreatePlan(*schema, dsl_string);
+        auto loc = raw_plan_tmp.find("@@@@");
+        auto raw_plan = raw_plan_tmp;
+        raw_plan.replace(loc, 4, clause);
+        auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
+        auto plan =
+            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N * num_iters);
 
         for (int i = 0; i < N * num_iters; ++i) {
             auto ans = final[i];
 
-            auto val = age_col[i];
-            auto ref = ref_func(val);
-            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
-        }
-    }
-}
-
-TEST(Expr, TestSimpleDsl) {
-    using namespace milvus::query;
-    using namespace milvus::segcore;
-
-    auto vec_dsl = Json::parse(R"({
-                "vector": {
-                    "fakevec": {
-                        "metric_type": "L2",
-                        "params": {
-                            "nprobe": 10
-                        },
-                        "query": "$0",
-                        "topk": 10,
-                        "round_decimal": 3
-                    }
-                }
-            })");
-
-    int N = 32;
-    auto get_item = [&](int base, int bit = 1) {
-        std::vector<int> terms;
-        // note: random gen range is [0, 2N)
-        for (int i = 0; i < N * 2; ++i) {
-            if (((i >> base) & 0x1) == bit) {
-                terms.push_back(i);
-            }
-        }
-        Json s;
-        s["term"]["age"]["values"] = terms;
-        return s;
-    };
-    // std::cout << get_item(0).dump(-2);
-    // std::cout << vec_dsl.dump(-2);
-    std::vector<std::tuple<Json, std::function<bool(int)>>> testcases;
-    {
-        Json dsl;
-        dsl["must"] = Json::array({vec_dsl, get_item(0), get_item(1), get_item(2, 0), get_item(3)});
-        testcases.emplace_back(dsl, [](int64_t x) { return (x & 0b1111) == 0b1011; });
-    }
-
-    {
-        Json dsl;
-        Json sub_dsl;
-        sub_dsl["must"] = Json::array({get_item(0), get_item(1), get_item(2, 0), get_item(3)});
-        dsl["must"] = Json::array({sub_dsl, vec_dsl});
-        testcases.emplace_back(dsl, [](int64_t x) { return (x & 0b1111) == 0b1011; });
-    }
-
-    {
-        Json dsl;
-        Json sub_dsl;
-        sub_dsl["should"] = Json::array({get_item(0), get_item(1), get_item(2, 0), get_item(3)});
-        dsl["must"] = Json::array({sub_dsl, vec_dsl});
-        testcases.emplace_back(dsl, [](int64_t x) { return !!((x & 0b1111) ^ 0b0100); });
-    }
-
-    {
-        Json dsl;
-        Json sub_dsl;
-        sub_dsl["must_not"] = Json::array({get_item(0), get_item(1), get_item(2, 0), get_item(3)});
-        dsl["must"] = Json::array({sub_dsl, vec_dsl});
-        testcases.emplace_back(dsl, [](int64_t x) { return (x & 0b1111) != 0b1011; });
-    }
-
-    auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
-    auto i64_fid = schema->AddDebugField("age", DataType::INT64);
-    schema->set_primary_field_id(i64_fid);
-
-    auto seg = CreateGrowingSegment(schema);
-    std::vector<int64_t> age_col;
-    int num_iters = 100;
-    for (int iter = 0; iter < num_iters; ++iter) {
-        auto raw_data = DataGen(schema, N, iter);
-        auto new_age_col = raw_data.get_col<int64_t>(i64_fid);
-        age_col.insert(age_col.end(), new_age_col.begin(), new_age_col.end());
-        seg->PreInsert(N);
-        seg->Insert(iter * N, N, raw_data.row_ids_.data(), raw_data.timestamps_.data(), raw_data.raw_);
-    }
-
-    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    ExecExprVisitor visitor(*seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
-    for (auto [clause, ref_func] : testcases) {
-        Json dsl;
-        dsl["bool"] = clause;
-        // std::cout << dsl.dump(2);
-        auto plan = CreatePlan(*schema, dsl.dump());
-        auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
-        EXPECT_EQ(final.size(), N * num_iters);
-
-        for (int i = 0; i < N * num_iters; ++i) {
-            bool ans = final[i];
             auto val = age_col[i];
             auto ref = ref_func(val);
             ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
@@ -509,68 +1039,107 @@ TEST(Expr, TestSimpleDsl) {
 }
 
 TEST(Expr, TestCompare) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::vector<std::tuple<std::string, std::function<bool(int, int64_t)>>> testcases = {
-        {R"("LT")", [](int a, int64_t b) { return a < b; }},  {R"("LE")", [](int a, int64_t b) { return a <= b; }},
-        {R"("GT")", [](int a, int64_t b) { return a > b; }},  {R"("GE")", [](int a, int64_t b) { return a >= b; }},
-        {R"("EQ")", [](int a, int64_t b) { return a == b; }}, {R"("NE")", [](int a, int64_t b) { return a != b; }},
-    };
+    std::vector<std::tuple<std::string, std::function<bool(int, int64_t)>>>
+        testcases = {
+            {R"(LessThan)", [](int a, int64_t b) { return a < b; }},
+            {R"(LessEqual)", [](int a, int64_t b) { return a <= b; }},
+            {R"(GreaterThan)", [](int a, int64_t b) { return a > b; }},
+            {R"(GreaterEqual)", [](int a, int64_t b) { return a >= b; }},
+            {R"(Equal)", [](int a, int64_t b) { return a == b; }},
+            {R"(NotEqual)", [](int a, int64_t b) { return a != b; }},
+        };
 
-    std::string dsl_string_tpl = R"({
-        "bool": {
-            "must": [
-                {
-                    "compare": {
-                        %1%: [
-                            "age1",
-                            "age2"
-                        ]
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
-        }
-    })";
+    // std::string dsl_string_tpl = R"({
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "compare": {
+    //                     %1%: [
+    //                         "age1",
+    //                         "age2"
+    //                     ]
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "L2",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10,
+    //                         "round_decimal": 3
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
+    std::string raw_plan_tmp = R"(vector_anns: <
+                                    field_id: 100
+                                    predicates: <
+                                      compare_expr: <
+                                        left_column_info: <
+                                          field_id: 101
+                                          data_type: Int32
+                                        >
+                                        right_column_info: <
+                                          field_id: 102
+                                          data_type: Int64
+                                        >
+                                        op: @@@@
+                                      >
+                                    >
+                                    query_info: <
+                                      topk: 10
+                                      round_decimal: 3
+                                      metric_type: "L2"
+                                      search_params: "{\"nprobe\": 10}"
+                                    >
+                                    placeholder_tag: "$0"
+     >)";
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto i32_fid = schema->AddDebugField("age1", DataType::INT32);
     auto i64_fid = schema->AddDebugField("age2", DataType::INT64);
     schema->set_primary_field_id(i64_fid);
 
-    auto seg = CreateGrowingSegment(schema);
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
     std::vector<int> age1_col;
     std::vector<int64_t> age2_col;
-    int num_iters = 100;
+    int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
         auto new_age1_col = raw_data.get_col<int>(i32_fid);
         auto new_age2_col = raw_data.get_col<int64_t>(i64_fid);
-        age1_col.insert(age1_col.end(), new_age1_col.begin(), new_age1_col.end());
-        age2_col.insert(age2_col.end(), new_age2_col.begin(), new_age2_col.end());
+        age1_col.insert(
+            age1_col.end(), new_age1_col.begin(), new_age1_col.end());
+        age2_col.insert(
+            age2_col.end(), new_age2_col.begin(), new_age2_col.end());
         seg->PreInsert(N);
-        seg->Insert(iter * N, N, raw_data.row_ids_.data(), raw_data.timestamps_.data(), raw_data.raw_);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    ExecExprVisitor visitor(*seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
     for (auto [clause, ref_func] : testcases) {
-        auto dsl_string = boost::str(boost::format(dsl_string_tpl) % clause);
-        auto plan = CreatePlan(*schema, dsl_string);
-        // std::cout << ShowPlanNodeVisitor().call_child(*plan->plan_node_) << std::endl;
+        auto loc = raw_plan_tmp.find("@@@@");
+        auto raw_plan = raw_plan_tmp;
+        raw_plan.replace(loc, 4, clause);
+        auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
+        auto plan =
+            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N * num_iters);
 
@@ -580,22 +1149,25 @@ TEST(Expr, TestCompare) {
             auto val1 = age1_col[i];
             auto val2 = age2_col[i];
             auto ref = ref_func(val1, val2);
-            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << boost::format("[%1%, %2%]") % val1 % val2;
+            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!"
+                                << boost::format("[%1%, %2%]") % val1 % val2;
         }
     }
 }
 
 TEST(Expr, TestCompareWithScalarIndex) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::vector<std::tuple<std::string, std::function<bool(int, int64_t)>>> testcases = {
-        {R"(LessThan)", [](int a, int64_t b) { return a < b; }},
-        {R"(LessEqual)", [](int a, int64_t b) { return a <= b; }},
-        {R"(GreaterThan)", [](int a, int64_t b) { return a > b; }},
-        {R"(GreaterEqual)", [](int a, int64_t b) { return a >= b; }},
-        {R"(Equal)", [](int a, int64_t b) { return a == b; }},
-        {R"(NotEqual)", [](int a, int64_t b) { return a != b; }},
-    };
+    std::vector<std::tuple<std::string, std::function<bool(int, int64_t)>>>
+        testcases = {
+            {R"(LessThan)", [](int a, int64_t b) { return a < b; }},
+            {R"(LessEqual)", [](int a, int64_t b) { return a <= b; }},
+            {R"(GreaterThan)", [](int a, int64_t b) { return a > b; }},
+            {R"(GreaterEqual)", [](int a, int64_t b) { return a >= b; }},
+            {R"(Equal)", [](int a, int64_t b) { return a == b; }},
+            {R"(NotEqual)", [](int a, int64_t b) { return a != b; }},
+        };
 
     std::string serialized_expr_plan = R"(vector_anns: <
                                             field_id: %1%
@@ -622,7 +1194,8 @@ TEST(Expr, TestCompareWithScalarIndex) {
      >)";
 
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto i32_fid = schema->AddDebugField("age32", DataType::INT32);
     auto i64_fid = schema->AddDebugField("age64", DataType::INT64);
     schema->set_primary_field_id(i64_fid);
@@ -656,11 +1229,14 @@ TEST(Expr, TestCompareWithScalarIndex) {
 
     ExecExprVisitor visitor(*seg, seg->get_row_count(), MAX_TIMESTAMP);
     for (auto [clause, ref_func] : testcases) {
-        auto dsl_string = boost::format(serialized_expr_plan) % vec_fid.get() % clause % i32_fid.get() %
-                          proto::schema::DataType_Name(int(DataType::INT32)) % i64_fid.get() %
-                          proto::schema::DataType_Name(int(DataType::INT64));
-        auto binary_plan = translate_text_plan_to_binary_plan(dsl_string.str().data());
-        auto plan = CreateSearchPlanByExpr(*schema, binary_plan.data(), binary_plan.size());
+        auto dsl_string =
+            boost::format(serialized_expr_plan) % vec_fid.get() % clause %
+            i32_fid.get() % proto::schema::DataType_Name(int(DataType::INT32)) %
+            i64_fid.get() % proto::schema::DataType_Name(int(DataType::INT64));
+        auto binary_plan =
+            translate_text_plan_to_binary_plan(dsl_string.str().data());
+        auto plan = CreateSearchPlanByExpr(
+            *schema, binary_plan.data(), binary_plan.size());
         // std::cout << ShowPlanNodeVisitor().call_child(*plan->plan_node_) << std::endl;
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N);
@@ -670,22 +1246,451 @@ TEST(Expr, TestCompareWithScalarIndex) {
             auto val1 = age32_col[i];
             auto val2 = age64_col[i];
             auto ref = ref_func(val1, val2);
-            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << boost::format("[%1%, %2%]") % val1 % val2;
+            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!"
+                                << boost::format("[%1%, %2%]") % val1 % val2;
         }
     }
 }
 
-TEST(Expr, TestCompareWithScalarIndexMaris) {
+TEST(Expr, TestCompareExpr) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::vector<std::tuple<std::string, std::function<bool(std::string, std::string)>>> testcases = {
-        {R"(LessThan)", [](std::string a, std::string b) { return a.compare(b) < 0; }},
-        {R"(LessEqual)", [](std::string a, std::string b) { return a.compare(b) <= 0; }},
-        {R"(GreaterThan)", [](std::string a, std::string b) { return a.compare(b) > 0; }},
-        {R"(GreaterEqual)", [](std::string a, std::string b) { return a.compare(b) >= 0; }},
-        {R"(Equal)", [](std::string a, std::string b) { return a.compare(b) == 0; }},
-        {R"(NotEqual)", [](std::string a, std::string b) { return a.compare(b) != 0; }},
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto bool_fid = schema->AddDebugField("bool", DataType::BOOL);
+    auto bool_1_fid = schema->AddDebugField("bool1", DataType::BOOL);
+    auto int8_fid = schema->AddDebugField("int8", DataType::INT8);
+    auto int8_1_fid = schema->AddDebugField("int81", DataType::INT8);
+    auto int16_fid = schema->AddDebugField("int16", DataType::INT16);
+    auto int16_1_fid = schema->AddDebugField("int161", DataType::INT16);
+    auto int32_fid = schema->AddDebugField("int32", DataType::INT32);
+    auto int32_1_fid = schema->AddDebugField("int321", DataType::INT32);
+    auto int64_fid = schema->AddDebugField("int64", DataType::INT64);
+    auto int64_1_fid = schema->AddDebugField("int641", DataType::INT64);
+    auto float_fid = schema->AddDebugField("float", DataType::FLOAT);
+    auto float_1_fid = schema->AddDebugField("float1", DataType::FLOAT);
+    auto double_fid = schema->AddDebugField("double", DataType::DOUBLE);
+    auto double_1_fid = schema->AddDebugField("double1", DataType::DOUBLE);
+    auto str1_fid = schema->AddDebugField("string1", DataType::VARCHAR);
+    auto str2_fid = schema->AddDebugField("string2", DataType::VARCHAR);
+    auto str3_fid = schema->AddDebugField("string3", DataType::VARCHAR);
+    schema->set_primary_field_id(str1_fid);
+
+    auto seg = CreateSealedSegment(schema);
+    size_t N = 1000;
+    auto raw_data = DataGen(schema, N);
+    auto fields = schema->get_fields();
+    for (auto field_data : raw_data.raw_->fields_data()) {
+        int64_t field_id = field_data.field_id();
+
+        auto info = FieldDataInfo(field_data.field_id(), N, "/tmp/a");
+        auto field_meta = fields.at(FieldId(field_id));
+        info.channel->push(
+            CreateFieldDataFromDataArray(N, &field_data, field_meta));
+        info.channel->close();
+
+        seg->LoadFieldData(FieldId(field_id), info);
+    }
+
+    ExecExprVisitor visitor(*seg, seg->get_row_count(), MAX_TIMESTAMP);
+    auto build_expr = [&](enum DataType type) -> std::shared_ptr<query::Expr> {
+        switch (type) {
+            case DataType::BOOL: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::BOOL;
+                compare_expr->left_field_id_ = bool_fid;
+
+                compare_expr->right_data_type_ = DataType::BOOL;
+                compare_expr->right_field_id_ = bool_1_fid;
+                return compare_expr;
+            }
+            case DataType::INT8: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::INT8;
+                compare_expr->left_field_id_ = int8_fid;
+
+                compare_expr->right_data_type_ = DataType::INT8;
+                compare_expr->right_field_id_ = int8_1_fid;
+                return compare_expr;
+            }
+            case DataType::INT16: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::INT16;
+                compare_expr->left_field_id_ = int16_fid;
+
+                compare_expr->right_data_type_ = DataType::INT16;
+                compare_expr->right_field_id_ = int16_1_fid;
+                return compare_expr;
+            }
+            case DataType::INT32: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::INT32;
+                compare_expr->left_field_id_ = int32_fid;
+
+                compare_expr->right_data_type_ = DataType::INT32;
+                compare_expr->right_field_id_ = int32_1_fid;
+                return compare_expr;
+            }
+            case DataType::INT64: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::INT64;
+                compare_expr->left_field_id_ = int64_fid;
+
+                compare_expr->right_data_type_ = DataType::INT64;
+                compare_expr->right_field_id_ = int64_1_fid;
+                return compare_expr;
+            }
+            case DataType::FLOAT: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::FLOAT;
+                compare_expr->left_field_id_ = float_fid;
+
+                compare_expr->right_data_type_ = DataType::FLOAT;
+                compare_expr->right_field_id_ = float_1_fid;
+                return compare_expr;
+            }
+            case DataType::DOUBLE: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::DOUBLE;
+                compare_expr->left_field_id_ = double_fid;
+
+                compare_expr->right_data_type_ = DataType::DOUBLE;
+                compare_expr->right_field_id_ = double_1_fid;
+                return compare_expr;
+            }
+            case DataType::VARCHAR: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::VARCHAR;
+                compare_expr->left_field_id_ = str2_fid;
+
+                compare_expr->right_data_type_ = DataType::VARCHAR;
+                compare_expr->right_field_id_ = str3_fid;
+                return compare_expr;
+            }
+            default:
+                return std::make_shared<query::CompareExpr>();
+        }
     };
+    std::cout << "start compare test" << std::endl;
+    auto expr = build_expr(DataType::BOOL);
+    auto final = visitor.call_child(*expr);
+    expr = build_expr(DataType::INT8);
+    final = visitor.call_child(*expr);
+    expr = build_expr(DataType::INT16);
+    final = visitor.call_child(*expr);
+    expr = build_expr(DataType::INT32);
+    final = visitor.call_child(*expr);
+    expr = build_expr(DataType::INT64);
+    final = visitor.call_child(*expr);
+    expr = build_expr(DataType::FLOAT);
+    final = visitor.call_child(*expr);
+    expr = build_expr(DataType::DOUBLE);
+    final = visitor.call_child(*expr);
+    std::cout << "end compare test" << std::endl;
+}
+
+TEST(Expr, TestMultiLogicalExprsOptimization) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto int64_fid = schema->AddDebugField("int64", DataType::INT64);
+    auto str1_fid = schema->AddDebugField("string1", DataType::VARCHAR);
+    schema->set_primary_field_id(str1_fid);
+
+    auto seg = CreateSealedSegment(schema);
+    size_t N = 10000;
+    auto raw_data = DataGen(schema, N);
+    auto fields = schema->get_fields();
+    for (auto field_data : raw_data.raw_->fields_data()) {
+        int64_t field_id = field_data.field_id();
+
+        auto info = FieldDataInfo(field_data.field_id(), N, "/tmp/a");
+        auto field_meta = fields.at(FieldId(field_id));
+        info.channel->push(
+            CreateFieldDataFromDataArray(N, &field_data, field_meta));
+        info.channel->close();
+
+        seg->LoadFieldData(FieldId(field_id), info);
+    }
+
+    ExecExprVisitor visitor(*seg, seg->get_row_count(), MAX_TIMESTAMP);
+    auto build_expr_with_optim = [&]() -> std::shared_ptr<query::Expr> {
+        ExprPtr child1_expr =
+            std::make_unique<query::UnaryRangeExprImpl<int64_t>>(
+                ColumnInfo(int64_fid, DataType::INT64),
+                proto::plan::OpType::LessThan,
+                -1,
+                proto::plan::GenericValue::ValCase::kInt64Val);
+        ExprPtr child2_expr =
+            std::make_unique<query::UnaryRangeExprImpl<int64_t>>(
+                ColumnInfo(int64_fid, DataType::INT64),
+                proto::plan::OpType::NotEqual,
+                100,
+                proto::plan::GenericValue::ValCase::kInt64Val);
+        return std::make_shared<query::LogicalBinaryExpr>(
+            LogicalBinaryExpr::OpType::LogicalAnd, child1_expr, child2_expr);
+    };
+    auto build_expr = [&]() -> std::shared_ptr<query::Expr> {
+        ExprPtr child1_expr =
+            std::make_unique<query::UnaryRangeExprImpl<int64_t>>(
+                ColumnInfo(int64_fid, DataType::INT64),
+                proto::plan::OpType::GreaterThan,
+                10,
+                proto::plan::GenericValue::ValCase::kInt64Val);
+        ExprPtr child2_expr =
+            std::make_unique<query::UnaryRangeExprImpl<int64_t>>(
+                ColumnInfo(int64_fid, DataType::INT64),
+                proto::plan::OpType::NotEqual,
+                100,
+                proto::plan::GenericValue::ValCase::kInt64Val);
+        return std::make_shared<query::LogicalBinaryExpr>(
+            LogicalBinaryExpr::OpType::LogicalAnd, child1_expr, child2_expr);
+    };
+    auto expr = build_expr_with_optim();
+    auto cost_op = 0;
+    for (int i = 0; i < 10; ++i) {
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*expr);
+        auto cost = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+        std::cout << "cost: " << cost << "us" << std::endl;
+        cost_op += cost;
+    }
+    cost_op = cost_op / 10.0;
+    std::cout << cost_op << std::endl;
+    expr = build_expr();
+    auto cost_no_op = 0;
+    for (int i = 0; i < 10; ++i) {
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*expr);
+        auto cost = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+        std::cout << "cost: " << cost << "us" << std::endl;
+        cost_no_op += cost;
+    }
+    cost_no_op = cost_no_op / 10.0;
+    std::cout << cost_no_op << std::endl;
+    ASSERT_LT(cost_op, cost_no_op);
+}
+
+TEST(Expr, TestExprs) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto int8_fid = schema->AddDebugField("int8", DataType::INT8);
+    auto int8_1_fid = schema->AddDebugField("int81", DataType::INT8);
+    auto int16_fid = schema->AddDebugField("int16", DataType::INT16);
+    auto int16_1_fid = schema->AddDebugField("int161", DataType::INT16);
+    auto int32_fid = schema->AddDebugField("int32", DataType::INT32);
+    auto int32_1_fid = schema->AddDebugField("int321", DataType::INT32);
+    auto int64_fid = schema->AddDebugField("int64", DataType::INT64);
+    auto int64_1_fid = schema->AddDebugField("int641", DataType::INT64);
+    auto str1_fid = schema->AddDebugField("string1", DataType::VARCHAR);
+    auto str2_fid = schema->AddDebugField("string2", DataType::VARCHAR);
+    auto float_fid = schema->AddDebugField("float", DataType::FLOAT);
+    auto double_fid = schema->AddDebugField("double", DataType::DOUBLE);
+    schema->set_primary_field_id(str1_fid);
+
+    auto seg = CreateSealedSegment(schema);
+    int N = 10000;
+    auto raw_data = DataGen(schema, N);
+
+    // load field data
+    auto fields = schema->get_fields();
+    for (auto field_data : raw_data.raw_->fields_data()) {
+        int64_t field_id = field_data.field_id();
+
+        auto info = FieldDataInfo(field_data.field_id(), N, "/tmp/a");
+        auto field_meta = fields.at(FieldId(field_id));
+        info.channel->push(
+            CreateFieldDataFromDataArray(N, &field_data, field_meta));
+        info.channel->close();
+
+        seg->LoadFieldData(FieldId(field_id), info);
+    }
+
+    ExecExprVisitor visitor(*seg, seg->get_row_count(), MAX_TIMESTAMP);
+
+    enum ExprType {
+        UnaryRangeExpr = 0,
+        TermExprImpl = 1,
+        CompareExpr = 2,
+        LogicalUnaryExpr = 3,
+        BinaryRangeExpr = 4,
+        LogicalBinaryExpr = 5,
+        BinaryArithOpEvalRangeExpr = 6,
+    };
+
+    auto build_expr = [&](enum ExprType test_type,
+                          int n) -> std::shared_ptr<query::Expr> {
+        switch (test_type) {
+            case UnaryRangeExpr:
+                return std::make_shared<query::UnaryRangeExprImpl<int8_t>>(
+                    ColumnInfo(int8_fid, DataType::INT8),
+                    proto::plan::OpType::GreaterThan,
+                    10,
+                    proto::plan::GenericValue::ValCase::kInt64Val);
+                break;
+            case TermExprImpl: {
+                std::vector<std::string> retrieve_ints;
+                for (int i = 0; i < n; ++i) {
+                    retrieve_ints.push_back("xxxxxx" + std::to_string(i % 10));
+                }
+                return std::make_shared<query::TermExprImpl<std::string>>(
+                    ColumnInfo(str1_fid, DataType::VARCHAR),
+                    retrieve_ints,
+                    proto::plan::GenericValue::ValCase::kStringVal);
+                // std::vector<double> retrieve_ints;
+                // for (int i = 0; i < n; ++i) {
+                //     retrieve_ints.push_back(i);
+                // }
+                // return std::make_shared<query::TermExprImpl<double>>(
+                //     ColumnInfo(double_fid, DataType::DOUBLE),
+                //     retrieve_ints,
+                //     proto::plan::GenericValue::ValCase::kFloatVal);
+                break;
+            }
+            case CompareExpr: {
+                auto compare_expr = std::make_shared<query::CompareExpr>();
+                compare_expr->op_type_ = OpType::LessThan;
+
+                compare_expr->left_data_type_ = DataType::INT8;
+                compare_expr->left_field_id_ = int8_fid;
+
+                compare_expr->right_data_type_ = DataType::INT8;
+                compare_expr->right_field_id_ = int8_1_fid;
+                return compare_expr;
+                break;
+            }
+            case BinaryRangeExpr: {
+                return std::make_shared<query::BinaryRangeExprImpl<int64_t>>(
+                    ColumnInfo(int64_fid, DataType::INT64),
+                    proto::plan::GenericValue::ValCase::kInt64Val,
+                    true,
+                    true,
+                    10,
+                    45);
+                break;
+            }
+            case LogicalUnaryExpr: {
+                ExprPtr child_expr =
+                    std::make_unique<query::UnaryRangeExprImpl<int32_t>>(
+                        ColumnInfo(int32_fid, DataType::INT32),
+                        proto::plan::OpType::GreaterThan,
+                        10,
+                        proto::plan::GenericValue::ValCase::kInt64Val);
+                return std::make_shared<query::LogicalUnaryExpr>(
+                    LogicalUnaryExpr::OpType::LogicalNot, child_expr);
+                break;
+            }
+            case LogicalBinaryExpr: {
+                ExprPtr child1_expr =
+                    std::make_unique<query::UnaryRangeExprImpl<int8_t>>(
+                        ColumnInfo(int8_fid, DataType::INT8),
+                        proto::plan::OpType::GreaterThan,
+                        10,
+                        proto::plan::GenericValue::ValCase::kInt64Val);
+                ExprPtr child2_expr =
+                    std::make_unique<query::UnaryRangeExprImpl<int8_t>>(
+                        ColumnInfo(int8_fid, DataType::INT8),
+                        proto::plan::OpType::NotEqual,
+                        10,
+                        proto::plan::GenericValue::ValCase::kInt64Val);
+                return std::make_shared<query::LogicalBinaryExpr>(
+                    LogicalBinaryExpr::OpType::LogicalXor,
+                    child1_expr,
+                    child2_expr);
+                break;
+            }
+            case BinaryArithOpEvalRangeExpr: {
+                return std::make_shared<
+                    query::BinaryArithOpEvalRangeExprImpl<int8_t>>(
+                    ColumnInfo(int8_fid, DataType::INT8),
+                    proto::plan::GenericValue::ValCase::kInt64Val,
+                    proto::plan::ArithOpType::Add,
+                    10,
+                    proto::plan::OpType::Equal,
+                    100);
+                break;
+            }
+            default:
+                return std::make_shared<query::BinaryRangeExprImpl<int64_t>>(
+                    ColumnInfo(int64_fid, DataType::INT64),
+                    proto::plan::GenericValue::ValCase::kInt64Val,
+                    true,
+                    true,
+                    10,
+                    45);
+                break;
+        }
+    };
+    auto test_case = [&](int n) {
+        auto expr = build_expr(TermExprImpl, n);
+        std::cout << "start test" << std::endl;
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*expr);
+        std::cout << n << "cost: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << "us" << std::endl;
+    };
+    test_case(3);
+    test_case(10);
+    test_case(20);
+    test_case(30);
+    test_case(50);
+    test_case(100);
+    test_case(200);
+    // test_case(500);
+}
+
+TEST(Expr, TestCompareWithScalarIndexMaris) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+    std::vector<
+        std::tuple<std::string, std::function<bool(std::string, std::string)>>>
+        testcases = {
+            {R"(LessThan)",
+             [](std::string a, std::string b) { return a.compare(b) < 0; }},
+            {R"(LessEqual)",
+             [](std::string a, std::string b) { return a.compare(b) <= 0; }},
+            {R"(GreaterThan)",
+             [](std::string a, std::string b) { return a.compare(b) > 0; }},
+            {R"(GreaterEqual)",
+             [](std::string a, std::string b) { return a.compare(b) >= 0; }},
+            {R"(Equal)",
+             [](std::string a, std::string b) { return a.compare(b) == 0; }},
+            {R"(NotEqual)",
+             [](std::string a, std::string b) { return a.compare(b) != 0; }},
+        };
 
     const char* serialized_expr_plan = R"(vector_anns: <
                                             field_id: %1%
@@ -712,7 +1717,8 @@ TEST(Expr, TestCompareWithScalarIndexMaris) {
      >)";
 
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto str1_fid = schema->AddDebugField("string1", DataType::VARCHAR);
     auto str2_fid = schema->AddDebugField("string2", DataType::VARCHAR);
     schema->set_primary_field_id(str1_fid);
@@ -744,10 +1750,12 @@ TEST(Expr, TestCompareWithScalarIndexMaris) {
 
     ExecExprVisitor visitor(*seg, seg->get_row_count(), MAX_TIMESTAMP);
     for (auto [clause, ref_func] : testcases) {
-        auto dsl_string =
-            boost::format(serialized_expr_plan) % vec_fid.get() % clause % str1_fid.get() % str2_fid.get();
-        auto binary_plan = translate_text_plan_to_binary_plan(dsl_string.str().data());
-        auto plan = CreateSearchPlanByExpr(*schema, binary_plan.data(), binary_plan.size());
+        auto dsl_string = boost::format(serialized_expr_plan) % vec_fid.get() %
+                          clause % str1_fid.get() % str2_fid.get();
+        auto binary_plan =
+            translate_text_plan_to_binary_plan(dsl_string.str().data());
+        auto plan = CreateSearchPlanByExpr(
+            *schema, binary_plan.data(), binary_plan.size());
         //         std::cout << ShowPlanNodeVisitor().call_child(*plan->plan_node_) << std::endl;
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N);
@@ -757,167 +1765,271 @@ TEST(Expr, TestCompareWithScalarIndexMaris) {
             auto val1 = str1_col[i];
             auto val2 = str2_col[i];
             auto ref = ref_func(val1, val2);
-            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << boost::format("[%1%, %2%]") % val1 % val2;
+            ASSERT_EQ(ans, ref) << clause << "@" << i << "!!"
+                                << boost::format("[%1%, %2%]") % val1 % val2;
         }
     }
 }
 
 TEST(Expr, TestBinaryArithOpEvalRange) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::vector<std::tuple<std::string, std::function<bool(int)>, DataType>> testcases = {
-        // Add test cases for BinaryArithOpEvalRangeExpr EQ of various data types
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": 4,
-                "value": 8
-            }
-        })",
-         [](int8_t v) { return (v + 4) == 8; }, DataType::INT8},
-        {R"("EQ": {
-            "SUB": {
-                "right_operand": 500,
-                "value": 1500
-            }
-        })",
-         [](int16_t v) { return (v - 500) == 1500; }, DataType::INT16},
-        {R"("EQ": {
-            "MUL": {
-                "right_operand": 2,
-                "value": 4000
-            }
-        })",
-         [](int32_t v) { return (v * 2) == 4000; }, DataType::INT32},
-        {R"("EQ": {
-            "DIV": {
-                "right_operand": 2,
-                "value": 1000
-            }
-        })",
-         [](int64_t v) { return (v / 2) == 1000; }, DataType::INT64},
-        {R"("EQ": {
-            "MOD": {
-                "right_operand": 100,
-                "value": 0
-            }
-        })",
-         [](int32_t v) { return (v % 100) == 0; }, DataType::INT32},
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": 500,
-                "value": 2500
-            }
-        })",
-         [](float v) { return (v + 500) == 2500; }, DataType::FLOAT},
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": 500,
-                "value": 2500
-            }
-        })",
-         [](double v) { return (v + 500) == 2500; }, DataType::DOUBLE},
-        // Add test cases for BinaryArithOpEvalRangeExpr NE of various data types
-        {R"("NE": {
-            "ADD": {
-                "right_operand": 500,
-                "value": 2500
-            }
-        })",
-         [](float v) { return (v + 500) != 2500; }, DataType::FLOAT},
-        {R"("NE": {
-            "SUB": {
-                "right_operand": 500,
-                "value": 2500
-            }
-        })",
-         [](double v) { return (v - 500) != 2500; }, DataType::DOUBLE},
-        {R"("NE": {
-            "MUL": {
-                "right_operand": 2,
-                "value": 2
-            }
-        })",
-         [](int8_t v) { return (v * 2) != 2; }, DataType::INT8},
-        {R"("NE": {
-            "DIV": {
-                "right_operand": 2,
-                "value": 1000
-            }
-        })",
-         [](int16_t v) { return (v / 2) != 1000; }, DataType::INT16},
-        {R"("NE": {
-            "MOD": {
-                "right_operand": 100,
-                "value": 0
-            }
-        })",
-         [](int32_t v) { return (v % 100) != 0; }, DataType::INT32},
-        {R"("NE": {
-            "ADD": {
-                "right_operand": 500,
-                "value": 2500
-            }
-        })",
-         [](int64_t v) { return (v + 500) != 2500; }, DataType::INT64},
-    };
+    std::vector<std::tuple<std::string, std::function<bool(int)>, DataType>>
+        testcases = {
+            // Add test cases for BinaryArithOpEvalRangeExpr EQ of various data types
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 101
+                    data_type: Int8
+                  >
+                  arith_op: Add
+                  right_operand: <
+                    int64_val: 4
+                  >
+                  op: Equal
+                  value: <
+                    int64_val: 8
+                  >
+             >)",
+             [](int8_t v) { return (v + 4) == 8; },
+             DataType::INT8},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 102
+                    data_type: Int16
+                  >
+                  arith_op: Sub
+                  right_operand: <
+                    int64_val: 500
+                  >
+                  op: Equal
+                  value: <
+                    int64_val: 1500
+                  >
+             >)",
+             [](int16_t v) { return (v - 500) == 1500; },
+             DataType::INT16},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 103
+                    data_type: Int32
+                  >
+                  arith_op: Mul
+                  right_operand: <
+                    int64_val: 2
+                  >
+                  op: Equal
+                  value: <
+                    int64_val: 4000
+                  >
+             >)",
+             [](int32_t v) { return (v * 2) == 4000; },
+             DataType::INT32},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 104
+                    data_type: Int64
+                  >
+                  arith_op: Div
+                  right_operand: <
+                    int64_val: 2
+                  >
+                  op: Equal
+                  value: <
+                    int64_val: 1000
+                  >
+             >)",
+             [](int64_t v) { return (v / 2) == 1000; },
+             DataType::INT64},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 103
+                    data_type: Int32
+                  >
+                  arith_op: Mod
+                  right_operand: <
+                    int64_val: 100
+                  >
+                  op: Equal
+                  value: <
+                    int64_val: 0
+                  >
+             >)",
+             [](int32_t v) { return (v % 100) == 0; },
+             DataType::INT32},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 105
+                    data_type: Float
+                  >
+                  arith_op: Add
+                  right_operand: <
+                    float_val: 500
+                  >
+                  op: Equal
+                  value: <
+                    float_val: 2500
+                  >
+             >)",
+             [](float v) { return (v + 500) == 2500; },
+             DataType::FLOAT},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 106
+                    data_type: Double
+                  >
+                  arith_op: Add
+                  right_operand: <
+                    float_val: 500
+                  >
+                  op: Equal
+                  value: <
+                    float_val: 2500
+                  >
+             >)",
+             [](double v) { return (v + 500) == 2500; },
+             DataType::DOUBLE},
+            // Add test cases for BinaryArithOpEvalRangeExpr NE of various data types
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 105
+                    data_type: Float
+                  >
+                  arith_op: Add
+                  right_operand: <
+                    float_val: 500
+                  >
+                  op: NotEqual
+                  value: <
+                    float_val: 2500
+                  >
+             >)",
+             [](float v) { return (v + 500) != 2500; },
+             DataType::FLOAT},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 106
+                    data_type: Double
+                  >
+                  arith_op: Sub
+                  right_operand: <
+                    float_val: 500
+                  >
+                  op: NotEqual
+                  value: <
+                    float_val: 2500
+                  >
+             >)",
+             [](double v) { return (v - 500) != 2500; },
+             DataType::DOUBLE},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 101
+                    data_type: Int8
+                  >
+                  arith_op: Mul
+                  right_operand: <
+                    int64_val: 2
+                  >
+                  op: NotEqual
+                  value: <
+                    int64_val: 2
+                  >
+             >)",
+             [](int8_t v) { return (v * 2) != 2; },
+             DataType::INT8},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 102
+                    data_type: Int16
+                  >
+                  arith_op: Div
+                  right_operand: <
+                    int64_val: 2
+                  >
+                  op: NotEqual
+                  value: <
+                    int64_val: 1000
+                  >
+             >)",
+             [](int16_t v) { return (v / 2) != 1000; },
+             DataType::INT16},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 103
+                    data_type: Int32
+                  >
+                  arith_op: Mod
+                  right_operand: <
+                    int64_val: 100
+                  >
+                  op: NotEqual
+                  value: <
+                    int64_val: 0
+                  >
+             >)",
+             [](int32_t v) { return (v % 100) != 0; },
+             DataType::INT32},
+            {R"(binary_arith_op_eval_range_expr: <
+                  column_info: <
+                    field_id: 104
+                    data_type: Int64
+                  >
+                  arith_op: Mod
+                  right_operand: <
+                    int64_val: 500
+                  >
+                  op: NotEqual
+                  value: <
+                    int64_val: 2500
+                  >
+             >)",
+             [](int64_t v) { return (v + 500) != 2500; },
+             DataType::INT64},
+        };
 
-    std::string dsl_string_tmp = R"({
-        "bool": {
-            "must": [
-                {
-                    "range": {
-                        @@@@@
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
-        }
-    })";
+    // std::string dsl_string_tmp = R"({
+    //     "bool": {
+    //         "must": [
+    //             {
+    //                 "range": {
+    //                     @@@@@
+    //                 }
+    //             },
+    //             {
+    //                 "vector": {
+    //                     "fakevec": {
+    //                         "metric_type": "L2",
+    //                         "params": {
+    //                             "nprobe": 10
+    //                         },
+    //                         "query": "$0",
+    //                         "topk": 10,
+    //                         "round_decimal": 3
+    //                     }
+    //                 }
+    //             }
+    //         ]
+    //     }
+    // })";
 
-    std::string dsl_string_int8 = R"(
-        "age8": {
-            @@@@
-        })";
-
-    std::string dsl_string_int16 = R"(
-        "age16": {
-            @@@@
-        })";
-
-    std::string dsl_string_int32 = R"(
-        "age32": {
-            @@@@
-        })";
-
-    std::string dsl_string_int64 = R"(
-        "age64": {
-            @@@@
-        })";
-
-    std::string dsl_string_float = R"(
-        "age_float": {
-            @@@@
-        })";
-
-    std::string dsl_string_double = R"(
-        "age_double": {
-            @@@@
-        })";
-
+    std::string raw_plan_tmp = R"(vector_anns: <
+                                    field_id: 100
+                                    predicates: <
+                                      @@@@@
+                                    >
+                                    query_info: <
+                                      topk: 10
+                                      round_decimal: 3
+                                      metric_type: "L2"
+                                      search_params: "{\"nprobe\": 10}"
+                                    >
+                                    placeholder_tag: "$0"
+     >)";
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto i8_fid = schema->AddDebugField("age8", DataType::INT8);
     auto i16_fid = schema->AddDebugField("age16", DataType::INT16);
     auto i32_fid = schema->AddDebugField("age32", DataType::INT32);
@@ -926,7 +2038,7 @@ TEST(Expr, TestBinaryArithOpEvalRange) {
     auto double_fid = schema->AddDebugField("age_double", DataType::DOUBLE);
     schema->set_primary_field_id(i64_fid);
 
-    auto seg = CreateGrowingSegment(schema);
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
     int N = 1000;
     std::vector<int8_t> age8_col;
     std::vector<int16_t> age16_col;
@@ -934,7 +2046,7 @@ TEST(Expr, TestBinaryArithOpEvalRange) {
     std::vector<int64_t> age64_col;
     std::vector<float> age_float_col;
     std::vector<double> age_double_col;
-    int num_iters = 100;
+    int num_iters = 1;
     for (int iter = 0; iter < num_iters; ++iter) {
         auto raw_data = DataGen(schema, N, iter);
 
@@ -945,40 +2057,56 @@ TEST(Expr, TestBinaryArithOpEvalRange) {
         auto new_age_float_col = raw_data.get_col<float>(float_fid);
         auto new_age_double_col = raw_data.get_col<double>(double_fid);
 
-        age8_col.insert(age8_col.end(), new_age8_col.begin(), new_age8_col.end());
-        age16_col.insert(age16_col.end(), new_age16_col.begin(), new_age16_col.end());
-        age32_col.insert(age32_col.end(), new_age32_col.begin(), new_age32_col.end());
-        age64_col.insert(age64_col.end(), new_age64_col.begin(), new_age64_col.end());
-        age_float_col.insert(age_float_col.end(), new_age_float_col.begin(), new_age_float_col.end());
-        age_double_col.insert(age_double_col.end(), new_age_double_col.begin(), new_age_double_col.end());
+        age8_col.insert(
+            age8_col.end(), new_age8_col.begin(), new_age8_col.end());
+        age16_col.insert(
+            age16_col.end(), new_age16_col.begin(), new_age16_col.end());
+        age32_col.insert(
+            age32_col.end(), new_age32_col.begin(), new_age32_col.end());
+        age64_col.insert(
+            age64_col.end(), new_age64_col.begin(), new_age64_col.end());
+        age_float_col.insert(age_float_col.end(),
+                             new_age_float_col.begin(),
+                             new_age_float_col.end());
+        age_double_col.insert(age_double_col.end(),
+                              new_age_double_col.begin(),
+                              new_age_double_col.end());
 
         seg->PreInsert(N);
-        seg->Insert(iter * N, N, raw_data.row_ids_.data(), raw_data.timestamps_.data(), raw_data.raw_);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
     }
 
     auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
-    ExecExprVisitor visitor(*seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
     for (auto [clause, ref_func, dtype] : testcases) {
-        auto loc = dsl_string_tmp.find("@@@@@");
-        auto dsl_string = dsl_string_tmp;
-        if (dtype == DataType::INT8) {
-            dsl_string.replace(loc, 5, dsl_string_int8);
-        } else if (dtype == DataType::INT16) {
-            dsl_string.replace(loc, 5, dsl_string_int16);
-        } else if (dtype == DataType::INT32) {
-            dsl_string.replace(loc, 5, dsl_string_int32);
-        } else if (dtype == DataType::INT64) {
-            dsl_string.replace(loc, 5, dsl_string_int64);
-        } else if (dtype == DataType::FLOAT) {
-            dsl_string.replace(loc, 5, dsl_string_float);
-        } else if (dtype == DataType::DOUBLE) {
-            dsl_string.replace(loc, 5, dsl_string_double);
-        } else {
-            ASSERT_TRUE(false) << "No test case defined for this data type";
-        }
-        loc = dsl_string.find("@@@@");
-        dsl_string.replace(loc, 4, clause);
-        auto plan = CreatePlan(*schema, dsl_string);
+        auto loc = raw_plan_tmp.find("@@@@@");
+        auto raw_plan = raw_plan_tmp;
+        raw_plan.replace(loc, 5, clause);
+        // if (dtype == DataType::INT8) {
+        //     dsl_string.replace(loc, 5, dsl_string_int8);
+        // } else if (dtype == DataType::INT16) {
+        //     dsl_string.replace(loc, 5, dsl_string_int16);
+        // } else if (dtype == DataType::INT32) {
+        //     dsl_string.replace(loc, 5, dsl_string_int32);
+        // } else if (dtype == DataType::INT64) {
+        //     dsl_string.replace(loc, 5, dsl_string_int64);
+        // } else if (dtype == DataType::FLOAT) {
+        //     dsl_string.replace(loc, 5, dsl_string_float);
+        // } else if (dtype == DataType::DOUBLE) {
+        //     dsl_string.replace(loc, 5, dsl_string_double);
+        // } else {
+        //     ASSERT_TRUE(false) << "No test case defined for this data type";
+        // }
+        // loc = dsl_string.find("@@@@");
+        // dsl_string.replace(loc, 4, clause);
+        auto plan_str = translate_text_plan_to_binary_plan(raw_plan.c_str());
+        auto plan =
+            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N * num_iters);
 
@@ -1015,137 +2143,222 @@ TEST(Expr, TestBinaryArithOpEvalRange) {
     }
 }
 
-TEST(Expr, TestBinaryArithOpEvalRangeExceptions) {
+TEST(Expr, TestBinaryArithOpEvalRangeJSON) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::vector<std::tuple<std::string, std::string, DataType>> testcases = {
-        // Add test for data type mismatch
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": 500,
-                "value": 2500.00
-            }
-        })",
-         "Assert \"(value.is_number_integer())\"", DataType::INT32},
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": 500.0,
-                "value": 2500
-            }
-        })",
-         "Assert \"(right_operand.is_number_integer())\"", DataType::INT32},
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": 500.0,
-                "value": true
-            }
-        })",
-         "Assert \"(value.is_number())\"", DataType::FLOAT},
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": "500",
-                "value": 2500.0
-            }
-        })",
-         "Assert \"(right_operand.is_number())\"", DataType::FLOAT},
-        // Check unsupported arithmetic operator type
-        {R"("EQ": {
-            "EXP": {
-                "right_operand": 500,
-                "value": 2500
-            }
-        })",
-         "arith op(exp) not found", DataType::INT32},
-        // Check unsupported data type
-        {R"("EQ": {
-            "ADD": {
-                "right_operand": true,
-                "value": false
-            }
-        })",
-         "bool type is not supported", DataType::BOOL},
+
+    struct Testcase {
+        int64_t right_operand;
+        int64_t value;
+        OpType op;
+        std::vector<std::string> nested_path;
+    };
+    std::vector<Testcase> testcases{
+        {10, 20, OpType::Equal, {"int"}},
+        {20, 30, OpType::Equal, {"int"}},
+        {30, 40, OpType::NotEqual, {"int"}},
+        {40, 50, OpType::NotEqual, {"int"}},
+        {10, 20, OpType::Equal, {"double"}},
+        {20, 30, OpType::Equal, {"double"}},
+        {30, 40, OpType::NotEqual, {"double"}},
+        {40, 50, OpType::NotEqual, {"double"}},
     };
 
-    std::string dsl_string_tmp = R"({
-        "bool": {
-            "must": [
-                {
-                    "range": {
-                        @@@@@
-                    }
-                },
-                {
-                    "vector": {
-                        "fakevec": {
-                            "metric_type": "L2",
-                            "params": {
-                                "nprobe": 10
-                            },
-                            "query": "$0",
-                            "topk": 10,
-                            "round_decimal": 3
-                        }
-                    }
-                }
-            ]
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    for (auto testcase : testcases) {
+        auto check = [&](int64_t value) {
+            if (testcase.op == OpType::Equal) {
+                return value + testcase.right_operand == testcase.value;
+            }
+            return value + testcase.right_operand != testcase.value;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<BinaryArithOpEvalRangeExprImpl<int64_t>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                proto::plan::GenericValue::ValCase::kInt64Val,
+                ArithOpType::Add,
+                testcase.right_operand,
+                testcase.op,
+                testcase.value);
+        auto final = visitor.call_child(*plan.predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+
+            if (testcase.nested_path[0] == "int") {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<int64_t>(pointer)
+                               .value();
+                auto ref = check(val);
+                ASSERT_EQ(ans, ref) << testcase.value << " " << val;
+            } else {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<double>(pointer)
+                               .value();
+                auto ref = check(val);
+                ASSERT_EQ(ans, ref) << testcase.value << " " << val;
+            }
         }
-    })";
+    }
+}
 
-    std::string dsl_string_int = R"(
-        "age": {
-            @@@@
-        })";
+TEST(Expr, TestBinaryArithOpEvalRangeJSONFloat) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
 
-    std::string dsl_string_num = R"(
-        "FloatN": {
-            @@@@
-        })";
-
-    std::string dsl_string_bool = R"(
-        "BoolField": {
-            @@@@
-        })";
+    struct Testcase {
+        double right_operand;
+        double value;
+        OpType op;
+        std::vector<std::string> nested_path;
+    };
+    std::vector<Testcase> testcases{
+        {10, 20, OpType::Equal, {"double"}},
+        {20, 30, OpType::Equal, {"double"}},
+        {30, 40, OpType::NotEqual, {"double"}},
+        {40, 50, OpType::NotEqual, {"double"}},
+        {10, 20, OpType::Equal, {"int"}},
+        {20, 30, OpType::Equal, {"int"}},
+        {30, 40, OpType::NotEqual, {"int"}},
+        {40, 50, OpType::NotEqual, {"int"}},
+    };
 
     auto schema = std::make_shared<Schema>();
-    schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
-    schema->AddDebugField("age", DataType::INT32);
-    schema->AddDebugField("FloatN", DataType::FLOAT);
-    schema->AddDebugField("BoolField", DataType::BOOL);
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
 
-    for (auto [clause, assert_info, dtype] : testcases) {
-        auto loc = dsl_string_tmp.find("@@@@@");
-        auto dsl_string = dsl_string_tmp;
-        if (dtype == DataType::INT32) {
-            dsl_string.replace(loc, 5, dsl_string_int);
-        } else if (dtype == DataType::FLOAT) {
-            dsl_string.replace(loc, 5, dsl_string_num);
-        } else if (dtype == DataType::BOOL) {
-            dsl_string.replace(loc, 5, dsl_string_bool);
-        } else {
-            ASSERT_TRUE(false) << "No test case defined for this data type";
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    for (auto testcase : testcases) {
+        auto check = [&](double value) {
+            if (testcase.op == OpType::Equal) {
+                return value + testcase.right_operand == testcase.value;
+            }
+            return value + testcase.right_operand != testcase.value;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<BinaryArithOpEvalRangeExprImpl<double>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                proto::plan::GenericValue::ValCase::kFloatVal,
+                ArithOpType::Add,
+                testcase.right_operand,
+                testcase.op,
+                testcase.value);
+        auto final = visitor.call_child(*plan.predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+
+            auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                           .template at<double>(pointer)
+                           .value();
+            auto ref = check(val);
+            ASSERT_EQ(ans, ref) << testcase.value << " " << val;
         }
+    }
 
-        loc = dsl_string.find("@@@@");
-        dsl_string.replace(loc, 4, clause);
+    std::vector<Testcase> array_testcases{
+        {0, 3, OpType::Equal, {"array"}},
+        {0, 5, OpType::NotEqual, {"array"}},
+    };
 
-        try {
-            auto plan = CreatePlan(*schema, dsl_string);
-            FAIL() << "Expected AssertionError: " << assert_info << " not thrown";
-        } catch (const std::exception& err) {
-            std::string err_msg = err.what();
-            ASSERT_TRUE(err_msg.find(assert_info) != std::string::npos);
-        } catch (...) {
-            FAIL() << "Expected AssertionError: " << assert_info << " not thrown";
+    for (auto testcase : array_testcases) {
+        auto check = [&](int64_t value) {
+            if (testcase.op == OpType::Equal) {
+                return value == testcase.value;
+            }
+            return value != testcase.value;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<BinaryArithOpEvalRangeExprImpl<int64_t>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                proto::plan::GenericValue::ValCase::kInt64Val,
+                ArithOpType::ArrayLength,
+                testcase.right_operand,
+                testcase.op,
+                testcase.value);
+        auto final = visitor.call_child(*plan.predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+
+            auto json = milvus::Json(simdjson::padded_string(json_col[i]));
+            int64_t array_length = 0;
+            auto doc = json.doc();
+            auto array = doc.at_pointer(pointer).get_array();
+            if (!array.error()) {
+                array_length = array.count_elements();
+            }
+            auto ref = check(array_length);
+            ASSERT_EQ(ans, ref) << testcase.value << " " << array_length;
         }
     }
 }
 
 TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
+    using namespace milvus;
     using namespace milvus::query;
     using namespace milvus::segcore;
-    std::vector<std::tuple<std::string, std::function<bool(int)>, DataType>> testcases = {
-        // Add test cases for BinaryArithOpEvalRangeExpr EQ of various data types
-        {R"(arith_op: Add
+    std::vector<std::tuple<std::string, std::function<bool(int)>, DataType>>
+        testcases = {
+            // Add test cases for BinaryArithOpEvalRangeExpr EQ of various data types
+            {R"(arith_op: Add
             right_operand: <
                 int64_val: 4
             >
@@ -1153,8 +2366,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 8
             >)",
-         [](int8_t v) { return (v + 4) == 8; }, DataType::INT8},
-        {R"(arith_op: Sub
+             [](int8_t v) { return (v + 4) == 8; },
+             DataType::INT8},
+            {R"(arith_op: Sub
             right_operand: <
                 int64_val: 500
             >
@@ -1162,8 +2376,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 1500
             >)",
-         [](int16_t v) { return (v - 500) == 1500; }, DataType::INT16},
-        {R"(arith_op: Mul
+             [](int16_t v) { return (v - 500) == 1500; },
+             DataType::INT16},
+            {R"(arith_op: Mul
             right_operand: <
                 int64_val: 2
             >
@@ -1171,8 +2386,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 4000
             >)",
-         [](int32_t v) { return (v * 2) == 4000; }, DataType::INT32},
-        {R"(arith_op: Div
+             [](int32_t v) { return (v * 2) == 4000; },
+             DataType::INT32},
+            {R"(arith_op: Div
             right_operand: <
                 int64_val: 2
             >
@@ -1180,8 +2396,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 1000
             >)",
-         [](int64_t v) { return (v / 2) == 1000; }, DataType::INT64},
-        {R"(arith_op: Mod
+             [](int64_t v) { return (v / 2) == 1000; },
+             DataType::INT64},
+            {R"(arith_op: Mod
             right_operand: <
                 int64_val: 100
             >
@@ -1189,8 +2406,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 0
             >)",
-         [](int32_t v) { return (v % 100) == 0; }, DataType::INT32},
-        {R"(arith_op: Add
+             [](int32_t v) { return (v % 100) == 0; },
+             DataType::INT32},
+            {R"(arith_op: Add
             right_operand: <
                 float_val: 500
             >
@@ -1198,8 +2416,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 float_val: 2500
             >)",
-         [](float v) { return (v + 500) == 2500; }, DataType::FLOAT},
-        {R"(arith_op: Add
+             [](float v) { return (v + 500) == 2500; },
+             DataType::FLOAT},
+            {R"(arith_op: Add
             right_operand: <
                 float_val: 500
             >
@@ -1207,8 +2426,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 float_val: 2500
             >)",
-         [](double v) { return (v + 500) == 2500; }, DataType::DOUBLE},
-        {R"(arith_op: Add
+             [](double v) { return (v + 500) == 2500; },
+             DataType::DOUBLE},
+            {R"(arith_op: Add
             right_operand: <
                 float_val: 500
             >
@@ -1216,8 +2436,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 float_val: 2000
             >)",
-         [](float v) { return (v + 500) != 2000; }, DataType::FLOAT},
-        {R"(arith_op: Sub
+             [](float v) { return (v + 500) != 2000; },
+             DataType::FLOAT},
+            {R"(arith_op: Sub
             right_operand: <
                 float_val: 500
             >
@@ -1225,8 +2446,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 float_val: 2500
             >)",
-         [](double v) { return (v - 500) != 2000; }, DataType::DOUBLE},
-        {R"(arith_op: Mul
+             [](double v) { return (v - 500) != 2000; },
+             DataType::DOUBLE},
+            {R"(arith_op: Mul
             right_operand: <
                 int64_val: 2
             >
@@ -1234,8 +2456,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 2
             >)",
-         [](int8_t v) { return (v * 2) != 2; }, DataType::INT8},
-        {R"(arith_op: Div
+             [](int8_t v) { return (v * 2) != 2; },
+             DataType::INT8},
+            {R"(arith_op: Div
             right_operand: <
                 int64_val: 2
             >
@@ -1243,8 +2466,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 2000
             >)",
-         [](int16_t v) { return (v / 2) != 2000; }, DataType::INT16},
-        {R"(arith_op: Mod
+             [](int16_t v) { return (v / 2) != 2000; },
+             DataType::INT16},
+            {R"(arith_op: Mod
             right_operand: <
                 int64_val: 100
             >
@@ -1252,8 +2476,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 1
             >)",
-         [](int32_t v) { return (v % 100) != 1; }, DataType::INT32},
-        {R"(arith_op: Add
+             [](int32_t v) { return (v % 100) != 1; },
+             DataType::INT32},
+            {R"(arith_op: Add
             right_operand: <
                 int64_val: 500
             >
@@ -1261,8 +2486,9 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             value: <
                 int64_val: 2000
             >)",
-         [](int64_t v) { return (v + 500) != 2000; }, DataType::INT64},
-    };
+             [](int64_t v) { return (v + 500) != 2000; },
+             DataType::INT64},
+        };
 
     std::string serialized_expr_plan = R"(vector_anns: <
                                             field_id: %1%
@@ -1288,7 +2514,8 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
     @@@@)";
 
     auto schema = std::make_shared<Schema>();
-    auto vec_fid = schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
     auto i8_fid = schema->AddDebugField("age8", DataType::INT8);
     auto i16_fid = schema->AddDebugField("age16", DataType::INT16);
     auto i32_fid = schema->AddDebugField("age32", DataType::INT32);
@@ -1369,7 +2596,8 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
     seg->LoadIndex(load_index_info);
 
     auto seg_promote = dynamic_cast<SegmentSealedImpl*>(seg.get());
-    ExecExprVisitor visitor(*seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
     int offset = 0;
     for (auto [clause, ref_func, dtype] : testcases) {
         auto loc = serialized_expr_plan.find("@@@@@");
@@ -1400,8 +2628,10 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             ASSERT_TRUE(false) << "No test case defined for this data type";
         }
 
-        auto binary_plan = translate_text_plan_to_binary_plan(expr.str().data());
-        auto plan = CreateSearchPlanByExpr(*schema, binary_plan.data(), binary_plan.size());
+        auto binary_plan =
+            translate_text_plan_to_binary_plan(expr.str().data());
+        auto plan = CreateSearchPlanByExpr(
+            *schema, binary_plan.data(), binary_plan.size());
 
         auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
         EXPECT_EQ(final.size(), N);
@@ -1435,6 +2665,1827 @@ TEST(Expr, TestBinaryArithOpEvalRangeWithScalarSortIndex) {
             } else {
                 ASSERT_TRUE(false) << "No test case defined for this data type";
             }
+        }
+    }
+}
+
+TEST(Expr, TestUnaryRangeWithJSON) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+    std::vector<
+        std::tuple<std::string,
+                   std::function<bool(
+                       std::variant<int64_t, bool, double, std::string_view>)>,
+                   DataType>>
+        testcases = {
+            {R"(op: Equal
+                        value: <
+                            bool_val: true
+                        >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return std::get<bool>(v);
+             },
+             DataType::BOOL},
+            {R"(op: LessEqual
+                        value: <
+                            int64_val: 1500
+                        >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return std::get<int64_t>(v) < 1500;
+             },
+             DataType::INT64},
+            {R"(op: LessEqual
+                        value: <
+                            float_val: 4000
+                        >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return std::get<double>(v) <= 4000;
+             },
+             DataType::DOUBLE},
+            {R"(op: GreaterThan
+                        value: <
+                            float_val: 1000
+                        >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return std::get<double>(v) > 1000;
+             },
+             DataType::DOUBLE},
+            {R"(op: GreaterEqual
+                        value: <
+                            int64_val: 0
+                        >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return std::get<int64_t>(v) >= 0;
+             },
+             DataType::INT64},
+            {R"(op: NotEqual
+                        value: <
+                            bool_val: true
+                        >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return !std::get<bool>(v);
+             },
+             DataType::BOOL},
+            {R"(op: Equal
+            value: <
+                string_val: "test"
+            >)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return std::get<std::string_view>(v) == "test";
+             },
+             DataType::STRING},
+        };
+
+    std::string serialized_expr_plan = R"(vector_anns: <
+                                            field_id: %1%
+                                            predicates: <
+                                                unary_range_expr: <
+                                                    @@@@@
+                                                >
+                                            >
+                                            query_info: <
+                                                topk: 10
+                                                round_decimal: 3
+                                                metric_type: "L2"
+                                                search_params: "{\"nprobe\": 10}"
+                                            >
+                                            placeholder_tag: "$0"
+     >)";
+
+    std::string arith_expr = R"(
+    column_info: <
+        field_id: %2%
+        data_type: %3%
+        nested_path:"%4%"
+    >
+    @@@@)";
+
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto i64_fid = schema->AddDebugField("age64", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    int offset = 0;
+    for (auto [clause, ref_func, dtype] : testcases) {
+        auto loc = serialized_expr_plan.find("@@@@@");
+        auto expr_plan = serialized_expr_plan;
+        expr_plan.replace(loc, 5, arith_expr);
+        loc = expr_plan.find("@@@@");
+        expr_plan.replace(loc, 4, clause);
+        boost::format expr;
+        switch (dtype) {
+            case DataType::BOOL: {
+                expr =
+                    boost::format(expr_plan) % vec_fid.get() % json_fid.get() %
+                    proto::schema::DataType_Name(int(DataType::JSON)) % "bool";
+                break;
+            }
+            case DataType::INT64: {
+                expr =
+                    boost::format(expr_plan) % vec_fid.get() % json_fid.get() %
+                    proto::schema::DataType_Name(int(DataType::JSON)) % "int";
+                break;
+            }
+            case DataType::DOUBLE: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "double";
+                break;
+            }
+            case DataType::STRING: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "string";
+                break;
+            }
+            default: {
+                ASSERT_TRUE(false) << "No test case defined for this data type";
+            }
+        }
+
+        auto unary_plan = translate_text_plan_to_binary_plan(expr.str().data());
+        auto plan = CreateSearchPlanByExpr(
+            *schema, unary_plan.data(), unary_plan.size());
+
+        auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            if (dtype == DataType::BOOL) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<bool>("/bool")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::INT64) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<int64_t>("/int")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::DOUBLE) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<double>("/double")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::STRING) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<std::string_view>("/string")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else {
+                ASSERT_TRUE(false) << "No test case defined for this data type";
+            }
+        }
+    }
+}
+
+TEST(Expr, TestTermWithJSON) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+    std::vector<
+        std::tuple<std::string,
+                   std::function<bool(
+                       std::variant<int64_t, bool, double, std::string_view>)>,
+                   DataType>>
+        testcases = {
+            {R"(values: <bool_val: true>)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 std::unordered_set<bool> term_set;
+                 term_set = {true, false};
+                 return term_set.find(std::get<bool>(v)) != term_set.end();
+             },
+             DataType::BOOL},
+            {R"(values: <int64_val: 1500>, values: <int64_val: 2048>, values: <int64_val: 3216>)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 std::unordered_set<int64_t> term_set;
+                 term_set = {1500, 2048, 3216};
+                 return term_set.find(std::get<int64_t>(v)) != term_set.end();
+             },
+             DataType::INT64},
+            {R"(values: <float_val: 1500.0>, values: <float_val: 4000>, values: <float_val: 235.14>)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 std::unordered_set<double> term_set;
+                 term_set = {1500.0, 4000, 235.14};
+                 return term_set.find(std::get<double>(v)) != term_set.end();
+             },
+             DataType::DOUBLE},
+            {R"(values: <string_val: "aaa">, values: <string_val: "abc">, values: <string_val: "235.14">)",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 std::unordered_set<std::string_view> term_set;
+                 term_set = {"aaa", "abc", "235.14"};
+                 return term_set.find(std::get<std::string_view>(v)) !=
+                        term_set.end();
+             },
+             DataType::STRING},
+            {R"()",
+             [](std::variant<int64_t, bool, double, std::string_view> v) {
+                 return false;
+             },
+             DataType::INT64},
+        };
+
+    std::string serialized_expr_plan = R"(vector_anns: <
+                                            field_id: %1%
+                                            predicates: <
+                                                term_expr: <
+                                                    @@@@@
+                                                >
+                                            >
+                                            query_info: <
+                                                topk: 10
+                                                round_decimal: 3
+                                                metric_type: "L2"
+                                                search_params: "{\"nprobe\": 10}"
+                                            >
+                                            placeholder_tag: "$0"
+     >)";
+
+    std::string arith_expr = R"(
+    column_info: <
+        field_id: %2%
+        data_type: %3%
+        nested_path:"%4%"
+    >
+    @@@@)";
+
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto i64_fid = schema->AddDebugField("age64", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    int offset = 0;
+    for (auto [clause, ref_func, dtype] : testcases) {
+        auto loc = serialized_expr_plan.find("@@@@@");
+        auto expr_plan = serialized_expr_plan;
+        expr_plan.replace(loc, 5, arith_expr);
+        loc = expr_plan.find("@@@@");
+        expr_plan.replace(loc, 4, clause);
+        boost::format expr;
+        switch (dtype) {
+            case DataType::BOOL: {
+                expr =
+                    boost::format(expr_plan) % vec_fid.get() % json_fid.get() %
+                    proto::schema::DataType_Name(int(DataType::JSON)) % "bool";
+                break;
+            }
+            case DataType::INT64: {
+                expr =
+                    boost::format(expr_plan) % vec_fid.get() % json_fid.get() %
+                    proto::schema::DataType_Name(int(DataType::JSON)) % "int";
+                break;
+            }
+            case DataType::DOUBLE: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "double";
+                break;
+            }
+            case DataType::STRING: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "string";
+                break;
+            }
+            default: {
+                ASSERT_TRUE(false) << "No test case defined for this data type";
+            }
+        }
+
+        auto unary_plan = translate_text_plan_to_binary_plan(expr.str().data());
+        auto plan = CreateSearchPlanByExpr(
+            *schema, unary_plan.data(), unary_plan.size());
+
+        auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            if (dtype == DataType::BOOL) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<bool>("/bool")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::INT64) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<int64_t>("/int")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::DOUBLE) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<double>("/double")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::STRING) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .template at<std::string_view>("/string")
+                               .value();
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else {
+                ASSERT_TRUE(false) << "No test case defined for this data type";
+            }
+        }
+    }
+}
+
+TEST(Expr, TestExistsWithJSON) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+    std::vector<std::tuple<std::string, std::function<bool(bool)>, DataType>>
+        testcases = {
+            {R"()", [](bool v) { return v; }, DataType::BOOL},
+            {R"()", [](bool v) { return v; }, DataType::INT64},
+            {R"()", [](bool v) { return v; }, DataType::STRING},
+            {R"()", [](bool v) { return v; }, DataType::VARCHAR},
+            {R"()", [](bool v) { return v; }, DataType::DOUBLE},
+        };
+
+    std::string serialized_expr_plan = R"(vector_anns: <
+                                            field_id: %1%
+                                            predicates: <
+                                                exists_expr: <
+                                                    @@@@@
+                                                >
+                                            >
+                                            query_info: <
+                                                topk: 10
+                                                round_decimal: 3
+                                                metric_type: "L2"
+                                                search_params: "{\"nprobe\": 10}"
+                                            >
+                                            placeholder_tag: "$0"
+     >)";
+
+    std::string arith_expr = R"(
+    info: <
+        field_id: %2%
+        data_type: %3%
+        nested_path:"%4%"
+    >
+    @@@@)";
+
+    auto schema = std::make_shared<Schema>();
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+    auto i64_fid = schema->AddDebugField("age64", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGen(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+    int offset = 0;
+    for (auto [clause, ref_func, dtype] : testcases) {
+        auto loc = serialized_expr_plan.find("@@@@@");
+        auto expr_plan = serialized_expr_plan;
+        expr_plan.replace(loc, 5, arith_expr);
+        loc = expr_plan.find("@@@@");
+        expr_plan.replace(loc, 4, clause);
+        boost::format expr;
+        switch (dtype) {
+            case DataType::BOOL: {
+                expr =
+                    boost::format(expr_plan) % vec_fid.get() % json_fid.get() %
+                    proto::schema::DataType_Name(int(DataType::JSON)) % "bool";
+                break;
+            }
+            case DataType::INT64: {
+                expr =
+                    boost::format(expr_plan) % vec_fid.get() % json_fid.get() %
+                    proto::schema::DataType_Name(int(DataType::JSON)) % "int";
+                break;
+            }
+            case DataType::DOUBLE: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "double";
+                break;
+            }
+            case DataType::STRING: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "string";
+                break;
+            }
+            case DataType::VARCHAR: {
+                expr = boost::format(expr_plan) % vec_fid.get() %
+                       json_fid.get() %
+                       proto::schema::DataType_Name(int(DataType::JSON)) %
+                       "varchar";
+                break;
+            }
+            default: {
+                ASSERT_TRUE(false) << "No test case defined for this data type";
+            }
+        }
+
+        auto unary_plan = translate_text_plan_to_binary_plan(expr.str().data());
+        auto plan = CreateSearchPlanByExpr(
+            *schema, unary_plan.data(), unary_plan.size());
+
+        auto final = visitor.call_child(*plan->plan_node_->predicate_.value());
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            if (dtype == DataType::BOOL) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .exist("/bool");
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::INT64) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .exist("/int");
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::DOUBLE) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .exist("/double");
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::STRING) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .exist("/string");
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else if (dtype == DataType::VARCHAR) {
+                auto val = milvus::Json(simdjson::padded_string(json_col[i]))
+                               .exist("/varchar");
+                auto ref = ref_func(val);
+                ASSERT_EQ(ans, ref) << clause << "@" << i << "!!" << val;
+            } else {
+                ASSERT_TRUE(false) << "No test case defined for this data type";
+            }
+        }
+    }
+}
+
+template <typename T>
+struct Testcase {
+    std::vector<T> term;
+    std::vector<std::string> nested_path;
+    bool res;
+};
+
+TEST(Expr, TestTermInFieldJson) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGenForJsonArray(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+
+    std::vector<Testcase<bool>> bool_testcases{{{true}, {"bool"}},
+                                               {{false}, {"bool"}}};
+
+    for (auto testcase : bool_testcases) {
+        auto check = [&](const std::vector<bool>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<TermExprImpl<bool>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            proto::plan::GenericValue::ValCase::kBoolVal,
+            true);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        // std::cout << "cost"
+        //           << std::chrono::duration_cast<std::chrono::microseconds>(
+        //                  std::chrono::steady_clock::now() - start)
+        //                  .count()
+        //           << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<bool> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<bool>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<double>> double_testcases{
+        {{1.123}, {"double"}},
+        {{10.34}, {"double"}},
+        {{100.234}, {"double"}},
+        {{1000.4546}, {"double"}},
+    };
+
+    for (auto testcase : double_testcases) {
+        auto check = [&](const std::vector<double>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<TermExprImpl<double>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            proto::plan::GenericValue::ValCase::kFloatVal,
+            true);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<double> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<double>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<int64_t>> testcases{
+        {{1}, {"int"}},
+        {{10}, {"int"}},
+        {{100}, {"int"}},
+        {{1000}, {"int"}},
+    };
+
+    for (auto testcase : testcases) {
+        auto check = [&](const std::vector<int64_t>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<TermExprImpl<int64_t>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            proto::plan::GenericValue::ValCase::kInt64Val,
+            true);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<int64_t> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<int64_t>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<std::string>> testcases_string = {
+        {{"1sads"}, {"string"}},
+        {{"10dsf"}, {"string"}},
+        {{"100"}, {"string"}},
+        {{"100ddfdsssdfdsfsd0"}, {"string"}},
+    };
+
+    for (auto testcase : testcases_string) {
+        auto check = [&](const std::vector<std::string_view>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<TermExprImpl<std::string>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            proto::plan::GenericValue::ValCase::kStringVal,
+            true);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<std::string_view> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<std::string_view>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+}
+
+TEST(Expr, PraseJsonContainsExpr) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    std::vector<const char*> raw_plans{
+        R"(vector_anns:<
+            field_id:100
+            predicates:<
+                json_contains_expr:<
+                    column_info:<
+                        field_id:101
+                        data_type:JSON
+                        nested_path:"A"
+                    >
+                    elements:<int64_val:1 > elements:<int64_val:2 > elements:<int64_val:3 >
+                    op:ContainsAny
+                    elements_same_type:true
+                >
+            >
+            query_info:<
+                topk: 10
+                round_decimal: 3
+                metric_type: "L2"
+                search_params: "{\"nprobe\": 10}"
+            > placeholder_tag:"$0"
+        >)",
+        R"(vector_anns:<
+            field_id:100
+            predicates:<
+                json_contains_expr:<
+                    column_info:<
+                        field_id:101
+                        data_type:JSON
+                        nested_path:"A"
+                    >
+                    elements:<int64_val:1 > elements:<int64_val:2 > elements:<int64_val:3 >
+                    op:ContainsAll
+                    elements_same_type:true
+                >
+            >
+            query_info:<
+                topk: 10
+                round_decimal: 3
+                metric_type: "L2"
+                search_params: "{\"nprobe\": 10}"
+            > placeholder_tag:"$0"
+        >)",
+        R"(vector_anns:<
+            field_id:100
+            predicates:<
+                json_contains_expr:<
+                    column_info:<
+                        field_id:101
+                        data_type:JSON
+                        nested_path:"A"
+                    >
+                    elements:<bool_val:true > elements:<bool_val:false > elements:<bool_val:true >
+                    op:ContainsAll
+                    elements_same_type:true
+                >
+            >
+            query_info:<
+                topk: 10
+                round_decimal: 3
+                metric_type: "L2"
+                search_params: "{\"nprobe\": 10}"
+            > placeholder_tag:"$0"
+        >)",
+        R"(vector_anns:<
+            field_id:100
+            predicates:<
+                json_contains_expr:<
+                    column_info:<
+                        field_id:101
+                        data_type:JSON
+                        nested_path:"A"
+                    >
+                    elements:<float_val:1.1 > elements:<float_val:2.2 > elements:<float_val:3.3 >
+                    op:ContainsAll
+                    elements_same_type:true
+                >
+            >
+            query_info:<
+                topk: 10
+                round_decimal: 3
+                metric_type: "L2"
+                search_params: "{\"nprobe\": 10}"
+            > placeholder_tag:"$0"
+        >)",
+        R"(vector_anns:<
+            field_id:100
+            predicates:<
+                json_contains_expr:<
+                    column_info:<
+                        field_id:101
+                        data_type:JSON
+                        nested_path:"A"
+                    >
+                    elements:<string_val:"1" > elements:<string_val:"2" > elements:<string_val:"3" >
+                    op:ContainsAll
+                    elements_same_type:true
+                >
+            >
+            query_info:<
+                topk: 10
+                round_decimal: 3
+                metric_type: "L2"
+                search_params: "{\"nprobe\": 10}"
+            > placeholder_tag:"$0"
+        >)",
+        R"(vector_anns:<
+            field_id:100
+            predicates:<
+                json_contains_expr:<
+                    column_info:<
+                        field_id:101
+                        data_type:JSON
+                        nested_path:"A"
+                    >
+                    elements:<string_val:"1" >
+                    elements:<int64_val:2 >
+                    elements:<float_val:3.3 >
+                    elements:<bool_val:true>
+                    op:ContainsAll
+                >
+            >
+            query_info:<
+                topk: 10
+                round_decimal: 3
+                metric_type: "L2"
+                search_params: "{\"nprobe\": 10}"
+            > placeholder_tag:"$0"
+        >)",
+    };
+
+    for (auto& raw_plan : raw_plans) {
+        auto plan_str = translate_text_plan_to_binary_plan(raw_plan);
+        auto schema = std::make_shared<Schema>();
+        schema->AddDebugField(
+            "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+        schema->AddDebugField("json", DataType::JSON);
+        auto plan =
+            CreateSearchPlanByExpr(*schema, plan_str.data(), plan_str.size());
+    }
+}
+
+TEST(Expr, TestJsonContainsAny) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGenForJsonArray(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+
+    std::vector<Testcase<bool>> bool_testcases{{{true}, {"bool"}},
+                                               {{false}, {"bool"}}};
+
+    for (auto testcase : bool_testcases) {
+        auto check = [&](const std::vector<bool>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<bool>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+            proto::plan::GenericValue::ValCase::kBoolVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<bool> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<bool>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<double>> double_testcases{
+        {{1.123}, {"double"}},
+        {{10.34}, {"double"}},
+        {{100.234}, {"double"}},
+        {{1000.4546}, {"double"}},
+    };
+
+    for (auto testcase : double_testcases) {
+        auto check = [&](const std::vector<double>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<double>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+            proto::plan::GenericValue::ValCase::kFloatVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<double> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<double>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<int64_t>> testcases{
+        {{1}, {"int"}},
+        {{10}, {"int"}},
+        {{100}, {"int"}},
+        {{1000}, {"int"}},
+    };
+
+    for (auto testcase : testcases) {
+        auto check = [&](const std::vector<int64_t>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<int64_t>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+            proto::plan::GenericValue::ValCase::kInt64Val);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<int64_t> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<int64_t>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<std::string>> testcases_string = {
+        {{"1sads"}, {"string"}},
+        {{"10dsf"}, {"string"}},
+        {{"100"}, {"string"}},
+        {{"100ddfdsssdfdsfsd0"}, {"string"}},
+    };
+
+    for (auto testcase : testcases_string) {
+        auto check = [&](const std::vector<std::string_view>& values) {
+            return std::find(values.begin(), values.end(), testcase.term[0]) !=
+                   values.end();
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<std::string>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+            proto::plan::GenericValue::ValCase::kStringVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<std::string_view> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<std::string_view>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+}
+
+TEST(Expr, TestJsonContainsAll) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGenForJsonArray(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+
+    std::vector<Testcase<bool>> bool_testcases{{{true, true}, {"bool"}},
+                                               {{false, false}, {"bool"}}};
+
+    for (auto testcase : bool_testcases) {
+        auto check = [&](const std::vector<bool>& values) {
+            for (auto const& e : testcase.term) {
+                if (std::find(values.begin(), values.end(), e) ==
+                    values.end()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<bool>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+            proto::plan::GenericValue::ValCase::kBoolVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<bool> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<bool>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<double>> double_testcases{
+        {{1.123, 10.34}, {"double"}},
+        {{10.34, 100.234}, {"double"}},
+        {{100.234, 1000.4546}, {"double"}},
+        {{1000.4546, 1.123}, {"double"}},
+        {{1000.4546, 10.34}, {"double"}},
+        {{1.123, 100.234}, {"double"}},
+    };
+
+    for (auto testcase : double_testcases) {
+        auto check = [&](const std::vector<double>& values) {
+            for (auto const& e : testcase.term) {
+                if (std::find(values.begin(), values.end(), e) ==
+                    values.end()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<double>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+            proto::plan::GenericValue::ValCase::kFloatVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<double> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<double>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<int64_t>> testcases{
+        {{1, 10}, {"int"}},
+        {{10, 100}, {"int"}},
+        {{100, 1000}, {"int"}},
+        {{1000, 10}, {"int"}},
+        {{2, 4, 6, 8, 10}, {"int"}},
+        {{1, 2, 3, 4, 5}, {"int"}},
+    };
+
+    for (auto testcase : testcases) {
+        auto check = [&](const std::vector<int64_t>& values) {
+            for (auto const& e : testcase.term) {
+                if (std::find(values.begin(), values.end(), e) ==
+                    values.end()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<int64_t>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+            proto::plan::GenericValue::ValCase::kInt64Val);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<int64_t> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<int64_t>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+
+    std::vector<Testcase<std::string>> testcases_string = {
+        {{"1sads", "10dsf"}, {"string"}},
+        {{"10dsf", "100"}, {"string"}},
+        {{"100", "10dsf", "1sads"}, {"string"}},
+        {{"100ddfdsssdfdsfsd0", "100"}, {"string"}},
+    };
+
+    for (auto testcase : testcases_string) {
+        auto check = [&](const std::vector<std::string_view>& values) {
+            for (auto const& e : testcase.term) {
+                if (std::find(values.begin(), values.end(), e) ==
+                    values.end()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ = std::make_unique<JsonContainsExprImpl<std::string>>(
+            ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+            testcase.term,
+            true,
+            proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+            proto::plan::GenericValue::ValCase::kStringVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            auto array = milvus::Json(simdjson::padded_string(json_col[i]))
+                             .array_at(pointer);
+            std::vector<std::string_view> res;
+            for (const auto& element : array) {
+                res.push_back(element.template get<std::string_view>());
+            }
+            ASSERT_EQ(ans, check(res));
+        }
+    }
+}
+
+TEST(Expr, TestJsonContainsArray) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGenForJsonArray(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+
+    proto::plan::Array a;
+    a.set_same_type(false);
+    for (int i = 0; i < 4; ++i) {
+        if (i % 4 == 0) {
+            proto::plan::GenericValue int_val;
+            int_val.set_int64_val(int64_t(i));
+            a.add_array()->CopyFrom(int_val);
+        } else if ((i - 1) % 4 == 0) {
+            proto::plan::GenericValue bool_val;
+            bool_val.set_bool_val(bool(i));
+            a.add_array()->CopyFrom(bool_val);
+        } else if ((i - 2) % 4 == 0) {
+            proto::plan::GenericValue float_val;
+            float_val.set_float_val(double(i));
+            a.add_array()->CopyFrom(float_val);
+        } else if ((i - 3) % 4 == 0) {
+            proto::plan::GenericValue string_val;
+            string_val.set_string_val(std::to_string(i));
+            a.add_array()->CopyFrom(string_val);
+        }
+    }
+    proto::plan::Array b;
+    b.set_same_type(true);
+    proto::plan::GenericValue int_val1;
+    int_val1.set_int64_val(int64_t(1));
+    b.add_array()->CopyFrom(int_val1);
+
+    proto::plan::GenericValue int_val2;
+    int_val2.set_int64_val(int64_t(2));
+    b.add_array()->CopyFrom(int_val2);
+
+    proto::plan::GenericValue int_val3;
+    int_val3.set_int64_val(int64_t(3));
+    b.add_array()->CopyFrom(int_val3);
+
+    std::vector<Testcase<proto::plan::Array>> diff_testcases{{{a}, {"string"}},
+                                                             {{b}, {"array"}}};
+
+    for (auto& testcase : diff_testcases) {
+        auto check = [&](const std::vector<bool>& values, int i) {
+            if (testcase.nested_path[0] == "array" && (i == 1 || i == N + 1)) {
+                return true;
+            }
+            return false;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::Array>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                true,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            std::vector<bool> res;
+            ASSERT_EQ(ans, check(res, i));
+        }
+    }
+
+    for (auto& testcase : diff_testcases) {
+        auto check = [&](const std::vector<bool>& values, int i) {
+            if (testcase.nested_path[0] == "array" && (i == 1 || i == N + 1)) {
+                return true;
+            }
+            return false;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::Array>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                true,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            std::vector<bool> res;
+            ASSERT_EQ(ans, check(res, i));
+        }
+    }
+
+    proto::plan::Array sub_arr1;
+    sub_arr1.set_same_type(true);
+    proto::plan::GenericValue int_val11;
+    int_val11.set_int64_val(int64_t(1));
+    sub_arr1.add_array()->CopyFrom(int_val11);
+
+    proto::plan::GenericValue int_val12;
+    int_val12.set_int64_val(int64_t(2));
+    sub_arr1.add_array()->CopyFrom(int_val12);
+
+    proto::plan::Array sub_arr2;
+    sub_arr2.set_same_type(true);
+    proto::plan::GenericValue int_val21;
+    int_val21.set_int64_val(int64_t(3));
+    sub_arr2.add_array()->CopyFrom(int_val21);
+
+    proto::plan::GenericValue int_val22;
+    int_val22.set_int64_val(int64_t(4));
+    sub_arr2.add_array()->CopyFrom(int_val22);
+    std::vector<Testcase<proto::plan::Array>> diff_testcases2{
+        {{sub_arr1, sub_arr2}, {"array2"}}};
+
+    for (auto& testcase : diff_testcases2) {
+        auto check = [&]() { return true; };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::Array>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                true,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            ASSERT_EQ(ans, check());
+        }
+    }
+
+    for (auto& testcase : diff_testcases2) {
+        auto check = [&](const std::vector<bool>& values, int i) {
+            return true;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::Array>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                true,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            std::vector<bool> res;
+            ASSERT_EQ(ans, check(res, i));
+        }
+    }
+
+    proto::plan::Array sub_arr3;
+    sub_arr3.set_same_type(true);
+    proto::plan::GenericValue int_val31;
+    int_val31.set_int64_val(int64_t(5));
+    sub_arr3.add_array()->CopyFrom(int_val31);
+
+    proto::plan::GenericValue int_val32;
+    int_val32.set_int64_val(int64_t(6));
+    sub_arr3.add_array()->CopyFrom(int_val32);
+
+    proto::plan::Array sub_arr4;
+    sub_arr4.set_same_type(true);
+    proto::plan::GenericValue int_val41;
+    int_val41.set_int64_val(int64_t(7));
+    sub_arr4.add_array()->CopyFrom(int_val41);
+
+    proto::plan::GenericValue int_val42;
+    int_val42.set_int64_val(int64_t(8));
+    sub_arr4.add_array()->CopyFrom(int_val42);
+    std::vector<Testcase<proto::plan::Array>> diff_testcases3{
+        {{sub_arr3, sub_arr4}, {"array2"}}};
+
+    for (auto& testcase : diff_testcases3) {
+        auto check = [&](const std::vector<bool>& values, int i) {
+            return false;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::Array>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                true,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            std::vector<bool> res;
+            ASSERT_EQ(ans, check(res, i));
+        }
+    }
+
+    for (auto& testcase : diff_testcases3) {
+        auto check = [&](const std::vector<bool>& values, int i) {
+            return false;
+        };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::Array>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                true,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            std::vector<bool> res;
+            ASSERT_EQ(ans, check(res, i));
+        }
+    }
+}
+
+milvus::proto::plan::GenericValue
+generatedArrayWithFourDiffType(int64_t int_val,
+                               double float_val,
+                               bool bool_val,
+                               std::string string_val) {
+    using namespace milvus;
+
+    proto::plan::GenericValue value;
+    proto::plan::Array diff_type_array;
+    diff_type_array.set_same_type(false);
+    proto::plan::GenericValue int_value;
+    int_value.set_int64_val(int_val);
+    diff_type_array.add_array()->CopyFrom(int_value);
+
+    proto::plan::GenericValue float_value;
+    float_value.set_float_val(float_val);
+    diff_type_array.add_array()->CopyFrom(float_value);
+
+    proto::plan::GenericValue bool_value;
+    bool_value.set_bool_val(bool_val);
+    diff_type_array.add_array()->CopyFrom(bool_value);
+
+    proto::plan::GenericValue string_value;
+    string_value.set_string_val(string_val);
+    diff_type_array.add_array()->CopyFrom(string_value);
+
+    value.mutable_array_val()->CopyFrom(diff_type_array);
+    return value;
+}
+
+TEST(Expr, TestJsonContainsDiffTypeArray) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGenForJsonArray(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+
+    proto::plan::GenericValue int_value;
+    int_value.set_int64_val(1);
+    auto diff_type_array1 =
+        generatedArrayWithFourDiffType(1, 2.2, false, "abc");
+    auto diff_type_array2 =
+        generatedArrayWithFourDiffType(1, 2.2, false, "def");
+    auto diff_type_array3 = generatedArrayWithFourDiffType(1, 2.2, true, "abc");
+    auto diff_type_array4 =
+        generatedArrayWithFourDiffType(1, 3.3, false, "abc");
+    auto diff_type_array5 =
+        generatedArrayWithFourDiffType(2, 2.2, false, "abc");
+
+    std::vector<Testcase<proto::plan::GenericValue>> diff_testcases{
+        {{diff_type_array1, int_value}, {"array3"}, true},
+        {{diff_type_array2, int_value}, {"array3"}, false},
+        {{diff_type_array3, int_value}, {"array3"}, false},
+        {{diff_type_array4, int_value}, {"array3"}, false},
+        {{diff_type_array5, int_value}, {"array3"}, false},
+    };
+
+    for (auto& testcase : diff_testcases) {
+        auto check = [&]() { return testcase.res; };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::GenericValue>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                false,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            ASSERT_EQ(ans, check());
+        }
+    }
+
+    for (auto& testcase : diff_testcases) {
+        auto check = [&]() { return false; };
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::GenericValue>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                false,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+                proto::plan::GenericValue::ValCase::kArrayVal);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            ASSERT_EQ(ans, check());
+        }
+    }
+}
+
+TEST(Expr, TestJsonContainsDiffType) {
+    using namespace milvus;
+    using namespace milvus::query;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto i64_fid = schema->AddDebugField("id", DataType::INT64);
+    auto json_fid = schema->AddDebugField("json", DataType::JSON);
+    schema->set_primary_field_id(i64_fid);
+
+    auto seg = CreateGrowingSegment(schema, empty_index_meta);
+    int N = 1000;
+    std::vector<std::string> json_col;
+    int num_iters = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        auto raw_data = DataGenForJsonArray(schema, N, iter);
+        auto new_json_col = raw_data.get_col<std::string>(json_fid);
+
+        json_col.insert(
+            json_col.end(), new_json_col.begin(), new_json_col.end());
+        seg->PreInsert(N);
+        seg->Insert(iter * N,
+                    N,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+    }
+
+    auto seg_promote = dynamic_cast<SegmentGrowingImpl*>(seg.get());
+    ExecExprVisitor visitor(
+        *seg_promote, seg_promote->get_row_count(), MAX_TIMESTAMP);
+
+    proto::plan::GenericValue int_val;
+    int_val.set_int64_val(int64_t(3));
+    proto::plan::GenericValue bool_val;
+    bool_val.set_bool_val(bool(false));
+    proto::plan::GenericValue float_val;
+    float_val.set_float_val(double(100.34));
+    proto::plan::GenericValue string_val;
+    string_val.set_string_val("10dsf");
+
+    proto::plan::GenericValue string_val2;
+    string_val2.set_string_val("abc");
+    proto::plan::GenericValue bool_val2;
+    bool_val2.set_bool_val(bool(true));
+    proto::plan::GenericValue float_val2;
+    float_val2.set_float_val(double(2.2));
+    proto::plan::GenericValue int_val2;
+    int_val2.set_int64_val(int64_t(1));
+
+    std::vector<Testcase<proto::plan::GenericValue>> diff_testcases{
+        {{int_val, bool_val, float_val, string_val},
+         {"diff_type_array"},
+         false},
+        {{string_val2, bool_val2, float_val2, int_val2},
+         {"diff_type_array"},
+         true},
+    };
+
+    for (auto& testcase : diff_testcases) {
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::GenericValue>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                false,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAny,
+                proto::plan::GenericValue::ValCase::VAL_NOT_SET);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            ASSERT_EQ(ans, testcase.res);
+        }
+    }
+
+    for (auto& testcase : diff_testcases) {
+        RetrievePlanNode plan;
+        auto pointer = milvus::Json::pointer(testcase.nested_path);
+        plan.predicate_ =
+            std::make_unique<JsonContainsExprImpl<proto::plan::GenericValue>>(
+                ColumnInfo(json_fid, DataType::JSON, testcase.nested_path),
+                testcase.term,
+                false,
+                proto::plan::JSONContainsExpr_JSONOp_ContainsAll,
+                proto::plan::GenericValue::ValCase::VAL_NOT_SET);
+        auto start = std::chrono::steady_clock::now();
+        auto final = visitor.call_child(*plan.predicate_.value());
+        std::cout << "cost"
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << std::endl;
+        EXPECT_EQ(final.size(), N * num_iters);
+
+        for (int i = 0; i < N * num_iters; ++i) {
+            auto ans = final[i];
+            ASSERT_EQ(ans, testcase.res);
         }
     }
 }

@@ -1,16 +1,25 @@
 cluster:
   enabled: true
+log:
+  level: debug
 image:
   all:
     repository: milvusdb/milvus
     tag: master-latest
     pullPolicy: IfNotPresent
 
-etcd:
+indexNode:
+  resources:
+    requests:
+      cpu: 2
+    limits:
+      cpu: 8
+
+etcd: 
   replicaCount: 3
   image:
     repository: milvusdb/etcd
-    tag: 3.5.0-r7
+    tag: 3.5.5-r2
 
 minio:
   resources:
@@ -125,3 +134,12 @@ pulsar:
       defaultRetentionSizeInMB: "8192"
       backlogQuotaDefaultLimitGB: "8"
       backlogQuotaDefaultRetentionPolicy: producer_exception
+
+extraConfigFiles:
+  user.yaml: |+
+    dataCoord:
+      compaction:
+        indexBasedCompaction: false
+    indexCoord:
+      scheduler:
+        interval: 100        

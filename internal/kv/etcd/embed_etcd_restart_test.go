@@ -20,30 +20,28 @@ import (
 	"os"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-
-	embed_etcd_kv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	embed_etcd_kv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestEtcdRestartLoad(te *testing.T) {
 	etcdDataDir := "/tmp/_etcd_data"
 	te.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
-	param := new(paramtable.ServiceParam)
-	param.Init()
-	param.BaseTable.Save("etcd.use.embed", "true")
-	// TODO, not sure if the relative path works for ci environment
-	param.BaseTable.Save("etcd.config.path", "../../../configs/advanced/etcd.yaml")
-	param.BaseTable.Save("etcd.data.dir", etcdDataDir)
-	//clean up data
+	te.Setenv("ETCD_USE_EMBED", "true")
+	param := new(paramtable.ComponentParam)
+	param.Init(paramtable.NewBaseTable())
+	param.Save("etcd.config.path", "../../../configs/advanced/etcd.yaml")
+	param.Save("etcd.data.dir", etcdDataDir)
+	// clean up data
 	defer func() {
 		err := os.RemoveAll(etcdDataDir)
 		assert.NoError(te, err)
 	}()
-	param.EtcdCfg.LoadCfgToMemory()
-	te.Run("EtcdKV SaveRestartAndLoad", func(t *testing.T) {
+	te.Run("etcdKV SaveRestartAndLoad", func(t *testing.T) {
 		rootPath := "/etcd/test/root/saveRestartAndLoad"
 		metaKv, err := embed_etcd_kv.NewMetaKvFactory(rootPath, &param.EtcdCfg)
 		require.NoError(te, err)
@@ -81,7 +79,7 @@ func TestEtcdRestartLoad(te *testing.T) {
 		embed := metaKv.(*embed_etcd_kv.EmbedEtcdKV)
 		embed.Close()
 
-		//restart and check test result
+		// restart and check test result
 		metaKv, _ = embed_etcd_kv.NewMetaKvFactory(rootPath, &param.EtcdCfg)
 
 		for _, test := range saveAndLoadTests {

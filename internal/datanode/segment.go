@@ -17,20 +17,23 @@
 package datanode
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
+	"math"
+	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bits-and-blooms/bloom/v3"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
 
 // Segment contains the latest segment infos from channel.
@@ -44,106 +47,59 @@ type Segment struct {
 	memorySize  int64
 	compactedTo UniqueID
 
-	pkStat pkStatistics
+	curInsertBuf     *BufferData
+	curDeleteBuf     *DelDataBuf
+	historyInsertBuf []*BufferData
+	historyDeleteBuf []*DelDataBuf
 
-	startPos *internalpb.MsgPosition // TODO readonly
-	endPos   *internalpb.MsgPosition
+	statLock     sync.RWMutex
+	currentStat  *storage.PkStatistics
+	historyStats []*storage.PkStatistics
+
+	startPos    *msgpb.MsgPosition // TODO readonly
+	lazyLoading atomic.Value
+	syncing     atomic.Value
+	released    atomic.Value
 }
 
-// pkStatistics contains pk field statistic information
-type pkStatistics struct {
-	statsChanged bool               //  statistic changed
-	pkFilter     *bloom.BloomFilter //  bloom filter of pk inside a segment
-	minPK        primaryKey         //	minimal pk value, shortcut for checking whether a pk is inside this segment
-	maxPK        primaryKey         //  maximal pk value, same above
-}
-
-// update set pk min/max value if input value is beyond former range.
-func (st *pkStatistics) update(pk primaryKey) error {
-	if st == nil {
-		return errors.New("nil pk statistics")
-	}
-	if st.minPK == nil {
-		st.minPK = pk
-	} else if st.minPK.GT(pk) {
-		st.minPK = pk
-	}
-
-	if st.maxPK == nil {
-		st.maxPK = pk
-	} else if st.maxPK.LT(pk) {
-		st.maxPK = pk
-	}
-
-	return nil
-}
-
-func (st *pkStatistics) updatePKRange(ids storage.FieldData) error {
-	switch pks := ids.(type) {
-	case *storage.Int64FieldData:
-		buf := make([]byte, 8)
-		for _, pk := range pks.Data {
-			id := storage.NewInt64PrimaryKey(pk)
-			err := st.update(id)
-			if err != nil {
-				return err
-			}
-			common.Endian.PutUint64(buf, uint64(pk))
-			st.pkFilter.Add(buf)
+func (s *Segment) isSyncing() bool {
+	if s != nil {
+		b, ok := s.syncing.Load().(bool)
+		if ok {
+			return b
 		}
-	case *storage.StringFieldData:
-		for _, pk := range pks.Data {
-			id := storage.NewVarCharPrimaryKey(pk)
-			err := st.update(id)
-			if err != nil {
-				return err
-			}
-			st.pkFilter.AddString(pk)
-		}
-	default:
-		return fmt.Errorf("invalid data type for primary key: %T", ids)
 	}
-
-	// mark statistic updated
-	st.statsChanged = true
-
-	return nil
+	return false
 }
 
-// getStatslog return marshaled statslog content if there is any change since last call.
-// statslog is marshaled as json.
-func (st *pkStatistics) getStatslog(segmentID, pkID UniqueID, pkType schemapb.DataType) ([]byte, error) {
-	if !st.statsChanged {
-		return nil, fmt.Errorf("%w segment %d", errSegmentStatsNotChanged, segmentID)
+func (s *Segment) setSyncing(syncing bool) {
+	if s != nil {
+		s.syncing.Store(syncing)
 	}
-
-	pks := storage.PrimaryKeyStats{
-		FieldID: pkID,
-		PkType:  int64(pkType),
-		MaxPk:   st.maxPK,
-		MinPk:   st.minPK,
-		BF:      st.pkFilter,
-	}
-
-	bs, err := json.Marshal(pks)
-	if err == nil {
-		st.statsChanged = false
-	}
-	return bs, err
 }
 
-type addSegmentReq struct {
-	segType                    datapb.SegmentType
-	segID, collID, partitionID UniqueID
-	numOfRows                  int64
-	startPos, endPos           *internalpb.MsgPosition
-	statsBinLogs               []*datapb.FieldBinlog
-	recoverTs                  Timestamp
-	importing                  bool
+func (s *Segment) isLoadingLazy() bool {
+	b, ok := s.lazyLoading.Load().(bool)
+	if !ok {
+		return false
+	}
+	return b
 }
 
-func (s *Segment) updatePk(pk primaryKey) error {
-	return s.pkStat.update(pk)
+func (s *Segment) setLoadingLazy(b bool) {
+	s.lazyLoading.Store(b)
+}
+
+func (s *Segment) isReleased() bool {
+	b, ok := s.released.Load().(bool)
+	if !ok {
+		return false
+	}
+	return b
+}
+
+func (s *Segment) setReleased(b bool) {
+	s.released.Store(b)
 }
 
 func (s *Segment) isValid() bool {
@@ -162,23 +118,162 @@ func (s *Segment) setType(t datapb.SegmentType) {
 	s.sType.Store(t)
 }
 
-func (s *Segment) updatePKRange(ids storage.FieldData) error {
-	log := log.With(zap.Int64("collectionID", s.collectionID),
-		zap.Int64("partitionID", s.partitionID),
-		zap.Int64("segmentID", s.segmentID),
-	)
-
-	err := s.pkStat.updatePKRange(ids)
+func (s *Segment) updatePKRange(ids storage.FieldData) {
+	s.statLock.Lock()
+	defer s.statLock.Unlock()
+	s.InitCurrentStat()
+	err := s.currentStat.UpdatePKRange(ids)
 	if err != nil {
-		log.Warn("failed to updatePKRange", zap.Error(err))
+		panic(err)
 	}
-
-	log.Info("update pk range",
-		zap.Int64("num_rows", s.numRows), zap.Any("minPK", s.pkStat.minPK), zap.Any("maxPK", s.pkStat.maxPK))
-
-	return nil
 }
 
-func (s *Segment) getSegmentStatslog(pkID UniqueID, pkType schemapb.DataType) ([]byte, error) {
-	return s.pkStat.getStatslog(s.segmentID, pkID, pkType)
+func (s *Segment) getHistoricalStats(pkField *schemapb.FieldSchema) ([]*storage.PrimaryKeyStats, int64) {
+	statsList := []*storage.PrimaryKeyStats{}
+	for _, stats := range s.historyStats {
+		statsList = append(statsList, &storage.PrimaryKeyStats{
+			FieldID: pkField.FieldID,
+			PkType:  int64(pkField.DataType),
+			BF:      stats.PkFilter,
+			MaxPk:   stats.MaxPK,
+			MinPk:   stats.MinPK,
+		})
+	}
+
+	if s.currentStat != nil {
+		statsList = append(statsList, &storage.PrimaryKeyStats{
+			FieldID: pkField.FieldID,
+			PkType:  int64(pkField.DataType),
+			BF:      s.currentStat.PkFilter,
+			MaxPk:   s.currentStat.MaxPK,
+			MinPk:   s.currentStat.MinPK,
+		})
+	}
+	return statsList, s.numRows
+}
+
+func (s *Segment) InitCurrentStat() {
+	if s.currentStat == nil {
+		s.currentStat = &storage.PkStatistics{
+			PkFilter: bloom.NewWithEstimates(storage.BloomFilterSize, storage.MaxBloomFalsePositive),
+		}
+	}
+}
+
+// check if PK exists is current
+func (s *Segment) isPKExist(pk primaryKey) bool {
+	// for integrity, report false positive while lazy loading
+	if s.isLoadingLazy() {
+		return true
+	}
+	s.statLock.Lock()
+	defer s.statLock.Unlock()
+	if s.currentStat != nil && s.currentStat.PkExist(pk) {
+		return true
+	}
+
+	for _, historyStats := range s.historyStats {
+		if historyStats.PkExist(pk) {
+			return true
+		}
+	}
+	return false
+}
+
+// setInsertBuffer set curInsertBuf.
+func (s *Segment) setInsertBuffer(buf *BufferData) {
+	s.curInsertBuf = buf
+
+	if buf != nil && buf.buffer != nil {
+		dataSize := 0
+		for _, data := range buf.buffer.Data {
+			dataSize += data.GetMemorySize()
+		}
+		metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			strconv.FormatInt(s.collectionID, 10)).Add(float64(dataSize))
+	}
+}
+
+// rollInsertBuffer moves curInsertBuf to historyInsertBuf, and then sets curInsertBuf to nil.
+func (s *Segment) rollInsertBuffer() {
+	if s.curInsertBuf == nil {
+		return
+	}
+
+	if s.curInsertBuf.buffer != nil {
+		dataSize := 0
+		for _, data := range s.curInsertBuf.buffer.Data {
+			dataSize += data.GetMemorySize()
+		}
+		metrics.DataNodeFlowGraphBufferDataSize.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			strconv.FormatInt(s.collectionID, 10)).Sub(float64(dataSize))
+	}
+
+	s.curInsertBuf.buffer = nil // free buffer memory, only keep meta infos in historyInsertBuf
+	s.historyInsertBuf = append(s.historyInsertBuf, s.curInsertBuf)
+	s.curInsertBuf = nil
+}
+
+// evictHistoryInsertBuffer removes flushed buffer from historyInsertBuf after saveBinlogPath.
+func (s *Segment) evictHistoryInsertBuffer(endPos *msgpb.MsgPosition) {
+	tmpBuffers := make([]*BufferData, 0)
+	for _, buf := range s.historyInsertBuf {
+		if buf.endPos.Timestamp > endPos.Timestamp {
+			tmpBuffers = append(tmpBuffers, buf)
+		}
+	}
+	s.historyInsertBuf = tmpBuffers
+	ts, _ := tsoutil.ParseTS(endPos.Timestamp)
+	log.Info("evictHistoryInsertBuffer done", zap.Int64("segmentID", s.segmentID), zap.Time("ts", ts), zap.String("channel", endPos.ChannelName))
+}
+
+// rollDeleteBuffer moves curDeleteBuf to historyDeleteBuf, and then sets curDeleteBuf to nil.
+func (s *Segment) rollDeleteBuffer() {
+	if s.curDeleteBuf == nil {
+		return
+	}
+	s.curDeleteBuf.delData = nil // free buffer memory, only keep meta infos in historyDeleteBuf
+	s.historyDeleteBuf = append(s.historyDeleteBuf, s.curDeleteBuf)
+	s.curDeleteBuf = nil
+}
+
+// evictHistoryDeleteBuffer removes flushed buffer from historyDeleteBuf after saveBinlogPath.
+func (s *Segment) evictHistoryDeleteBuffer(endPos *msgpb.MsgPosition) {
+	tmpBuffers := make([]*DelDataBuf, 0)
+	for _, buf := range s.historyDeleteBuf {
+		if buf.endPos.Timestamp > endPos.Timestamp {
+			tmpBuffers = append(tmpBuffers, buf)
+		}
+	}
+	s.historyDeleteBuf = tmpBuffers
+	ts, _ := tsoutil.ParseTS(endPos.Timestamp)
+	log.Info("evictHistoryDeleteBuffer done", zap.Int64("segmentID", s.segmentID), zap.Time("ts", ts), zap.String("channel", endPos.ChannelName))
+}
+
+func (s *Segment) isBufferEmpty() bool {
+	return s.curInsertBuf == nil &&
+		s.curDeleteBuf == nil &&
+		len(s.historyInsertBuf) == 0 &&
+		len(s.historyDeleteBuf) == 0
+}
+
+func (s *Segment) minBufferTs() uint64 {
+	var minTs uint64 = math.MaxUint64
+	if s.curInsertBuf != nil && s.curInsertBuf.startPos != nil && s.curInsertBuf.startPos.Timestamp < minTs {
+		minTs = s.curInsertBuf.startPos.Timestamp
+	}
+	if s.curDeleteBuf != nil && s.curDeleteBuf.startPos != nil && s.curDeleteBuf.startPos.Timestamp < minTs {
+		minTs = s.curDeleteBuf.startPos.Timestamp
+	}
+	for _, ib := range s.historyInsertBuf {
+		if ib != nil && ib.startPos != nil && ib.startPos.Timestamp < minTs {
+			minTs = ib.startPos.Timestamp
+		}
+	}
+	for _, db := range s.historyDeleteBuf {
+		if db != nil && db.startPos != nil && db.startPos.Timestamp < minTs {
+			minTs = db.startPos.Timestamp
+		}
+	}
+	return minTs
 }

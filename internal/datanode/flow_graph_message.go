@@ -17,15 +17,17 @@
 package datanode
 
 import (
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 )
 
 type (
 	// Msg is flowgraph.Msg
 	Msg = flowgraph.Msg
+
+	BaseMsg = flowgraph.BaseMsg
 
 	// MsgStreamMsg is flowgraph.MsgStreamMsg
 	MsgStreamMsg = flowgraph.MsgStreamMsg
@@ -41,12 +43,13 @@ type (
 )
 
 type flowGraphMsg struct {
+	BaseMsg
 	insertMessages []*msgstream.InsertMsg
 	deleteMessages []*msgstream.DeleteMsg
 	timeRange      TimeRange
-	startPositions []*internalpb.MsgPosition
-	endPositions   []*internalpb.MsgPosition
-	//segmentsToSync is the signal used by insertBufferNode to notify deleteNode to flush
+	startPositions []*msgpb.MsgPosition
+	endPositions   []*msgpb.MsgPosition
+	// segmentsToSync is the signal used by insertBufferNode to notify deleteNode to flush
 	segmentsToSync []UniqueID
 	dropCollection bool
 	dropPartitions []UniqueID
@@ -56,13 +59,18 @@ func (fgMsg *flowGraphMsg) TimeTick() Timestamp {
 	return fgMsg.timeRange.timestampMax
 }
 
+func (fgMsg *flowGraphMsg) IsClose() bool {
+	return fgMsg.BaseMsg.IsCloseMsg()
+}
+
 // flush Msg is used in flowgraph insertBufferNode to flush the given segment
 type flushMsg struct {
 	msgID        UniqueID
 	timestamp    Timestamp
 	segmentID    UniqueID
 	collectionID UniqueID
-	flushed      bool
+	// isFlush illustrates if this is a flush or normal sync
+	isFlush bool
 }
 
 type resendTTMsg struct {

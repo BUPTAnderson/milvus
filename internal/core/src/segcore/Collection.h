@@ -15,15 +15,19 @@
 #include <string>
 
 #include "common/Schema.h"
+#include "common/IndexMeta.h"
 
 namespace milvus::segcore {
 
 class Collection {
  public:
-    explicit Collection(const std::string& collection_proto);
+    explicit Collection(const std::string_view collection_proto);
 
     void
     parse();
+
+    void
+    parseIndexMeta(const std::string_view index_meta_proto_blob);
 
  public:
     SchemaPtr&
@@ -31,7 +35,12 @@ class Collection {
         return schema_;
     }
 
-    const std::string&
+    IndexMetaPtr&
+    GetIndexMeta() {
+        return index_meta_;
+    }
+
+    const std::string_view
     get_collection_name() {
         return collection_name_;
     }
@@ -40,6 +49,7 @@ class Collection {
     std::string collection_name_;
     std::string schema_proto_;
     SchemaPtr schema_;
+    IndexMetaPtr index_meta_;
 };
 
 using CollectionPtr = std::unique_ptr<Collection>;

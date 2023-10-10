@@ -19,13 +19,14 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // EventTypeCode represents event type by code
@@ -212,7 +213,7 @@ func newDescriptorEvent() *descriptorEvent {
 }
 
 func newInsertEventWriter(dataType schemapb.DataType, dim ...int) (*insertEventWriter, error) {
-	var payloadWriter *PayloadWriter
+	var payloadWriter PayloadWriterInterface
 	var err error
 	if typeutil.IsVectorType(dataType) {
 		if len(dim) != 1 {
@@ -368,8 +369,8 @@ func newDropPartitionEventWriter(dataType schemapb.DataType) (*dropPartitionEven
 	return writer, nil
 }
 
-func newIndexFileEventWriter() (*indexFileEventWriter, error) {
-	payloadWriter, err := NewPayloadWriter(schemapb.DataType_Int8)
+func newIndexFileEventWriter(dataType schemapb.DataType) (*indexFileEventWriter, error) {
+	payloadWriter, err := NewPayloadWriter(dataType)
 	if err != nil {
 		return nil, err
 	}

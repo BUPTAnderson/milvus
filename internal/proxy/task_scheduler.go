@@ -19,17 +19,15 @@ package proxy
 import (
 	"container/list"
 	"context"
-	"errors"
-	"fmt"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/util/trace"
-	"github.com/opentracing/opentracing-go"
-	oplog "github.com/opentracing/opentracing-go/log"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type taskQueue interface {
@@ -123,7 +121,7 @@ func (queue *baseTaskQueue) AddActiveTask(t task) {
 	tID := t.ID()
 	_, ok := queue.activeTasks[tID]
 	if ok {
-		log.Debug("Proxy task with tID already in active task list!", zap.Any("ID", tID))
+		log.Warn("Proxy task with tID already in active task list!", zap.Int64("ID", tID))
 	}
 
 	queue.activeTasks[tID] = t
@@ -138,7 +136,7 @@ func (queue *baseTaskQueue) PopActiveTask(taskID UniqueID) task {
 		return t
 	}
 
-	log.Debug("Proxy task not in active task list! ts", zap.Any("taskID", taskID))
+	log.Warn("Proxy task not in active task list! ts", zap.Int64("taskID", taskID))
 	return t
 }
 
@@ -169,7 +167,7 @@ func (queue *baseTaskQueue) Enqueue(t task) error {
 		return err
 	}
 
-	ts, err := queue.tsoAllocatorIns.AllocOne()
+	ts, err := queue.tsoAllocatorIns.AllocOne(t.TraceCtx())
 	if err != nil {
 		return err
 	}
@@ -201,8 +199,8 @@ func newBaseTaskQueue(tsoAllocatorIns tsoAllocator) *baseTaskQueue {
 		activeTasks:     make(map[UniqueID]task),
 		utLock:          sync.RWMutex{},
 		atLock:          sync.RWMutex{},
-		maxTaskNum:      Params.ProxyCfg.MaxTaskNum,
-		utBufChan:       make(chan int, Params.ProxyCfg.MaxTaskNum),
+		maxTaskNum:      Params.ProxyCfg.MaxTaskNum.GetAsInt64(),
+		utBufChan:       make(chan int, Params.ProxyCfg.MaxTaskNum.GetAsInt()),
 		tsoAllocatorIns: tsoAllocatorIns,
 	}
 }
@@ -219,24 +217,37 @@ type pChanStatInfo struct {
 
 type dmTaskQueue struct {
 	*baseTaskQueue
-	lock sync.Mutex
 
 	statsLock            sync.RWMutex
 	pChanStatisticsInfos map[pChan]*pChanStatInfo
 }
 
 func (queue *dmTaskQueue) Enqueue(t task) error {
-	queue.statsLock.Lock()
-	defer queue.statsLock.Unlock()
-	err := queue.baseTaskQueue.Enqueue(t)
+	// This statsLock has two functions:
+	//	1) Protect member pChanStatisticsInfos
+	//	2) Serialize the timestamp allocation for dml tasks
+
+	// 1. set the current pChannels for this dmTask
+	dmt := t.(dmlTask)
+	err := dmt.setChannels()
 	if err != nil {
-		return err
-	}
-	err = queue.addPChanStats(t)
-	if err != nil {
+		log.Warn("setChannels failed when Enqueue", zap.Int64("taskID", t.ID()), zap.Error(err))
 		return err
 	}
 
+	// 2. enqueue dml task
+	queue.statsLock.Lock()
+	defer queue.statsLock.Unlock()
+	err = queue.baseTaskQueue.Enqueue(t)
+	if err != nil {
+		return err
+	}
+	// 3. commit will use pChannels got previously when preAdding and will definitely succeed
+	pChannels := dmt.getChannels()
+	queue.commitPChanStats(dmt, pChannels)
+	// there's indeed a possibility that the collection info cache was expired after preAddPChanStats
+	// but considering root coord knows everything about meta modification, invalid stats appended after the meta changed
+	// will be discarded by root coord and will not lead to inconsistent state
 	return nil
 }
 
@@ -252,76 +263,68 @@ func (queue *dmTaskQueue) PopActiveTask(taskID UniqueID) task {
 		log.Debug("Proxy dmTaskQueue popPChanStats", zap.Any("taskID", t.ID()))
 		queue.popPChanStats(t)
 	} else {
-		log.Debug("Proxy task not in active task list!", zap.Any("taskID", taskID))
+		log.Warn("Proxy task not in active task list!", zap.Any("taskID", taskID))
 	}
 	return t
 }
 
-func (queue *dmTaskQueue) addPChanStats(t task) error {
-	if dmT, ok := t.(dmlTask); ok {
-		stats, err := dmT.getPChanStats()
-		if err != nil {
-			log.Debug("Proxy dmTaskQueue addPChanStats", zap.Any("tID", t.ID()),
-				zap.Any("stats", stats), zap.Error(err))
-			return err
+func (queue *dmTaskQueue) commitPChanStats(dmt dmlTask, pChannels []pChan) {
+	// 1. prepare new stat for all pChannels
+	newStats := make(map[pChan]pChanStatistics)
+	beginTs := dmt.BeginTs()
+	endTs := dmt.EndTs()
+	for _, channel := range pChannels {
+		newStats[channel] = pChanStatistics{
+			minTs: beginTs,
+			maxTs: endTs,
 		}
-		for cName, stat := range stats {
-			info, ok := queue.pChanStatisticsInfos[cName]
-			if !ok {
-				info = &pChanStatInfo{
-					pChanStatistics: stat,
-					tsSet: map[Timestamp]struct{}{
-						stat.minTs: {},
-					},
-				}
-				queue.pChanStatisticsInfos[cName] = info
-			} else {
-				if info.minTs > stat.minTs {
-					queue.pChanStatisticsInfos[cName].minTs = stat.minTs
-				}
-				if info.maxTs < stat.maxTs {
-					queue.pChanStatisticsInfos[cName].maxTs = stat.maxTs
-				}
-				queue.pChanStatisticsInfos[cName].tsSet[info.minTs] = struct{}{}
-			}
-		}
-	} else {
-		return fmt.Errorf("proxy addUnissuedTask reflect to dmlTask failed, tID:%v", t.ID())
 	}
-	return nil
+	// 2. update stats for all pChannels
+	for cName, newStat := range newStats {
+		currentStat, ok := queue.pChanStatisticsInfos[cName]
+		if !ok {
+			currentStat = &pChanStatInfo{
+				pChanStatistics: newStat,
+				tsSet: map[Timestamp]struct{}{
+					newStat.minTs: {},
+				},
+			}
+			queue.pChanStatisticsInfos[cName] = currentStat
+		} else {
+			if currentStat.minTs > newStat.minTs {
+				currentStat.minTs = newStat.minTs
+			}
+			if currentStat.maxTs < newStat.maxTs {
+				currentStat.maxTs = newStat.maxTs
+			}
+			currentStat.tsSet[newStat.minTs] = struct{}{}
+		}
+	}
 }
 
-func (queue *dmTaskQueue) popPChanStats(t task) error {
-	if dmT, ok := t.(dmlTask); ok {
-		channels, err := dmT.getChannels()
-		if err != nil {
-			return err
-		}
-		for _, cName := range channels {
-			info, ok := queue.pChanStatisticsInfos[cName]
-			if ok {
-				delete(queue.pChanStatisticsInfos[cName].tsSet, info.minTs)
-				if len(queue.pChanStatisticsInfos[cName].tsSet) <= 0 {
-					delete(queue.pChanStatisticsInfos, cName)
-				} else if queue.pChanStatisticsInfos[cName].minTs == info.minTs {
-					minTs := info.maxTs
-					for ts := range queue.pChanStatisticsInfos[cName].tsSet {
-						if ts < minTs {
-							minTs = ts
-						}
+func (queue *dmTaskQueue) popPChanStats(t task) {
+	channels := t.(dmlTask).getChannels()
+	taskTs := t.BeginTs()
+	for _, cName := range channels {
+		info, ok := queue.pChanStatisticsInfos[cName]
+		if ok {
+			delete(info.tsSet, taskTs)
+			if len(info.tsSet) <= 0 {
+				delete(queue.pChanStatisticsInfos, cName)
+			} else {
+				newMinTs := info.maxTs
+				for ts := range info.tsSet {
+					if newMinTs > ts {
+						newMinTs = ts
 					}
-					queue.pChanStatisticsInfos[cName].minTs = minTs
 				}
+				info.minTs = newMinTs
 			}
 		}
-	} else {
-		return fmt.Errorf("proxy dmTaskQueue popPChanStats reflect to dmlTask failed, tID:%v", t.ID())
 	}
-	return nil
 }
 
 func (queue *dmTaskQueue) getPChanStatsInfo() (map[pChan]*pChanStatistics, error) {
-
 	ret := make(map[pChan]*pChanStatistics)
 	queue.statsLock.RLock()
 	defer queue.statsLock.RUnlock()
@@ -426,22 +429,17 @@ func (sched *taskScheduler) getTaskByReqID(reqID UniqueID) task {
 }
 
 func (sched *taskScheduler) processTask(t task, q taskQueue) {
-	span, ctx := trace.StartSpanFromContext(t.TraceCtx(),
-		opentracing.Tags{
-			"Type": t.Name(),
-			"ID":   t.ID(),
-		})
-	defer span.Finish()
-	traceID, _, _ := trace.InfoFromSpan(span)
+	ctx, span := otel.Tracer(typeutil.ProxyRole).Start(t.TraceCtx(), t.Name())
+	defer span.End()
 
-	span.LogFields(oplog.Int64("scheduler process AddActiveTask", t.ID()))
+	span.AddEvent("scheduler process AddActiveTask")
 	q.AddActiveTask(t)
 
 	defer func() {
-		span.LogFields(oplog.Int64("scheduler process PopActiveTask", t.ID()))
+		span.AddEvent("scheduler process PopActiveTask")
 		q.PopActiveTask(t.ID())
 	}()
-	span.LogFields(oplog.Int64("scheduler process PreExecute", t.ID()))
+	span.AddEvent("scheduler process PreExecute")
 
 	err := t.PreExecute(ctx)
 
@@ -449,28 +447,25 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 		t.Notify(err)
 	}()
 	if err != nil {
-		trace.LogError(span, err)
-		log.Error("Failed to pre-execute task: "+err.Error(),
-			zap.String("traceID", traceID))
+		span.RecordError(err)
+		log.Ctx(ctx).Warn("Failed to pre-execute task: " + err.Error())
 		return
 	}
 
-	span.LogFields(oplog.Int64("scheduler process Execute", t.ID()))
+	span.AddEvent("scheduler process Execute")
 	err = t.Execute(ctx)
 	if err != nil {
-		trace.LogError(span, err)
-		log.Error("Failed to execute task: "+err.Error(),
-			zap.String("traceID", traceID))
+		span.RecordError(err)
+		log.Ctx(ctx).Warn("Failed to execute task: ", zap.Error(err))
 		return
 	}
 
-	span.LogFields(oplog.Int64("scheduler process PostExecute", t.ID()))
+	span.AddEvent("scheduler process PostExecute")
 	err = t.PostExecute(ctx)
 
 	if err != nil {
-		trace.LogError(span, err)
-		log.Error("Failed to post-execute task: "+err.Error(),
-			zap.String("traceID", traceID))
+		span.RecordError(err)
+		log.Ctx(ctx).Warn("Failed to post-execute task: ", zap.Error(err))
 		return
 	}
 }

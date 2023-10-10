@@ -21,9 +21,9 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // BinlogType is to distinguish different files saving different data.
@@ -41,6 +41,7 @@ const (
 	// StatsBinlog BinlogType for stats data
 	StatsBinlog
 )
+
 const (
 	// MagicNumber used in binlog
 	MagicNumber int32 = 0xfffabc
@@ -261,7 +262,7 @@ func (writer *IndexFileBinlogWriter) NextIndexFileEventWriter() (*indexFileEvent
 	if writer.isClosed() {
 		return nil, fmt.Errorf("binlog has closed")
 	}
-	event, err := newIndexFileEventWriter()
+	event, err := newIndexFileEventWriter(writer.PayloadDataType)
 	if err != nil {
 		return nil, err
 	}
@@ -320,41 +321,6 @@ func NewDDLBinlogWriter(dataType schemapb.DataType, collectionID int64) *DDLBinl
 			descriptorEvent: *descriptorEvent,
 			magicNumber:     MagicNumber,
 			binlogType:      DDLBinlog,
-			eventWriters:    make([]EventWriter, 0),
-			buffer:          nil,
-		},
-	}
-	return w
-}
-
-// NewIndexFileBinlogWriter returns a new IndexFileBinlogWriter with provided parameters
-func NewIndexFileBinlogWriter(
-	indexBuildID UniqueID,
-	version int64,
-	collectionID UniqueID,
-	partitionID UniqueID,
-	segmentID UniqueID,
-	fieldID UniqueID,
-	indexName string,
-	indexID UniqueID,
-	key string,
-) *IndexFileBinlogWriter {
-	descriptorEvent := newDescriptorEvent()
-	descriptorEvent.CollectionID = collectionID
-	descriptorEvent.PartitionID = partitionID
-	descriptorEvent.SegmentID = segmentID
-	descriptorEvent.FieldID = fieldID
-	descriptorEvent.PayloadDataType = schemapb.DataType_Int8
-	descriptorEvent.AddExtra("indexBuildID", fmt.Sprintf("%d", indexBuildID))
-	descriptorEvent.AddExtra("version", fmt.Sprintf("%d", version))
-	descriptorEvent.AddExtra("indexName", indexName)
-	descriptorEvent.AddExtra("indexID", fmt.Sprintf("%d", indexID))
-	descriptorEvent.AddExtra("key", key)
-	w := &IndexFileBinlogWriter{
-		baseBinlogWriter: baseBinlogWriter{
-			descriptorEvent: *descriptorEvent,
-			magicNumber:     MagicNumber,
-			binlogType:      IndexFileBinlog,
 			eventWriters:    make([]EventWriter, 0),
 			buffer:          nil,
 		},

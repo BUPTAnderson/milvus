@@ -21,12 +21,11 @@
 #include <string>
 
 #include "common/Types.h"
-#include "exceptions/EasyAssert.h"
-#include "utils/Status.h"
+#include "common/EasyAssert.h"
 
 namespace milvus {
 
-inline int
+inline size_t
 datatype_sizeof(DataType data_type, int dim = 1) {
     switch (data_type) {
         case DataType::BOOL:
@@ -46,11 +45,15 @@ datatype_sizeof(DataType data_type, int dim = 1) {
         case DataType::VECTOR_FLOAT:
             return sizeof(float) * dim;
         case DataType::VECTOR_BINARY: {
-            Assert(dim % 8 == 0);
+            AssertInfo(dim % 8 == 0, "dim=" + std::to_string(dim));
             return dim / 8;
         }
+        case DataType::VECTOR_FLOAT16: {
+            return sizeof(float16) * dim;
+        }
         default: {
-            throw std::invalid_argument("unsupported data type");
+            throw SegcoreError(DataTypeInvalid,
+                               fmt::format("invalid type is {}", data_type));
         }
     }
 }
@@ -59,6 +62,8 @@ datatype_sizeof(DataType data_type, int dim = 1) {
 inline std::string
 datatype_name(DataType data_type) {
     switch (data_type) {
+        case DataType::NONE:
+            return "none";
         case DataType::BOOL:
             return "bool";
         case DataType::INT8:
@@ -73,23 +78,34 @@ datatype_name(DataType data_type) {
             return "float";
         case DataType::DOUBLE:
             return "double";
+        case DataType::STRING:
+            return "string";
         case DataType::VARCHAR:
             return "varChar";
+        case DataType::ARRAY:
+            return "array";
+        case DataType::JSON:
+            return "json";
         case DataType::VECTOR_FLOAT:
             return "vector_float";
         case DataType::VECTOR_BINARY: {
             return "vector_binary";
         }
+        case DataType::VECTOR_FLOAT16: {
+            return "vector_float16";
+        }
         default: {
-            auto err_msg = "Unsupported DataType(" + std::to_string((int)data_type) + ")";
-            PanicInfo(err_msg);
+            PanicInfo(DataTypeInvalid,
+                      fmt::format("Unsupported DataType({})", data_type));
         }
     }
 }
 
 inline bool
 datatype_is_vector(DataType datatype) {
-    return datatype == DataType::VECTOR_BINARY || datatype == DataType::VECTOR_FLOAT;
+    return datatype == DataType::VECTOR_BINARY ||
+           datatype == DataType::VECTOR_FLOAT ||
+           datatype == DataType::VECTOR_FLOAT16;
 }
 
 inline bool
@@ -97,6 +113,40 @@ datatype_is_string(DataType datatype) {
     switch (datatype) {
         case DataType::VARCHAR:
         case DataType::STRING:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool
+datatype_is_binary(DataType datatype) {
+    switch (datatype) {
+        case DataType::ARRAY:
+        case DataType::JSON:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool
+datatype_is_json(DataType datatype) {
+    return datatype == DataType::JSON;
+}
+
+inline bool
+datatype_is_array(DataType datatype) {
+    return datatype == DataType::ARRAY;
+}
+
+inline bool
+datatype_is_variable(DataType datatype) {
+    switch (datatype) {
+        case DataType::VARCHAR:
+        case DataType::STRING:
+        case DataType::ARRAY:
+        case DataType::JSON:
             return true;
         default:
             return false;
@@ -137,50 +187,59 @@ class FieldMeta {
     FieldMeta&
     operator=(FieldMeta&&) = default;
 
-    FieldMeta(const FieldName& name, FieldId id, DataType type) : name_(name), id_(id), type_(type) {
-        Assert(!is_vector());
+    FieldMeta(const FieldName& name, FieldId id, DataType type)
+        : name_(name), id_(id), type_(type) {
+        Assert(!datatype_is_vector(type_));
     }
 
-    FieldMeta(const FieldName& name, FieldId id, DataType type, int64_t max_length)
-        : name_(name), id_(id), type_(type), string_info_(StringInfo{max_length}) {
-        Assert(is_string());
+    FieldMeta(const FieldName& name,
+              FieldId id,
+              DataType type,
+              int64_t max_length)
+        : name_(name),
+          id_(id),
+          type_(type),
+          string_info_(StringInfo{max_length}) {
+        Assert(datatype_is_string(type_));
     }
 
-    FieldMeta(
-        const FieldName& name, FieldId id, DataType type, int64_t dim, std::optional<knowhere::MetricType> metric_type)
-        : name_(name), id_(id), type_(type), vector_info_(VectorInfo{dim, metric_type}) {
-        Assert(is_vector());
+    FieldMeta(const FieldName& name,
+              FieldId id,
+              DataType type,
+              DataType element_type)
+        : name_(name), id_(id), type_(type), element_type_(element_type) {
+        Assert(datatype_is_array(type_));
     }
 
-    bool
-    is_vector() const {
-        Assert(type_ != DataType::NONE);
-        return type_ == DataType::VECTOR_BINARY || type_ == DataType::VECTOR_FLOAT;
-    }
-
-    bool
-    is_string() const {
-        Assert(type_ != DataType::NONE);
-        return type_ == DataType::VARCHAR || type_ == DataType::STRING;
+    FieldMeta(const FieldName& name,
+              FieldId id,
+              DataType type,
+              int64_t dim,
+              std::optional<knowhere::MetricType> metric_type)
+        : name_(name),
+          id_(id),
+          type_(type),
+          vector_info_(VectorInfo{dim, metric_type}) {
+        Assert(datatype_is_vector(type_));
     }
 
     int64_t
     get_dim() const {
-        Assert(is_vector());
+        Assert(datatype_is_vector(type_));
         Assert(vector_info_.has_value());
         return vector_info_->dim_;
     }
 
     int64_t
     get_max_len() const {
-        Assert(is_string());
+        Assert(datatype_is_string(type_));
         Assert(string_info_.has_value());
         return string_info_->max_length;
     }
 
     std::optional<knowhere::MetricType>
     get_metric_type() const {
-        Assert(is_vector());
+        Assert(datatype_is_vector(type_));
         Assert(vector_info_.has_value());
         return vector_info_->metric_type_;
     }
@@ -200,12 +259,31 @@ class FieldMeta {
         return type_;
     }
 
-    int64_t
+    DataType
+    get_element_type() const {
+        return element_type_;
+    }
+
+    bool
+    is_vector() const {
+        return datatype_is_vector(type_);
+    }
+
+    bool
+    is_string() const {
+        return datatype_is_string(type_);
+    }
+
+    size_t
     get_sizeof() const {
+        static const size_t ARRAY_SIZE = 128;
+        static const size_t JSON_SIZE = 512;
         if (is_vector()) {
             return datatype_sizeof(type_, get_dim());
         } else if (is_string()) {
             return string_info_->max_length;
+        } else if (datatype_is_variable(type_)) {
+            return type_ == DataType::ARRAY ? ARRAY_SIZE : JSON_SIZE;
         } else {
             return datatype_sizeof(type_);
         }
@@ -222,6 +300,7 @@ class FieldMeta {
     FieldName name_;
     FieldId id_;
     DataType type_ = DataType::NONE;
+    DataType element_type_ = DataType::NONE;
     std::optional<VectorInfo> vector_info_;
     std::optional<StringInfo> string_info_;
 };

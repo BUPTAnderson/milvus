@@ -20,8 +20,9 @@ import (
 	"sync"
 
 	"github.com/golang/protobuf/proto"
+
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	. "github.com/milvus-io/milvus/internal/util/typeutil"
+	. "github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type DmChannel struct {
@@ -90,7 +91,7 @@ func (m *ChannelDistManager) GetShardLeader(replica *Replica, shard string) (int
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
-	for node := range replica.Nodes {
+	for _, node := range replica.GetNodes() {
 		channels := m.channels[node]
 		for _, dmc := range channels {
 			if dmc.ChannelName == shard {
@@ -107,11 +108,32 @@ func (m *ChannelDistManager) GetShardLeadersByReplica(replica *Replica) map[stri
 	defer m.rwmutex.RUnlock()
 
 	ret := make(map[string]int64)
-	for node := range replica.Nodes {
+	for _, node := range replica.GetNodes() {
 		channels := m.channels[node]
 		for _, dmc := range channels {
 			if dmc.GetCollectionID() == replica.GetCollectionID() {
 				ret[dmc.GetChannelName()] = node
+			}
+		}
+	}
+	return ret
+}
+
+func (m *ChannelDistManager) GetChannelDistByReplica(replica *Replica) map[string][]int64 {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	ret := make(map[string][]int64)
+	for _, node := range replica.GetNodes() {
+		channels := m.channels[node]
+		for _, dmc := range channels {
+			if dmc.GetCollectionID() == replica.GetCollectionID() {
+				channelName := dmc.GetChannelName()
+				_, ok := ret[channelName]
+				if !ok {
+					ret[channelName] = make([]int64, 0)
+				}
+				ret[channelName] = append(ret[channelName], node)
 			}
 		}
 	}

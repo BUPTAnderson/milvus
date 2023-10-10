@@ -17,14 +17,15 @@
 package datacoord
 
 import (
-	"errors"
 	"sort"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type calUpperLimitPolicy func(schema *schemapb.CollectionSchema) (int, error)
@@ -41,7 +42,7 @@ func calBySchemaPolicy(schema *schemapb.CollectionSchema) (int, error) {
 	if sizePerRecord == 0 {
 		return -1, errors.New("zero size record schema found")
 	}
-	threshold := Params.DataCoordCfg.SegmentMaxSize * 1024 * 1024
+	threshold := Params.DataCoordCfg.SegmentMaxSize.GetAsFloat() * 1024 * 1024
 	return int(threshold / float64(sizePerRecord)), nil
 }
 
@@ -57,7 +58,7 @@ func calBySchemaPolicyWithDiskIndex(schema *schemapb.CollectionSchema) (int, err
 	if sizePerRecord == 0 {
 		return -1, errors.New("zero size record schema found")
 	}
-	threshold := Params.DataCoordCfg.DiskSegmentMaxSize * 1024 * 1024
+	threshold := Params.DataCoordCfg.DiskSegmentMaxSize.GetAsFloat() * 1024 * 1024
 	return int(threshold / float64(sizePerRecord)), nil
 }
 
@@ -67,7 +68,8 @@ type AllocatePolicy func(segments []*SegmentInfo, count int64,
 
 // AllocatePolicyV1 v1 policy simple allocation policy using Greedy Algorithm
 func AllocatePolicyV1(segments []*SegmentInfo, count int64,
-	maxCountPerSegment int64) ([]*Allocation, []*Allocation) {
+	maxCountPerSegment int64,
+) ([]*Allocation, []*Allocation) {
 	newSegmentAllocations := make([]*Allocation, 0)
 	existedSegmentAllocations := make([]*Allocation, 0)
 	// create new segment if count >= max num
@@ -116,13 +118,25 @@ func getSegmentCapacityPolicy(sizeFactor float64) segmentSealPolicy {
 	}
 }
 
-// getLastExpiresLifetimePolicy get segmentSealPolicy with lifetime limit compares ts - segment.lastExpireTime
+// sealByLifetimePolicy get segmentSealPolicy with lifetime limit compares ts - segment.lastExpireTime
 func sealByLifetimePolicy(lifetime time.Duration) segmentSealPolicy {
 	return func(segment *SegmentInfo, ts Timestamp) bool {
 		pts, _ := tsoutil.ParseTS(ts)
 		epts, _ := tsoutil.ParseTS(segment.GetLastExpireTime())
 		d := pts.Sub(epts)
 		return d >= lifetime
+	}
+}
+
+// sealByMaxBinlogFileNumberPolicy seal segment if binlog file number of segment exceed configured max number
+func sealByMaxBinlogFileNumberPolicy(maxBinlogFileNumber int) segmentSealPolicy {
+	return func(segment *SegmentInfo, ts Timestamp) bool {
+		logFileCounter := 0
+		for _, fieldBinlog := range segment.GetStatslogs() {
+			logFileCounter += len(fieldBinlog.GetBinlogs())
+		}
+
+		return logFileCounter >= maxBinlogFileNumber
 	}
 }
 
@@ -145,7 +159,7 @@ func sealLongTimeIdlePolicy(idleTimeTolerance time.Duration, minSizeToSealIdleSe
 // channelSealPolicy seal policy applies to channel
 type channelSealPolicy func(string, []*SegmentInfo, Timestamp) []*SegmentInfo
 
-// getChannelCapacityPolicy get channelSealPolicy with channel segment capacity policy
+// getChannelOpenSegCapacityPolicy get channelSealPolicy with channel segment capacity policy
 func getChannelOpenSegCapacityPolicy(limit int) channelSealPolicy {
 	return func(channel string, segs []*SegmentInfo, ts Timestamp) []*SegmentInfo {
 		if len(segs) <= limit {
@@ -160,7 +174,7 @@ func getChannelOpenSegCapacityPolicy(limit int) channelSealPolicy {
 	}
 }
 
-// sortSegStatusByLastExpires sort segmentStatus with lastExpireTime ascending order
+// sortSegmentsByLastExpires sort segmentStatus with lastExpireTime ascending order
 func sortSegmentsByLastExpires(segs []*SegmentInfo) {
 	sort.Slice(segs, func(i, j int) bool {
 		return segs[i].LastExpireTime < segs[j].LastExpireTime
@@ -173,7 +187,6 @@ const flushInterval = 2 * time.Second
 
 func flushPolicyV1(segment *SegmentInfo, t Timestamp) bool {
 	return segment.GetState() == commonpb.SegmentState_Sealed &&
-		segment.GetLastExpireTime() <= t &&
 		time.Since(segment.lastFlushTime) >= flushInterval &&
-		segment.currRows != 0
+		(segment.GetLastExpireTime() <= t && segment.currRows != 0 || (segment.IsImporting))
 }

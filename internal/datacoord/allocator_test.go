@@ -21,10 +21,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestAllocator_Basic(t *testing.T) {
-	ms := newMockRootCoordService()
+	paramtable.Init()
+	ms := newMockRootCoordClient()
 	allocator := newRootCoordAllocator(ms)
 	ctx := context.Background()
 
@@ -39,10 +42,10 @@ func TestAllocator_Basic(t *testing.T) {
 	})
 
 	t.Run("Test Unhealthy Root", func(t *testing.T) {
-		ms := newMockRootCoordService()
+		ms := newMockRootCoordClient()
 		allocator := newRootCoordAllocator(ms)
 		err := ms.Stop()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		_, err = allocator.allocTimestamp(ctx)
 		assert.Error(t, err)

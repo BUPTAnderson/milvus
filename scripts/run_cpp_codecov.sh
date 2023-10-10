@@ -27,8 +27,8 @@ while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symli
 done
 ROOT_DIR="$( cd -P "$( dirname "$SOURCE" )/.." && pwd )"
 
-MILVUS_CORE_DIR="${ROOT_DIR}/internal/core/"
-MILVUS_CORE_UNITTEST_DIR="${MILVUS_CORE_DIR}/output/unittest/"
+MILVUS_CORE_DIR="${ROOT_DIR}/internal/core"
+MILVUS_CORE_UNITTEST_DIR="${MILVUS_CORE_DIR}/output/unittest"
 
 echo "ROOT_DIR = ${ROOT_DIR}"
 echo "MILVUS_CORE_DIR = ${MILVUS_CORE_DIR}"
@@ -57,6 +57,8 @@ if [ $? -ne 0 ]; then
     echo "Failed to generate coverage baseline"
     exit -1
 fi
+# starting the timer
+beginTime=`date +%s`
 
 # run unittest
 for test in `ls ${MILVUS_CORE_UNITTEST_DIR}`; do
@@ -87,7 +89,10 @@ ${LCOV_CMD} -r "${FILE_INFO_COMBINE}" -o "${FILE_INFO_OUTPUT}" \
     "*/thirdparty/*"
 
 # generate html report
-${LCOV_GEN_CMD} ${FILE_INFO_OUTPUT} --output-directory ${DIR_LCOV_OUTPUT}/
-echo "Generate cpp code coverage report to ${DIR_LCOV_OUTPUT}"
+#${LCOV_GEN_CMD} ${FILE_INFO_OUTPUT} --output-directory ${DIR_LCOV_OUTPUT}/
+#echo "Generate cpp code coverage report to ${DIR_LCOV_OUTPUT}"
 
 
+endTime=`date +%s`
+
+echo "Total time for cpp unittest:" $(($endTime-$beginTime)) "s"

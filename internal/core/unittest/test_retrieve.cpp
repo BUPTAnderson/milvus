@@ -11,12 +11,20 @@
 
 #include <gtest/gtest.h>
 
+#include "query/Expr.h"
 #include "query/ExprImpl.h"
 #include "segcore/ScalarIndex.h"
 #include "test_utils/DataGen.h"
 
 using namespace milvus;
 using namespace milvus::segcore;
+
+std::unique_ptr<proto::segcore::RetrieveResults>
+RetrieveUsingDefaultOutputSize(SegmentInterface* segment,
+                               const query::RetrievePlan* plan,
+                               Timestamp timestamp) {
+    return segment->Retrieve(plan, timestamp, DEFAULT_MAX_OUTPUT_SIZE);
+}
 
 TEST(Retrieve, ScalarIndex) {
     SUCCEED();
@@ -48,7 +56,8 @@ TEST(Retrieve, AutoID) {
     auto schema = std::make_shared<Schema>();
     auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
     auto DIM = 16;
-    auto fid_vec = schema->AddDebugField("vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
     schema->set_primary_field_id(fid_64);
 
     int64_t N = 100;
@@ -65,13 +74,18 @@ TEST(Retrieve, AutoID) {
     for (int i = 0; i < req_size; ++i) {
         values.emplace_back(i64_col[choose(i)]);
     }
-    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(fid_64, DataType::INT64, values);
+    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        values,
+        proto::plan::GenericValue::kInt64Val);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
     plan->plan_node_->predicate_ = std::move(term_expr);
     std::vector<FieldId> target_fields_id{fid_64, fid_vec};
     plan->field_ids_ = target_fields_id;
 
-    auto retrieve_results = segment->Retrieve(plan.get(), 100);
+    auto retrieve_results =
+        RetrieveUsingDefaultOutputSize(segment.get(), plan.get(), 100);
     Assert(retrieve_results->fields_data_size() == target_fields_id.size());
     auto field0 = retrieve_results->fields_data(0);
     Assert(field0.has_scalars());
@@ -98,7 +112,8 @@ TEST(Retrieve, AutoID2) {
     auto schema = std::make_shared<Schema>();
     auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
     auto DIM = 16;
-    auto fid_vec = schema->AddDebugField("vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
     schema->set_primary_field_id(fid_64);
 
     int64_t N = 100;
@@ -115,13 +130,18 @@ TEST(Retrieve, AutoID2) {
     for (int i = 0; i < req_size; ++i) {
         values.emplace_back(i64_col[choose(i)]);
     }
-    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(fid_64, DataType::INT64, values);
+    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        values,
+        proto::plan::GenericValue::kInt64Val);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
     plan->plan_node_->predicate_ = std::move(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
-    auto retrieve_results = segment->Retrieve(plan.get(), 100);
+    auto retrieve_results =
+        RetrieveUsingDefaultOutputSize(segment.get(), plan.get(), 100);
     Assert(retrieve_results->fields_data_size() == target_offsets.size());
     auto field0 = retrieve_results->fields_data(0);
     Assert(field0.has_scalars());
@@ -143,7 +163,8 @@ TEST(Retrieve, NotExist) {
     auto schema = std::make_shared<Schema>();
     auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
     auto DIM = 16;
-    auto fid_vec = schema->AddDebugField("vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
     schema->set_primary_field_id(fid_64);
 
     int64_t N = 100;
@@ -163,13 +184,18 @@ TEST(Retrieve, NotExist) {
         values.emplace_back(choose2(i));
     }
 
-    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(fid_64, DataType::INT64, values);
+    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        values,
+        proto::plan::GenericValue::kInt64Val);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
     plan->plan_node_->predicate_ = std::move(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
-    auto retrieve_results = segment->Retrieve(plan.get(), 100);
+    auto retrieve_results =
+        RetrieveUsingDefaultOutputSize(segment.get(), plan.get(), 100);
     Assert(retrieve_results->fields_data_size() == target_offsets.size());
     auto field0 = retrieve_results->fields_data(0);
     Assert(field0.has_scalars());
@@ -191,7 +217,8 @@ TEST(Retrieve, Empty) {
     auto schema = std::make_shared<Schema>();
     auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
     auto DIM = 16;
-    auto fid_vec = schema->AddDebugField("vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
     schema->set_primary_field_id(fid_64);
 
     int64_t N = 100;
@@ -205,13 +232,18 @@ TEST(Retrieve, Empty) {
     for (int i = 0; i < req_size; ++i) {
         values.emplace_back(choose(i));
     }
-    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(fid_64, DataType::INT64, values);
+    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        values,
+        proto::plan::GenericValue::kInt64Val);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
     plan->plan_node_->predicate_ = std::move(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
-    auto retrieve_results = segment->Retrieve(plan.get(), 100);
+    auto retrieve_results =
+        RetrieveUsingDefaultOutputSize(segment.get(), plan.get(), 100);
 
     Assert(retrieve_results->fields_data_size() == target_offsets.size());
     auto field0 = retrieve_results->fields_data(0);
@@ -222,11 +254,49 @@ TEST(Retrieve, Empty) {
     Assert(field1.vectors().float_vector().data_size() == 0);
 }
 
+TEST(Retrieve, Limit) {
+    auto schema = std::make_shared<Schema>();
+    auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
+    auto DIM = 16;
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    schema->set_primary_field_id(fid_64);
+
+    int64_t N = 101;
+    auto dataset = DataGen(schema, N, 42);
+    auto segment = CreateSealedSegment(schema);
+    SealedLoadFieldData(dataset, *segment);
+
+    auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    auto term_expr = std::make_unique<query::UnaryRangeExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        OpType::GreaterEqual,
+        0,
+        proto::plan::GenericValue::kInt64Val);
+    plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
+    plan->plan_node_->predicate_ = std::move(term_expr);
+
+    // test query results exceed the limit size
+    std::vector<FieldId> target_fields{TimestampFieldID, fid_64, fid_vec};
+    plan->field_ids_ = target_fields;
+    EXPECT_THROW(segment->Retrieve(plan.get(), N, 1), std::runtime_error);
+
+    auto retrieve_results =
+        segment->Retrieve(plan.get(), N, DEFAULT_MAX_OUTPUT_SIZE);
+    Assert(retrieve_results->fields_data_size() == target_fields.size());
+    auto field0 = retrieve_results->fields_data(0);
+    auto field2 = retrieve_results->fields_data(2);
+    Assert(field0.scalars().long_data().data_size() == N);
+    Assert(field2.vectors().float_vector().data_size() == N * DIM);
+}
+
 TEST(Retrieve, LargeTimestamp) {
     auto schema = std::make_shared<Schema>();
     auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
     auto DIM = 16;
-    auto fid_vec = schema->AddDebugField("vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
     schema->set_primary_field_id(fid_64);
 
     int64_t N = 100;
@@ -244,7 +314,11 @@ TEST(Retrieve, LargeTimestamp) {
     for (int i = 0; i < req_size; ++i) {
         values.emplace_back(i64_col[choose(i)]);
     }
-    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(fid_64, DataType::INT64, values);
+    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        values,
+        proto::plan::GenericValue::kInt64Val);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
     plan->plan_node_->predicate_ = std::move(term_expr);
     std::vector<FieldId> target_offsets{fid_64, fid_vec};
@@ -253,7 +327,8 @@ TEST(Retrieve, LargeTimestamp) {
     std::vector<int> filter_timestamps{-1, 0, 1, 10, 20};
     filter_timestamps.push_back(N / 2);
     for (const auto& f_ts : filter_timestamps) {
-        auto retrieve_results = segment->Retrieve(plan.get(), ts_offset + 1 + f_ts);
+        auto retrieve_results = RetrieveUsingDefaultOutputSize(
+            segment.get(), plan.get(), ts_offset + 1 + f_ts);
         Assert(retrieve_results->fields_data_size() == 2);
 
         int target_num = (f_ts + choose_sep) / choose_sep;
@@ -263,10 +338,12 @@ TEST(Retrieve, LargeTimestamp) {
 
         for (auto field_data : retrieve_results->fields_data()) {
             if (DataType(field_data.type()) == DataType::INT64) {
-                Assert(field_data.scalars().long_data().data_size() == target_num);
+                Assert(field_data.scalars().long_data().data_size() ==
+                       target_num);
             }
             if (DataType(field_data.type()) == DataType::VECTOR_FLOAT) {
-                Assert(field_data.vectors().float_vector().data_size() == target_num * DIM);
+                Assert(field_data.vectors().float_vector().data_size() ==
+                       target_num * DIM);
             }
         }
     }
@@ -276,8 +353,11 @@ TEST(Retrieve, Delete) {
     auto schema = std::make_shared<Schema>();
     auto fid_64 = schema->AddDebugField("i64", DataType::INT64);
     auto DIM = 16;
-    auto fid_vec = schema->AddDebugField("vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
+    auto fid_vec = schema->AddDebugField(
+        "vector_64", DataType::VECTOR_FLOAT, DIM, knowhere::metric::L2);
     schema->set_primary_field_id(fid_64);
+
+    auto fid_ts = schema->AddDebugField("Timestamp", DataType::INT64);
 
     int64_t N = 10;
     int64_t req_size = 10;
@@ -287,21 +367,31 @@ TEST(Retrieve, Delete) {
     auto segment = CreateSealedSegment(schema);
     SealedLoadFieldData(dataset, *segment);
     auto i64_col = dataset.get_col<int64_t>(fid_64);
+    auto ts_col = dataset.get_col<int64_t>(fid_ts);
 
     auto plan = std::make_unique<query::RetrievePlan>(*schema);
+    std::vector<int64_t> timestamps;
+    for (int i = 0; i < req_size; ++i) {
+        timestamps.emplace_back(ts_col[choose(i)]);
+    }
     std::vector<int64_t> values;
     for (int i = 0; i < req_size; ++i) {
         values.emplace_back(i64_col[choose(i)]);
     }
-    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(fid_64, DataType::INT64, values);
+    auto term_expr = std::make_unique<query::TermExprImpl<int64_t>>(
+        milvus::query::ColumnInfo(
+            fid_64, DataType::INT64, std::vector<std::string>()),
+        values,
+        proto::plan::GenericValue::kInt64Val);
     plan->plan_node_ = std::make_unique<query::RetrievePlanNode>();
     plan->plan_node_->predicate_ = std::move(term_expr);
-    std::vector<FieldId> target_offsets{fid_64, fid_vec};
+    std::vector<FieldId> target_offsets{fid_ts, fid_64, fid_vec};
     plan->field_ids_ = target_offsets;
 
     {
-        auto retrieve_results = segment->Retrieve(plan.get(), 100);
-        Assert(retrieve_results->fields_data_size() == target_offsets.size());
+        auto retrieve_results =
+            RetrieveUsingDefaultOutputSize(segment.get(), plan.get(), 100);
+        ASSERT_EQ(retrieve_results->fields_data_size(), target_offsets.size());
         auto field0 = retrieve_results->fields_data(0);
         Assert(field0.has_scalars());
         auto field0_data = field0.scalars().long_data();
@@ -309,18 +399,23 @@ TEST(Retrieve, Delete) {
         for (int i = 0; i < req_size; ++i) {
             auto index = choose(i);
             auto data = field0_data.data(i);
-        }
-
-        for (int i = 0; i < req_size; ++i) {
-            auto index = choose(i);
-            auto data = field0_data.data(i);
-            ASSERT_EQ(data, i64_col[index]);
+            ASSERT_EQ(data, ts_col[index]);
         }
 
         auto field1 = retrieve_results->fields_data(1);
-        Assert(field1.has_vectors());
-        auto field1_data = field1.vectors().float_vector();
-        ASSERT_EQ(field1_data.data_size(), DIM * req_size);
+        Assert(field1.has_scalars());
+        auto field1_data = field1.scalars().long_data();
+
+        for (int i = 0; i < req_size; ++i) {
+            auto index = choose(i);
+            auto data = field1_data.data(i);
+            ASSERT_EQ(data, i64_col[index]);
+        }
+
+        auto field2 = retrieve_results->fields_data(2);
+        Assert(field2.has_vectors());
+        auto field2_data = field2.vectors().float_vector();
+        ASSERT_EQ(field2_data.data_size(), DIM * req_size);
     }
 
     int64_t row_count = 0;
@@ -343,26 +438,30 @@ TEST(Retrieve, Delete) {
     auto ids = std::make_unique<IdArray>();
     ids->mutable_int_id()->mutable_data()->Add(new_pks.begin(), new_pks.end());
     std::vector<idx_t> new_timestamps{10, 10, 10, 10, 10, 10};
-    auto reserved_offset = segment->PreDelete(new_count);
+    auto reserved_offset = segment->get_deleted_count();
     ASSERT_EQ(reserved_offset, row_count);
-    segment->Delete(reserved_offset, new_count, ids.get(), reinterpret_cast<const Timestamp*>(new_timestamps.data()));
+    segment->Delete(reserved_offset,
+                    new_count,
+                    ids.get(),
+                    reinterpret_cast<const Timestamp*>(new_timestamps.data()));
 
     {
-        auto retrieve_results = segment->Retrieve(plan.get(), 100);
+        auto retrieve_results =
+            RetrieveUsingDefaultOutputSize(segment.get(), plan.get(), 100);
         Assert(retrieve_results->fields_data_size() == target_offsets.size());
-        auto field0 = retrieve_results->fields_data(0);
-        Assert(field0.has_scalars());
-        auto field0_data = field0.scalars().long_data();
+        auto field1 = retrieve_results->fields_data(1);
+        Assert(field1.has_scalars());
+        auto field1_data = field1.scalars().long_data();
         auto size = req_size - new_count;
         for (int i = 0; i < size; ++i) {
             auto index = choose(i);
-            auto data = field0_data.data(i);
+            auto data = field1_data.data(i);
             ASSERT_EQ(data, i64_col[index + new_count]);
         }
 
-        auto field1 = retrieve_results->fields_data(1);
-        Assert(field1.has_vectors());
-        auto field1_data = field1.vectors().float_vector();
-        ASSERT_EQ(field1_data.data_size(), DIM * size);
+        auto field2 = retrieve_results->fields_data(2);
+        Assert(field2.has_vectors());
+        auto field2_data = field2.vectors().float_vector();
+        ASSERT_EQ(field2_data.data_size(), DIM * size);
     }
 }

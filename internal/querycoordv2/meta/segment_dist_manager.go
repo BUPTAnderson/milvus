@@ -20,14 +20,18 @@ import (
 	"sync"
 
 	"github.com/golang/protobuf/proto"
+
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	. "github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/internal/proto/querypb"
+	. "github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type Segment struct {
 	*datapb.SegmentInfo
-	Node    int64 // Node the segment is in
-	Version int64 // Version is the timestamp of loading segment
+	Node               int64                             // Node the segment is in
+	Version            int64                             // Version is the timestamp of loading segment
+	LastDeltaTimestamp uint64                            // The timestamp of the last delta record
+	IndexInfo          map[int64]*querypb.FieldIndexInfo // index info of loaded segment
 }
 
 func SegmentFromInfo(info *datapb.SegmentInfo) *Segment {
@@ -150,7 +154,7 @@ func (m *SegmentDistManager) GetByShardWithReplica(shard string, replica *Replic
 
 	ret := make([]*Segment, 0)
 	for nodeID, segments := range m.segments {
-		if !replica.Nodes.Contain(nodeID) {
+		if !replica.Contains(nodeID) {
 			continue
 		}
 		for _, segment := range segments {
@@ -171,6 +175,22 @@ func (m *SegmentDistManager) GetByCollectionAndNode(collectionID, nodeID UniqueI
 	for _, segment := range m.segments[nodeID] {
 		if segment.CollectionID == collectionID {
 			ret = append(ret, segment)
+		}
+	}
+	return ret
+}
+
+func (m *SegmentDistManager) GetSegmentDist(segmentID int64) []int64 {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	ret := make([]int64, 0)
+	for nodeID, segments := range m.segments {
+		for _, segment := range segments {
+			if segment.GetID() == segmentID {
+				ret = append(ret, nodeID)
+				break
+			}
 		}
 	}
 	return ret

@@ -9,13 +9,13 @@ import (
 
 	"golang.org/x/exp/mmap"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func init() {
@@ -72,9 +72,7 @@ var (
 	}
 )
 
-var (
-	mockChunkMgrIns = &mockChunkmgr{}
-)
+var mockChunkMgrIns = &mockChunkmgr{}
 
 type mockStorageFactory struct{}
 
@@ -183,17 +181,14 @@ func (c *mockChunkmgr) mockFieldData(numrows, dim int, collectionID, partitionID
 	}
 	vecs := randomFloats(numrows, dim)
 	idField := storage.Int64FieldData{
-		NumRows: []int64{},
-		Data:    idList,
+		Data: idList,
 	}
 	tsField := storage.Int64FieldData{
-		NumRows: []int64{},
-		Data:    tsList,
+		Data: tsList,
 	}
 	vecField := storage.FloatVectorFieldData{
-		NumRows: []int64{},
-		Data:    vecs,
-		Dim:     dim,
+		Data: vecs,
+		Dim:  dim,
 	}
 	insertData := &storage.InsertData{
 		Data: map[int64]storage.FieldData{
@@ -205,7 +200,7 @@ func (c *mockChunkmgr) mockFieldData(numrows, dim int, collectionID, partitionID
 	insertCodec := &storage.InsertCodec{
 		Schema: collMeta,
 	}
-	blobs, _, err := insertCodec.Serialize(partitionID, segmentID, insertData)
+	blobs, err := insertCodec.Serialize(partitionID, segmentID, insertData)
 	if err != nil {
 		panic(err)
 	}
@@ -244,11 +239,6 @@ func (f *mockFactory) NewMsgStream(context.Context) (msgstream.MsgStream, error)
 }
 
 func (f *mockFactory) NewTtMsgStream(context.Context) (msgstream.MsgStream, error) {
-	// TODO
-	return nil, errNotImplErr
-}
-
-func (f *mockFactory) NewQueryMsgStream(context.Context) (msgstream.MsgStream, error) {
 	// TODO
 	return nil, errNotImplErr
 }

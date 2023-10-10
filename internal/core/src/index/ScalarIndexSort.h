@@ -21,23 +21,29 @@
 #include <utility>
 #include <vector>
 #include <string>
-#include "knowhere/common/Exception.h"
+#include <map>
+
 #include "index/IndexStructure.h"
 #include "index/ScalarIndex.h"
+#include "storage/MemFileManagerImpl.h"
 
 namespace milvus::index {
 
 template <typename T>
 class ScalarIndexSort : public ScalarIndex<T> {
  public:
-    ScalarIndexSort();
-    ScalarIndexSort(size_t n, const T* values);
+    explicit ScalarIndexSort(
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
 
     BinarySet
     Serialize(const Config& config) override;
 
     void
     Load(const BinarySet& index_binary, const Config& config = {}) override;
+
+    void
+    Load(const Config& config = {}) override;
 
     int64_t
     Count() override {
@@ -47,17 +53,23 @@ class ScalarIndexSort : public ScalarIndex<T> {
     void
     Build(size_t n, const T* values) override;
 
-    const TargetBitmapPtr
+    void
+    Build(const Config& config = {}) override;
+
+    const TargetBitmap
     In(size_t n, const T* values) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
     NotIn(size_t n, const T* values) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
     Range(T value, OpType op) override;
 
-    const TargetBitmapPtr
-    Range(T lower_bound_value, bool lb_inclusive, T upper_bound_value, bool ub_inclusive) override;
+    const TargetBitmap
+    Range(T lower_bound_value,
+          bool lb_inclusive,
+          T upper_bound_value,
+          bool ub_inclusive) override;
 
     T
     Reverse_Lookup(size_t offset) const override;
@@ -66,6 +78,9 @@ class ScalarIndexSort : public ScalarIndex<T> {
     Size() override {
         return (int64_t)data_.size();
     }
+
+    BinarySet
+    Upload(const Config& config = {}) override;
 
  public:
     const std::vector<IndexStructure<T>>&
@@ -78,11 +93,15 @@ class ScalarIndexSort : public ScalarIndex<T> {
         return is_built_;
     }
 
+    void
+    LoadWithoutAssemble(const BinarySet& binary_set, const Config& config);
+
  private:
     bool is_built_;
     Config config_;
-    std::vector<size_t> idx_to_offsets_;  // used to retrieve.
+    std::vector<int32_t> idx_to_offsets_;  // used to retrieve.
     std::vector<IndexStructure<T>> data_;
+    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
 };
 
 template <typename T>
@@ -95,7 +114,8 @@ using ScalarIndexSortPtr = std::unique_ptr<ScalarIndexSort<T>>;
 namespace milvus::index {
 template <typename T>
 inline ScalarIndexSortPtr<T>
-CreateScalarIndexSort() {
-    return std::make_unique<ScalarIndexSort<T>>();
+CreateScalarIndexSort(const storage::FileManagerContext& file_manager_context =
+                          storage::FileManagerContext()) {
+    return std::make_unique<ScalarIndexSort<T>>(file_manager_context);
 }
 }  // namespace milvus::index

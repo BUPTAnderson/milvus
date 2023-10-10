@@ -21,11 +21,13 @@ default_int64_field_name = ct.default_int64_field_name
 default_float_field_name = ct.default_float_field_name
 default_bool_field_name = ct.default_bool_field_name
 default_string_field_name = ct.default_string_field_name
-binary_field_name = default_binary_vec_field_name
+binary_field_name = ct.default_binary_vec_field_name
 default_search_exp = "int64 >= 0"
 default_term_expr = f'{ct.default_int64_field_name} in [0, 1]'
 
 prefix = "deploy_test"
+
+TIMEOUT = 120
 
 
 class TestActionFirstDeployment(TestDeployBase):
@@ -38,13 +40,14 @@ class TestActionFirstDeployment(TestDeployBase):
         log.info("skip drop collection")
 
     @pytest.mark.tags(CaseLabel.L3)
-    @pytest.mark.parametrize("index_type", ["HNSW","BIN_IVF_FLAT"])
-    def test_task_all_empty(self,index_type):
+    @pytest.mark.parametrize("replica_number", [0])
+    @pytest.mark.parametrize("index_type", ["HNSW", "BIN_IVF_FLAT"])
+    def test_task_all_empty(self, index_type, replica_number):
         """
         before reinstall: create collection
         """
         name = ""
-        for k,v in locals().items():
+        for k, v in locals().items():
             if k in ["self", "name"]:
                 continue
             name += f"_{k}_{v}"
@@ -52,11 +55,13 @@ class TestActionFirstDeployment(TestDeployBase):
         is_binary = False
         if "BIN" in name:
             is_binary = True
-        collection_w = self.init_collection_general(insert_data=False, is_binary=is_binary, name=name)[0]
+        collection_w = \
+            self.init_collection_general(insert_data=False, is_binary=is_binary, name=name, enable_dynamic_field=False,
+                                         with_json=False, is_index=False)[0]
         if collection_w.has_index():
-            collection_w.drop_index()
-
-
+            index_names = [index.index_name for index in collection_w.indexes]
+            for index_name in index_names:
+                collection_w.drop_index(index_name=index_name)
 
     @pytest.mark.tags(CaseLabel.L3)
     @pytest.mark.parametrize("replica_number", [0, 1, 2])
@@ -64,14 +69,14 @@ class TestActionFirstDeployment(TestDeployBase):
     @pytest.mark.parametrize("is_deleted", ["is_deleted"])
     @pytest.mark.parametrize("is_string_indexed", ["is_string_indexed", "not_string_indexed"])
     @pytest.mark.parametrize("segment_status", ["only_growing", "all"])
-    @pytest.mark.parametrize("index_type", ["HNSW", "BIN_IVF_FLAT"]) #"IVF_FLAT", "HNSW", "BIN_IVF_FLAT"
+    @pytest.mark.parametrize("index_type", ["HNSW", "BIN_IVF_FLAT"])
     def test_task_all(self, index_type, is_compacted,
                       segment_status, is_string_indexed, replica_number, is_deleted, data_size):
         """
         before reinstall: create collection and insert data, load and search
         """
         name = ""
-        for k,v in locals().items():
+        for k, v in locals().items():
             if k in ["self", "name"]:
                 continue
             name += f"_{k}_{v}"
@@ -102,7 +107,9 @@ class TestActionFirstDeployment(TestDeployBase):
 
         # init collection and insert with small size data without flush to get growing segment
         collection_w = self.init_collection_general(insert_data=True, is_binary=is_binary, nb=3000,
-                                                    is_flush=False, is_index=True, name=name)[0]
+                                                    is_flush=False, is_index=False, name=name,
+                                                    enable_dynamic_field=False,
+                                                    with_json=False)[0]
         # params for creating index
         if is_binary:
             default_index_field = ct.default_binary_vec_field_name
@@ -112,6 +119,12 @@ class TestActionFirstDeployment(TestDeployBase):
         # create index for vector
         default_index_param = gen_index_param(index_type)
         collection_w.create_index(default_index_field, default_index_param)
+        # create index for string
+        if is_string_indexed == "is_string_indexed":
+            default_string_index_params = {}
+            default_string_index_name = "_default_string_idx"
+            collection_w.create_index(
+                default_string_field_name, default_string_index_params, index_name=default_string_index_name)
 
         # load for growing segment
         if replica_number >= 1:
@@ -120,10 +133,11 @@ class TestActionFirstDeployment(TestDeployBase):
             except Exception as e:
                 log.error(
                     f"release collection failed: {e} maybe the collection is not loaded")
-            collection_w.load(replica_number=replica_number)
+            collection_w.load(replica_number=replica_number, timeout=TIMEOUT)
+            self.utility_wrap.wait_for_loading_complete(name)
 
         # delete data for growing segment
-        delete_expr = f"{ct.default_int64_field_name} in {[i for i in range(0,10)]}"
+        delete_expr = f"{ct.default_int64_field_name} in {[i for i in range(0, 10)]}"
         if is_deleted == "is_deleted":
             collection_w.delete(expr=delete_expr)
 
@@ -134,10 +148,10 @@ class TestActionFirstDeployment(TestDeployBase):
                                 default_search_exp,
                                 check_task=CheckTasks.check_search_results,
                                 check_items={"nq": default_nq,
-                                            "limit": default_limit})
+                                             "limit": default_limit})
             output_fields = [ct.default_int64_field_name]
             collection_w.query(default_term_expr, output_fields=output_fields,
-                            check_task=CheckTasks.check_query_not_empty)
+                               check_task=CheckTasks.check_query_not_empty)
 
         # skip subsequent operations when segment_status is set to only_growing
         if segment_status == "only_growing":
@@ -146,25 +160,20 @@ class TestActionFirstDeployment(TestDeployBase):
         # insert with flush multiple times to generate multiple sealed segment
         for i in range(5):
             self.init_collection_general(insert_data=True, is_binary=is_binary, nb=data_size,
-                                         is_flush=False, is_index=True, name=name)
+                                         is_flush=False, is_index=False, name=name, enable_dynamic_field=False,
+                                         with_json=False)
             # at this step, all segment are sealed
             if pymilvus_version >= "2.2.0":
                 collection_w.flush()
             else:
                 collection_w.collection.num_entities
         # delete data for sealed segment and before index
-        delete_expr = f"{ct.default_int64_field_name} in {[i for i in range(10,20)]}"
+        delete_expr = f"{ct.default_int64_field_name} in {[i for i in range(10, 20)]}"
         if is_deleted == "is_deleted":
             collection_w.delete(expr=delete_expr)
-        # create index for string
-        if is_string_indexed == "is_string_indexed":
-            default_string_index_params = {}
-            default_string_index_name = "_default_string_idx"
-            collection_w.create_index(
-                default_string_field_name, default_string_index_params, index_name=default_string_index_name)
 
         # delete data for sealed segment and after index
-        delete_expr = f"{ct.default_int64_field_name} in {[i for i in range(20,30)]}"
+        delete_expr = f"{ct.default_int64_field_name} in {[i for i in range(20, 30)]}"
         if is_deleted == "is_deleted":
             collection_w.delete(expr=delete_expr)
         if is_compacted == "is_compacted":
@@ -172,17 +181,20 @@ class TestActionFirstDeployment(TestDeployBase):
         # get growing segment before reload
         if segment_status == "all":
             self.init_collection_general(insert_data=True, is_binary=is_binary, nb=3000,
-                                         is_flush=False, is_index=True, name=name)
+                                         is_flush=False, is_index=False, name=name, enable_dynamic_field=False,
+                                         with_json=False)
         # reload after flush and creating index
         if replica_number > 0:
             collection_w.release()
-            collection_w.load(replica_number=replica_number)
+            collection_w.load(replica_number=replica_number, timeout=TIMEOUT)
+            self.utility_wrap.wait_for_loading_complete(name)
 
         # insert data to get growing segment after reload
         if segment_status == "all":
             self.init_collection_general(insert_data=True, is_binary=is_binary, nb=3000,
-                                         is_flush=False, is_index=True, name=name)
-        
+                                         is_flush=False, is_index=False, name=name, enable_dynamic_field=False,
+                                         with_json=False)
+
         # search and query for sealed and growing segment
         if replica_number > 0:
             collection_w.search(vectors_to_search[:default_nq], default_search_field,
@@ -190,7 +202,7 @@ class TestActionFirstDeployment(TestDeployBase):
                                 default_search_exp,
                                 check_task=CheckTasks.check_search_results,
                                 check_items={"nq": default_nq,
-                                            "limit": default_limit})
+                                             "limit": default_limit})
             output_fields = [ct.default_int64_field_name]
             collection_w.query(default_term_expr, output_fields=output_fields,
-                            check_task=CheckTasks.check_query_not_empty)
+                               check_task=CheckTasks.check_query_not_empty)

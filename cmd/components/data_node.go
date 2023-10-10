@@ -19,12 +19,14 @@ package components
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcdatanode "github.com/milvus-io/milvus/internal/distributed/datanode"
-	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // DataNode implements DataNode grpc server
@@ -49,7 +51,8 @@ func NewDataNode(ctx context.Context, factory dependency.Factory) (*DataNode, er
 // Run starts service
 func (d *DataNode) Run() error {
 	if err := d.svr.Run(); err != nil {
-		panic(err)
+		log.Error("DataNode starts error", zap.Error(err))
+		return err
 	}
 	log.Debug("Datanode successfully started")
 	return nil

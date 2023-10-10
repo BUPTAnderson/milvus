@@ -17,8 +17,10 @@
 package kv
 
 import (
-	"github.com/milvus-io/milvus/internal/util/typeutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/milvus-io/milvus/internal/kv/predicates"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // CompareFailedError is a helper type for checking MetaKv CompareAndSwap series func error type
@@ -46,40 +48,44 @@ type BaseKV interface {
 	Remove(key string) error
 	MultiRemove(keys []string) error
 	RemoveWithPrefix(key string) error
-
+	Has(key string) (bool, error)
+	HasPrefix(prefix string) (bool, error)
 	Close()
 }
 
-//go:generate mockery --name=TxnKV
 // TxnKV contains extra txn operations of kv. The extra operations is transactional.
+//
+//go:generate mockery --name=TxnKV --with-expecter
 type TxnKV interface {
 	BaseKV
-	MultiSaveAndRemove(saves map[string]string, removals []string) error
-	MultiRemoveWithPrefix(keys []string) error
-	MultiSaveAndRemoveWithPrefix(saves map[string]string, removals []string) error
+	MultiSaveAndRemove(saves map[string]string, removals []string, preds ...predicates.Predicate) error
+	MultiSaveAndRemoveWithPrefix(saves map[string]string, removals []string, preds ...predicates.Predicate) error
 }
 
 // MetaKv is TxnKV for metadata. It should save data with lease.
+//
+//go:generate mockery --name=MetaKv --with-expecter
 type MetaKv interface {
 	TxnKV
 	GetPath(key string) string
 	LoadWithPrefix(key string) ([]string, []string, error)
-	LoadWithPrefix2(key string) ([]string, []string, []int64, error)
-	LoadWithRevisionAndVersions(key string) ([]string, []string, []int64, int64, error)
-	LoadWithRevision(key string) ([]string, []string, int64, error)
+	CompareVersionAndSwap(key string, version int64, target string) (bool, error)
+	WalkWithPrefix(prefix string, paginationSize int, fn func([]byte, []byte) error) error
+}
+
+// WatchKV is watchable MetaKv. As of today(2023/06/24), it's coupled with etcd.
+//
+//go:generate mockery --name=WatchKV --with-expecter
+type WatchKV interface {
+	MetaKv
 	Watch(key string) clientv3.WatchChan
 	WatchWithPrefix(key string) clientv3.WatchChan
 	WatchWithRevision(key string, revision int64) clientv3.WatchChan
-	SaveWithLease(key, value string, id clientv3.LeaseID) error
-	SaveWithIgnoreLease(key, value string) error
-	Grant(ttl int64) (id clientv3.LeaseID, err error)
-	KeepAlive(id clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error)
-	CompareValueAndSwap(key, value, target string, opts ...clientv3.OpOption) (bool, error)
-	CompareVersionAndSwap(key string, version int64, target string, opts ...clientv3.OpOption) (bool, error)
 }
 
-//go:generate mockery --name=SnapShotKV
 // SnapShotKV is TxnKV for snapshot data. It must save timestamp.
+//
+//go:generate mockery --name=SnapShotKV --with-expecter
 type SnapShotKV interface {
 	Save(key string, value string, ts typeutil.Timestamp) error
 	Load(key string, ts typeutil.Timestamp) (string, error)

@@ -12,9 +12,6 @@
 #include <google/protobuf/text_format.h>
 #include <gtest/gtest.h>
 #include <tuple>
-#include <knowhere/index/vector_index/helpers/IndexParameter.h>
-#include <knowhere/index/vector_index/adapter/VectorAdapter.h>
-#include <knowhere/index/vector_index/ConfAdapterMgr.h>
 #include "pb/index_cgo_msg.pb.h"
 
 #include "indexbuilder/index_c.h"
@@ -23,19 +20,21 @@
 #include "common/type_c.h"
 
 constexpr int NB = 10;
-const CStorageConfig c_storage_config = get_default_cstorage_config();
 
 TEST(FloatVecIndex, All) {
     auto index_type = knowhere::IndexEnum::INDEX_FAISS_IVFPQ;
     auto metric_type = knowhere::metric::L2;
     indexcgo::TypeParams type_params;
     indexcgo::IndexParams index_params;
-    std::tie(type_params, index_params) = generate_params(index_type, metric_type);
+    std::tie(type_params, index_params) =
+        generate_params(index_type, metric_type);
     std::string type_params_str, index_params_str;
     bool ok;
-    ok = google::protobuf::TextFormat::PrintToString(type_params, &type_params_str);
+    ok = google::protobuf::TextFormat::PrintToString(type_params,
+                                                     &type_params_str);
     assert(ok);
-    ok = google::protobuf::TextFormat::PrintToString(index_params, &index_params_str);
+    ok = google::protobuf::TextFormat::PrintToString(index_params,
+                                                     &index_params_str);
     assert(ok);
     auto dataset = GenDataset(NB, metric_type, false);
     auto xb_data = dataset.get_col<float>(milvus::FieldId(100));
@@ -47,33 +46,38 @@ TEST(FloatVecIndex, All) {
     CIndex copy_index;
 
     {
-        status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &index, c_storage_config);
-        ASSERT_EQ(Success, status.error_code);
+        status = CreateIndex(
+            dtype, type_params_str.c_str(), index_params_str.c_str(), &index);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = BuildFloatVecIndex(index, NB * DIM, xb_data.data());
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = SerializeIndexToBinarySet(index, &binary_set);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
-        status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &copy_index, c_storage_config);
-        ASSERT_EQ(Success, status.error_code);
+        status = CreateIndex(dtype,
+                             type_params_str.c_str(),
+                             index_params_str.c_str(),
+                             &copy_index);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = LoadIndexFromBinarySet(copy_index, binary_set);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = DeleteIndex(index);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = DeleteIndex(copy_index);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
+    { DeleteBinarySet(binary_set); }
 }
 
 TEST(BinaryVecIndex, All) {
@@ -81,12 +85,15 @@ TEST(BinaryVecIndex, All) {
     auto metric_type = knowhere::metric::JACCARD;
     indexcgo::TypeParams type_params;
     indexcgo::IndexParams index_params;
-    std::tie(type_params, index_params) = generate_params(index_type, metric_type);
+    std::tie(type_params, index_params) =
+        generate_params(index_type, metric_type);
     std::string type_params_str, index_params_str;
     bool ok;
-    ok = google::protobuf::TextFormat::PrintToString(type_params, &type_params_str);
+    ok = google::protobuf::TextFormat::PrintToString(type_params,
+                                                     &type_params_str);
     assert(ok);
-    ok = google::protobuf::TextFormat::PrintToString(index_params, &index_params_str);
+    ok = google::protobuf::TextFormat::PrintToString(index_params,
+                                                     &index_params_str);
     assert(ok);
     auto dataset = GenDataset(NB, metric_type, true);
     auto xb_data = dataset.get_col<uint8_t>(milvus::FieldId(100));
@@ -98,38 +105,43 @@ TEST(BinaryVecIndex, All) {
     CIndex copy_index;
 
     {
-        status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &index, c_storage_config);
-        ASSERT_EQ(Success, status.error_code);
+        status = CreateIndex(
+            dtype, type_params_str.c_str(), index_params_str.c_str(), &index);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = BuildBinaryVecIndex(index, NB * DIM / 8, xb_data.data());
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = SerializeIndexToBinarySet(index, &binary_set);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
-        status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &copy_index, c_storage_config);
-        ASSERT_EQ(Success, status.error_code);
+        status = CreateIndex(dtype,
+                             type_params_str.c_str(),
+                             index_params_str.c_str(),
+                             &copy_index);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = LoadIndexFromBinarySet(copy_index, binary_set);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = DeleteIndex(index);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
     {
         status = DeleteIndex(copy_index);
-        ASSERT_EQ(Success, status.error_code);
+        ASSERT_EQ(milvus::Success, status.error_code);
     }
+    { DeleteBinarySet(binary_set); }
 }
 
 TEST(CBoolIndexTest, All) {
     schemapb::BoolArray half;
-    knowhere::DatasetPtr half_ds;
+    knowhere::DataSetPtr half_ds;
 
     for (size_t i = 0; i < NB; i++) {
         *(half.mutable_data()->Add()) = (i % 2) == 0;
@@ -150,37 +162,44 @@ TEST(CBoolIndexTest, All) {
         CIndex copy_index;
 
         {
-            status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &index, c_storage_config);
-            ASSERT_EQ(Success, status.error_code);
+            status = CreateIndex(dtype,
+                                 type_params_str.c_str(),
+                                 index_params_str.c_str(),
+                                 &index);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
-            status = BuildScalarIndex(index, knowhere::GetDatasetRows(half_ds), knowhere::GetDatasetTensor(half_ds));
-            ASSERT_EQ(Success, status.error_code);
+            status = BuildScalarIndex(
+                index, half_ds->GetRows(), half_ds->GetTensor());
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = SerializeIndexToBinarySet(index, &binary_set);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
-            status =
-                CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &copy_index, c_storage_config);
-            ASSERT_EQ(Success, status.error_code);
+            status = CreateIndex(dtype,
+                                 type_params_str.c_str(),
+                                 index_params_str.c_str(),
+                                 &copy_index);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = LoadIndexFromBinarySet(copy_index, binary_set);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = DeleteIndex(index);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = DeleteIndex(copy_index);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
+        { DeleteBinarySet(binary_set); }
     }
 
-    delete[](char*) knowhere::GetDatasetTensor(half_ds);
+    delete[](char*)(half_ds->GetTensor());
 }
 
 // TODO: more scalar type.
@@ -201,34 +220,40 @@ TEST(CInt64IndexTest, All) {
         CIndex copy_index;
 
         {
-            status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &index, c_storage_config);
-            ASSERT_EQ(Success, status.error_code);
+            status = CreateIndex(dtype,
+                                 type_params_str.c_str(),
+                                 index_params_str.c_str(),
+                                 &index);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = BuildScalarIndex(index, arr.size(), arr.data());
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = SerializeIndexToBinarySet(index, &binary_set);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
-            status =
-                CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &copy_index, c_storage_config);
-            ASSERT_EQ(Success, status.error_code);
+            status = CreateIndex(dtype,
+                                 type_params_str.c_str(),
+                                 index_params_str.c_str(),
+                                 &copy_index);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = LoadIndexFromBinarySet(copy_index, binary_set);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = DeleteIndex(index);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = DeleteIndex(copy_index);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
+        { DeleteBinarySet(binary_set); }
     }
 }
 
@@ -254,36 +279,43 @@ TEST(CStringIndexTest, All) {
         CIndex copy_index;
 
         {
-            status = CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &index, c_storage_config);
-            ASSERT_EQ(Success, status.error_code);
+            status = CreateIndex(dtype,
+                                 type_params_str.c_str(),
+                                 index_params_str.c_str(),
+                                 &index);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
-            status = BuildScalarIndex(index, knowhere::GetDatasetRows(str_ds), knowhere::GetDatasetTensor(str_ds));
-            ASSERT_EQ(Success, status.error_code);
+            status = BuildScalarIndex(
+                index, (str_ds->GetRows()), (str_ds->GetTensor()));
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = SerializeIndexToBinarySet(index, &binary_set);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
-            status =
-                CreateIndex(dtype, type_params_str.c_str(), index_params_str.c_str(), &copy_index, c_storage_config);
-            ASSERT_EQ(Success, status.error_code);
+            status = CreateIndex(dtype,
+                                 type_params_str.c_str(),
+                                 index_params_str.c_str(),
+                                 &copy_index);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = LoadIndexFromBinarySet(copy_index, binary_set);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = DeleteIndex(index);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
         {
             status = DeleteIndex(copy_index);
-            ASSERT_EQ(Success, status.error_code);
+            ASSERT_EQ(milvus::Success, status.error_code);
         }
+        { DeleteBinarySet(binary_set); }
     }
 
-    delete[](char*) knowhere::GetDatasetTensor(str_ds);
+    delete[](char*)(str_ds->GetTensor());
 }
 #endif

@@ -18,33 +18,29 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/types"
-
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-
-	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
-
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
+	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/util/milvuserrors"
-
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/milvuserrors"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
 )
 
 type collectionMeta struct {
@@ -109,10 +105,10 @@ type RootCoordMock struct {
 
 	lastTs          typeutil.Timestamp
 	lastTsMtx       sync.Mutex
-	checkHealthFunc func(ctx context.Context, req *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error)
+	checkHealthFunc func(ctx context.Context, req *milvuspb.CheckHealthRequest, opts ...grpc.CallOption) (*milvuspb.CheckHealthResponse, error)
 }
 
-func (coord *RootCoordMock) CreateAlias(ctx context.Context, req *milvuspb.CreateAliasRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) CreateAlias(ctx context.Context, req *milvuspb.CreateAliasRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -140,13 +136,10 @@ func (coord *RootCoordMock) CreateAlias(ctx context.Context, req *milvuspb.Creat
 	}
 
 	coord.collAlias2ID[req.Alias] = collID
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) DropAlias(ctx context.Context, req *milvuspb.DropAliasRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) DropAlias(ctx context.Context, req *milvuspb.DropAliasRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -166,13 +159,10 @@ func (coord *RootCoordMock) DropAlias(ctx context.Context, req *milvuspb.DropAli
 	}
 
 	delete(coord.collAlias2ID, req.Alias)
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) AlterAlias(ctx context.Context, req *milvuspb.AlterAliasRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) AlterAlias(ctx context.Context, req *milvuspb.AlterAliasRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -198,10 +188,7 @@ func (coord *RootCoordMock) AlterAlias(ctx context.Context, req *milvuspb.AlterA
 		}, nil
 	}
 	coord.collAlias2ID[req.Alias] = collID
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
 func (coord *RootCoordMock) updateState(state commonpb.StateCode) {
@@ -216,24 +203,12 @@ func (coord *RootCoordMock) healthy() bool {
 	return coord.getState() == commonpb.StateCode_Healthy
 }
 
-func (coord *RootCoordMock) Init() error {
-	coord.updateState(commonpb.StateCode_Initializing)
-	return nil
-}
-
-func (coord *RootCoordMock) Start() error {
-	defer coord.updateState(commonpb.StateCode_Healthy)
-
-	return nil
-}
-
-func (coord *RootCoordMock) Stop() error {
+func (coord *RootCoordMock) Close() error {
 	defer coord.updateState(commonpb.StateCode_Abnormal)
-
 	return nil
 }
 
-func (coord *RootCoordMock) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+func (coord *RootCoordMock) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error) {
 	return &milvuspb.ComponentStates{
 		State: &milvuspb.ComponentInfo{
 			NodeID:    coord.nodeID,
@@ -242,14 +217,11 @@ func (coord *RootCoordMock) GetComponentStates(ctx context.Context) (*milvuspb.C
 			ExtraInfo: nil,
 		},
 		SubcomponentStates: nil,
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:             merr.Status(nil),
 	}, nil
 }
 
-func (coord *RootCoordMock) GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (coord *RootCoordMock) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.StringResponse{
@@ -260,11 +232,8 @@ func (coord *RootCoordMock) GetStatisticsChannel(ctx context.Context) (*milvuspb
 		}, nil
 	}
 	return &milvuspb.StringResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Value: coord.statisticsChannel,
+		Status: merr.Status(nil),
+		Value:  coord.statisticsChannel,
 	}, nil
 }
 
@@ -272,7 +241,7 @@ func (coord *RootCoordMock) Register() error {
 	return nil
 }
 
-func (coord *RootCoordMock) GetTimeTickChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (coord *RootCoordMock) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.StringResponse{
@@ -283,15 +252,12 @@ func (coord *RootCoordMock) GetTimeTickChannel(ctx context.Context) (*milvuspb.S
 		}, nil
 	}
 	return &milvuspb.StringResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Value: coord.timeTickChannel,
+		Status: merr.Status(nil),
+		Value:  coord.timeTickChannel,
 	}, nil
 }
 
-func (coord *RootCoordMock) CreateCollection(ctx context.Context, req *milvuspb.CreateCollectionRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) CreateCollection(ctx context.Context, req *milvuspb.CreateCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -320,6 +286,15 @@ func (coord *RootCoordMock) CreateCollection(ctx context.Context, req *milvuspb.
 	}
 	for i := range schema.Fields {
 		schema.Fields[i].FieldID = int64(common.StartOfUserFieldID + i)
+	}
+	if schema.EnableDynamicField {
+		schema.Fields = append(schema.Fields, &schemapb.FieldSchema{
+			FieldID:     int64(common.StartOfUserFieldID + len(schema.Fields)),
+			Name:        common.MetaFieldName,
+			Description: "$meta",
+			DataType:    schemapb.DataType_JSON,
+			IsDynamic:   true,
+		})
 	}
 
 	collID := typeutil.UniqueID(uniquegenerator.GetUniqueIntGeneratorIns().GetInt())
@@ -362,13 +337,29 @@ func (coord *RootCoordMock) CreateCollection(ctx context.Context, req *milvuspb.
 		partitionID2Meta: make(map[typeutil.UniqueID]partitionMeta),
 	}
 
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	idGenerator := uniquegenerator.GetUniqueIntGeneratorIns()
+	defaultPartitionName := Params.CommonCfg.DefaultPartitionName.GetValue()
+	_, err = typeutil.GetPartitionKeyFieldSchema(&schema)
+	if err == nil {
+		partitionNums := req.GetNumPartitions()
+		for i := int64(0); i < partitionNums; i++ {
+			partitionName := fmt.Sprintf("%s_%d", defaultPartitionName, i)
+			id := UniqueID(idGenerator.GetInt())
+			coord.collID2Partitions[collID].partitionName2ID[partitionName] = id
+			coord.collID2Partitions[collID].partitionID2Name[id] = partitionName
+			coord.collID2Partitions[collID].partitionID2Meta[id] = partitionMeta{}
+		}
+	} else {
+		id := UniqueID(idGenerator.GetInt())
+		coord.collID2Partitions[collID].partitionName2ID[defaultPartitionName] = id
+		coord.collID2Partitions[collID].partitionID2Name[id] = defaultPartitionName
+		coord.collID2Partitions[collID].partitionID2Meta[id] = partitionMeta{}
+	}
+
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) DropCollection(ctx context.Context, req *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) DropCollection(ctx context.Context, req *milvuspb.DropCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -396,13 +387,10 @@ func (coord *RootCoordMock) DropCollection(ctx context.Context, req *milvuspb.Dr
 
 	delete(coord.collID2Partitions, collID)
 
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) HasCollection(ctx context.Context, req *milvuspb.HasCollectionRequest) (*milvuspb.BoolResponse, error) {
+func (coord *RootCoordMock) HasCollection(ctx context.Context, req *milvuspb.HasCollectionRequest, opts ...grpc.CallOption) (*milvuspb.BoolResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.BoolResponse{
@@ -419,11 +407,8 @@ func (coord *RootCoordMock) HasCollection(ctx context.Context, req *milvuspb.Has
 	_, exist := coord.collName2ID[req.CollectionName]
 
 	return &milvuspb.BoolResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Value: exist,
+		Status: merr.Status(nil),
+		Value:  exist,
 	}, nil
 }
 
@@ -435,7 +420,7 @@ func (coord *RootCoordMock) ResetDescribeCollectionFunc() {
 	coord.describeCollectionFunc = nil
 }
 
-func (coord *RootCoordMock) DescribeCollection(ctx context.Context, req *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+func (coord *RootCoordMock) DescribeCollection(ctx context.Context, req *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.DescribeCollectionResponse{
@@ -481,10 +466,7 @@ func (coord *RootCoordMock) DescribeCollection(ctx context.Context, req *milvusp
 	}
 
 	return &milvuspb.DescribeCollectionResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:               merr.Status(nil),
 		Schema:               meta.schema,
 		CollectionID:         collID,
 		ShardsNum:            meta.shardsNum,
@@ -495,7 +477,11 @@ func (coord *RootCoordMock) DescribeCollection(ctx context.Context, req *milvusp
 	}, nil
 }
 
-func (coord *RootCoordMock) ShowCollections(ctx context.Context, req *milvuspb.ShowCollectionsRequest) (*milvuspb.ShowCollectionsResponse, error) {
+func (coord *RootCoordMock) DescribeCollectionInternal(ctx context.Context, req *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
+	return coord.DescribeCollection(ctx, req)
+}
+
+func (coord *RootCoordMock) ShowCollections(ctx context.Context, req *milvuspb.ShowCollectionsRequest, opts ...grpc.CallOption) (*milvuspb.ShowCollectionsResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.ShowCollectionsResponse{
@@ -524,10 +510,7 @@ func (coord *RootCoordMock) ShowCollections(ctx context.Context, req *milvuspb.S
 	}
 
 	return &milvuspb.ShowCollectionsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:               merr.Status(nil),
 		CollectionNames:      names,
 		CollectionIds:        ids,
 		CreatedTimestamps:    createdTimestamps,
@@ -536,7 +519,7 @@ func (coord *RootCoordMock) ShowCollections(ctx context.Context, req *milvuspb.S
 	}, nil
 }
 
-func (coord *RootCoordMock) CreatePartition(ctx context.Context, req *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) CreatePartition(ctx context.Context, req *milvuspb.CreatePartitionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -576,13 +559,10 @@ func (coord *RootCoordMock) CreatePartition(ctx context.Context, req *milvuspb.C
 		createdUtcTimestamp: ts,
 	}
 
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) DropPartition(ctx context.Context, req *milvuspb.DropPartitionRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) DropPartition(ctx context.Context, req *milvuspb.DropPartitionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -615,13 +595,10 @@ func (coord *RootCoordMock) DropPartition(ctx context.Context, req *milvuspb.Dro
 	delete(coord.collID2Partitions[collID].partitionName2ID, req.PartitionName)
 	delete(coord.collID2Partitions[collID].partitionID2Name, partitionID)
 
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) HasPartition(ctx context.Context, req *milvuspb.HasPartitionRequest) (*milvuspb.BoolResponse, error) {
+func (coord *RootCoordMock) HasPartition(ctx context.Context, req *milvuspb.HasPartitionRequest, opts ...grpc.CallOption) (*milvuspb.BoolResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.BoolResponse{
@@ -651,15 +628,12 @@ func (coord *RootCoordMock) HasPartition(ctx context.Context, req *milvuspb.HasP
 
 	_, partitionExist := coord.collID2Partitions[collID].partitionName2ID[req.PartitionName]
 	return &milvuspb.BoolResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Value: partitionExist,
+		Status: merr.Status(nil),
+		Value:  partitionExist,
 	}, nil
 }
 
-func (coord *RootCoordMock) ShowPartitions(ctx context.Context, req *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
+func (coord *RootCoordMock) ShowPartitions(ctx context.Context, req *milvuspb.ShowPartitionsRequest, opts ...grpc.CallOption) (*milvuspb.ShowPartitionsResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.ShowPartitionsResponse{
@@ -708,16 +682,17 @@ func (coord *RootCoordMock) ShowPartitions(ctx context.Context, req *milvuspb.Sh
 	}
 
 	return &milvuspb.ShowPartitionsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:               merr.Status(nil),
 		PartitionNames:       names,
 		PartitionIDs:         ids,
 		CreatedTimestamps:    createdTimestamps,
 		CreatedUtcTimestamps: createdUtcTimestamps,
 		InMemoryPercentages:  nil,
 	}, nil
+}
+
+func (coord *RootCoordMock) ShowPartitionsInternal(ctx context.Context, req *milvuspb.ShowPartitionsRequest, opts ...grpc.CallOption) (*milvuspb.ShowPartitionsResponse, error) {
+	return coord.ShowPartitions(ctx, req)
 }
 
 //func (coord *RootCoordMock) CreateIndex(ctx context.Context, req *milvuspb.CreateIndexRequest) (*commonpb.Status, error) {
@@ -786,7 +761,7 @@ func (coord *RootCoordMock) ShowPartitions(ctx context.Context, req *milvuspb.Sh
 //	}, nil
 //}
 
-func (coord *RootCoordMock) AllocTimestamp(ctx context.Context, req *rootcoordpb.AllocTimestampRequest) (*rootcoordpb.AllocTimestampResponse, error) {
+func (coord *RootCoordMock) AllocTimestamp(ctx context.Context, req *rootcoordpb.AllocTimestampRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocTimestampResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &rootcoordpb.AllocTimestampResponse{
@@ -808,16 +783,13 @@ func (coord *RootCoordMock) AllocTimestamp(ctx context.Context, req *rootcoordpb
 
 	coord.lastTs = ts
 	return &rootcoordpb.AllocTimestampResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:    merr.Status(nil),
 		Timestamp: ts,
 		Count:     req.Count,
 	}, nil
 }
 
-func (coord *RootCoordMock) AllocID(ctx context.Context, req *rootcoordpb.AllocIDRequest) (*rootcoordpb.AllocIDResponse, error) {
+func (coord *RootCoordMock) AllocID(ctx context.Context, req *rootcoordpb.AllocIDRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocIDResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &rootcoordpb.AllocIDResponse{
@@ -831,16 +803,13 @@ func (coord *RootCoordMock) AllocID(ctx context.Context, req *rootcoordpb.AllocI
 	}
 	begin, _ := uniquegenerator.GetUniqueIntGeneratorIns().GetInts(int(req.Count))
 	return &rootcoordpb.AllocIDResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		ID:    int64(begin),
-		Count: req.Count,
+		Status: merr.Status(nil),
+		ID:     int64(begin),
+		Count:  req.Count,
 	}, nil
 }
 
-func (coord *RootCoordMock) UpdateChannelTimeTick(ctx context.Context, req *internalpb.ChannelTimeTickMsg) (*commonpb.Status, error) {
+func (coord *RootCoordMock) UpdateChannelTimeTick(ctx context.Context, req *internalpb.ChannelTimeTickMsg, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -848,13 +817,10 @@ func (coord *RootCoordMock) UpdateChannelTimeTick(ctx context.Context, req *inte
 			Reason:    fmt.Sprintf("state code = %s", commonpb.StateCode_name[int32(code)]),
 		}, nil
 	}
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) DescribeSegment(ctx context.Context, req *milvuspb.DescribeSegmentRequest) (*milvuspb.DescribeSegmentResponse, error) {
+func (coord *RootCoordMock) DescribeSegment(ctx context.Context, req *milvuspb.DescribeSegmentRequest, opts ...grpc.CallOption) (*milvuspb.DescribeSegmentResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.DescribeSegmentResponse{
@@ -866,17 +832,14 @@ func (coord *RootCoordMock) DescribeSegment(ctx context.Context, req *milvuspb.D
 		}, nil
 	}
 	return &milvuspb.DescribeSegmentResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:      merr.Status(nil),
 		IndexID:     0,
 		BuildID:     0,
 		EnableIndex: false,
 	}, nil
 }
 
-func (coord *RootCoordMock) ShowSegments(ctx context.Context, req *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error) {
+func (coord *RootCoordMock) ShowSegments(ctx context.Context, req *milvuspb.ShowSegmentsRequest, opts ...grpc.CallOption) (*milvuspb.ShowSegmentsResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.ShowSegmentsResponse{
@@ -888,19 +851,16 @@ func (coord *RootCoordMock) ShowSegments(ctx context.Context, req *milvuspb.Show
 		}, nil
 	}
 	return &milvuspb.ShowSegmentsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:     merr.Status(nil),
 		SegmentIDs: nil,
 	}, nil
 }
 
-func (coord *RootCoordMock) DescribeSegments(ctx context.Context, req *rootcoordpb.DescribeSegmentsRequest) (*rootcoordpb.DescribeSegmentsResponse, error) {
+func (coord *RootCoordMock) DescribeSegments(ctx context.Context, req *rootcoordpb.DescribeSegmentsRequest, opts ...grpc.CallOption) (*rootcoordpb.DescribeSegmentsResponse, error) {
 	panic("implement me")
 }
 
-func (coord *RootCoordMock) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.InvalidateCollMetaCacheRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.InvalidateCollMetaCacheRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -908,10 +868,7 @@ func (coord *RootCoordMock) InvalidateCollectionMetaCache(ctx context.Context, i
 			Reason:    fmt.Sprintf("state code = %s", commonpb.StateCode_name[int32(code)]),
 		}, nil
 	}
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
 func (coord *RootCoordMock) SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg) (*commonpb.Status, error) {
@@ -922,13 +879,10 @@ func (coord *RootCoordMock) SegmentFlushCompleted(ctx context.Context, in *datap
 			Reason:    fmt.Sprintf("state code = %s", commonpb.StateCode_name[int32(code)]),
 		}, nil
 	}
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
-func (coord *RootCoordMock) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+func (coord *RootCoordMock) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest, opts ...grpc.CallOption) (*internalpb.ShowConfigurationsResponse, error) {
 	if !coord.healthy() {
 		return &internalpb.ShowConfigurationsResponse{
 			Status: &commonpb.Status{
@@ -950,7 +904,7 @@ func (coord *RootCoordMock) ShowConfigurations(ctx context.Context, req *interna
 	}, nil
 }
 
-func (coord *RootCoordMock) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+func (coord *RootCoordMock) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest, opts ...grpc.CallOption) (*milvuspb.GetMetricsResponse, error) {
 	if !coord.healthy() {
 		return &milvuspb.GetMetricsResponse{
 			Status: &commonpb.Status{
@@ -974,7 +928,7 @@ func (coord *RootCoordMock) GetMetrics(ctx context.Context, req *milvuspb.GetMet
 	}, nil
 }
 
-func (coord *RootCoordMock) Import(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
+func (coord *RootCoordMock) Import(ctx context.Context, req *milvuspb.ImportRequest, opts ...grpc.CallOption) (*milvuspb.ImportResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.ImportResponse{
@@ -986,15 +940,12 @@ func (coord *RootCoordMock) Import(ctx context.Context, req *milvuspb.ImportRequ
 		}, nil
 	}
 	return &milvuspb.ImportResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Tasks: make([]int64, 3),
+		Status: merr.Status(nil),
+		Tasks:  make([]int64, 3),
 	}, nil
 }
 
-func (coord *RootCoordMock) GetImportState(ctx context.Context, req *milvuspb.GetImportStateRequest) (*milvuspb.GetImportStateResponse, error) {
+func (coord *RootCoordMock) GetImportState(ctx context.Context, req *milvuspb.GetImportStateRequest, opts ...grpc.CallOption) (*milvuspb.GetImportStateResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.GetImportStateResponse{
@@ -1007,16 +958,13 @@ func (coord *RootCoordMock) GetImportState(ctx context.Context, req *milvuspb.Ge
 		}, nil
 	}
 	return &milvuspb.GetImportStateResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:   merr.Status(nil),
 		RowCount: 10,
 		IdList:   make([]int64, 3),
 	}, nil
 }
 
-func (coord *RootCoordMock) ListImportTasks(ctx context.Context, in *milvuspb.ListImportTasksRequest) (*milvuspb.ListImportTasksResponse, error) {
+func (coord *RootCoordMock) ListImportTasks(ctx context.Context, in *milvuspb.ListImportTasksRequest, opts ...grpc.CallOption) (*milvuspb.ListImportTasksResponse, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &milvuspb.ListImportTasksResponse{
@@ -1028,15 +976,12 @@ func (coord *RootCoordMock) ListImportTasks(ctx context.Context, in *milvuspb.Li
 		}, nil
 	}
 	return &milvuspb.ListImportTasksResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Tasks: make([]*milvuspb.GetImportStateResponse, 3),
+		Status: merr.Status(nil),
+		Tasks:  make([]*milvuspb.GetImportStateResponse, 3),
 	}, nil
 }
 
-func (coord *RootCoordMock) ReportImport(ctx context.Context, req *rootcoordpb.ImportResult) (*commonpb.Status, error) {
+func (coord *RootCoordMock) ReportImport(ctx context.Context, req *rootcoordpb.ImportResult, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	code := coord.state.Load().(commonpb.StateCode)
 	if code != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
@@ -1044,10 +989,7 @@ func (coord *RootCoordMock) ReportImport(ctx context.Context, req *rootcoordpb.I
 			Reason:    fmt.Sprintf("state code = %s", commonpb.StateCode_name[int32(code)]),
 		}, nil
 	}
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	return merr.Status(nil), nil
 }
 
 func NewRootCoordMock(opts ...RootCoordMockOption) *RootCoordMock {
@@ -1066,83 +1008,105 @@ func NewRootCoordMock(opts ...RootCoordMockOption) *RootCoordMock {
 		opt(rc)
 	}
 
+	rc.updateState(commonpb.StateCode_Healthy)
 	return rc
 }
 
-func (coord *RootCoordMock) CreateCredential(ctx context.Context, req *internalpb.CredentialInfo) (*commonpb.Status, error) {
+func (coord *RootCoordMock) CreateCredential(ctx context.Context, req *internalpb.CredentialInfo, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) UpdateCredential(ctx context.Context, req *internalpb.CredentialInfo) (*commonpb.Status, error) {
+func (coord *RootCoordMock) UpdateCredential(ctx context.Context, req *internalpb.CredentialInfo, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) DeleteCredential(ctx context.Context, req *milvuspb.DeleteCredentialRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) DeleteCredential(ctx context.Context, req *milvuspb.DeleteCredentialRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersRequest) (*milvuspb.ListCredUsersResponse, error) {
+func (coord *RootCoordMock) ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersRequest, opts ...grpc.CallOption) (*milvuspb.ListCredUsersResponse, error) {
 	return &milvuspb.ListCredUsersResponse{}, nil
 }
 
-func (coord *RootCoordMock) GetCredential(ctx context.Context, req *rootcoordpb.GetCredentialRequest) (*rootcoordpb.GetCredentialResponse, error) {
+func (coord *RootCoordMock) GetCredential(ctx context.Context, req *rootcoordpb.GetCredentialRequest, opts ...grpc.CallOption) (*rootcoordpb.GetCredentialResponse, error) {
 	return &rootcoordpb.GetCredentialResponse{}, nil
 }
 
-func (coord *RootCoordMock) CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) DropRole(ctx context.Context, req *milvuspb.DropRoleRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) DropRole(ctx context.Context, req *milvuspb.DropRoleRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) OperateUserRole(ctx context.Context, req *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) OperateUserRole(ctx context.Context, req *milvuspb.OperateUserRoleRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) SelectRole(ctx context.Context, req *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error) {
+func (coord *RootCoordMock) SelectRole(ctx context.Context, req *milvuspb.SelectRoleRequest, opts ...grpc.CallOption) (*milvuspb.SelectRoleResponse, error) {
 	return &milvuspb.SelectRoleResponse{}, nil
 }
 
-func (coord *RootCoordMock) SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error) {
+func (coord *RootCoordMock) SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest, opts ...grpc.CallOption) (*milvuspb.SelectUserResponse, error) {
 	return &milvuspb.SelectUserResponse{}, nil
 }
 
-func (coord *RootCoordMock) OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) SelectGrant(ctx context.Context, req *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error) {
+func (coord *RootCoordMock) SelectGrant(ctx context.Context, req *milvuspb.SelectGrantRequest, opts ...grpc.CallOption) (*milvuspb.SelectGrantResponse, error) {
 	return &milvuspb.SelectGrantResponse{}, nil
 }
 
-func (coord *RootCoordMock) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest) (*internalpb.ListPolicyResponse, error) {
+func (coord *RootCoordMock) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest, opts ...grpc.CallOption) (*internalpb.ListPolicyResponse, error) {
 	return &internalpb.ListPolicyResponse{}, nil
 }
 
-func (coord *RootCoordMock) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+func (coord *RootCoordMock) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, nil
 }
 
-func (coord *RootCoordMock) CheckHealth(ctx context.Context, req *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error) {
+func (coord *RootCoordMock) CreateDatabase(ctx context.Context, in *milvuspb.CreateDatabaseRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, nil
+}
+
+func (coord *RootCoordMock) DropDatabase(ctx context.Context, in *milvuspb.DropDatabaseRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil
+}
+
+func (coord *RootCoordMock) ListDatabases(ctx context.Context, in *milvuspb.ListDatabasesRequest, opts ...grpc.CallOption) (*milvuspb.ListDatabasesResponse, error) {
+	return &milvuspb.ListDatabasesResponse{}, nil
+}
+
+func (coord *RootCoordMock) CheckHealth(ctx context.Context, req *milvuspb.CheckHealthRequest, opts ...grpc.CallOption) (*milvuspb.CheckHealthResponse, error) {
 	if coord.checkHealthFunc != nil {
 		return coord.checkHealthFunc(ctx, req)
 	}
 	return &milvuspb.CheckHealthResponse{IsHealthy: true}, nil
 }
 
-type DescribeCollectionFunc func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error)
-type ShowPartitionsFunc func(ctx context.Context, request *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error)
-type ShowSegmentsFunc func(ctx context.Context, request *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error)
-type DescribeSegmentsFunc func(ctx context.Context, request *rootcoordpb.DescribeSegmentsRequest) (*rootcoordpb.DescribeSegmentsResponse, error)
-type ImportFunc func(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error)
-type DropCollectionFunc func(ctx context.Context, request *milvuspb.DropCollectionRequest) (*commonpb.Status, error)
+func (coord *RootCoordMock) RenameCollection(ctx context.Context, req *milvuspb.RenameCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, nil
+}
 
-type GetGetCredentialFunc func(ctx context.Context, req *rootcoordpb.GetCredentialRequest) (*rootcoordpb.GetCredentialResponse, error)
+type DescribeCollectionFunc func(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error)
+
+type ShowPartitionsFunc func(ctx context.Context, request *milvuspb.ShowPartitionsRequest, opts ...grpc.CallOption) (*milvuspb.ShowPartitionsResponse, error)
+
+type ShowSegmentsFunc func(ctx context.Context, request *milvuspb.ShowSegmentsRequest, opts ...grpc.CallOption) (*milvuspb.ShowSegmentsResponse, error)
+
+type DescribeSegmentsFunc func(ctx context.Context, request *rootcoordpb.DescribeSegmentsRequest, opts ...grpc.CallOption) (*rootcoordpb.DescribeSegmentsResponse, error)
+
+type ImportFunc func(ctx context.Context, req *milvuspb.ImportRequest, opts ...grpc.CallOption) (*milvuspb.ImportResponse, error)
+
+type DropCollectionFunc func(ctx context.Context, request *milvuspb.DropCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
+
+type GetGetCredentialFunc func(ctx context.Context, req *rootcoordpb.GetCredentialRequest, opts ...grpc.CallOption) (*rootcoordpb.GetCredentialResponse, error)
 
 type mockRootCoord struct {
-	types.RootCoord
+	types.RootCoordClient
 	DescribeCollectionFunc
 	ShowPartitionsFunc
 	ShowSegmentsFunc
@@ -1152,57 +1116,76 @@ type mockRootCoord struct {
 	GetGetCredentialFunc
 }
 
-func (m *mockRootCoord) GetCredential(ctx context.Context, request *rootcoordpb.GetCredentialRequest) (*rootcoordpb.GetCredentialResponse, error) {
+func (m *mockRootCoord) GetCredential(ctx context.Context, request *rootcoordpb.GetCredentialRequest, opts ...grpc.CallOption) (*rootcoordpb.GetCredentialResponse, error) {
 	if m.GetGetCredentialFunc != nil {
 		return m.GetGetCredentialFunc(ctx, request)
 	}
 	return nil, errors.New("mock")
-
 }
 
-func (m *mockRootCoord) DescribeCollection(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+func (m *mockRootCoord) DescribeCollection(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
 	if m.DescribeCollectionFunc != nil {
 		return m.DescribeCollectionFunc(ctx, request)
 	}
 	return nil, errors.New("mock")
 }
 
-func (m *mockRootCoord) ShowPartitions(ctx context.Context, request *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
+func (m *mockRootCoord) DescribeCollectionInternal(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
+	return m.DescribeCollection(ctx, request)
+}
+
+func (m *mockRootCoord) ShowPartitions(ctx context.Context, request *milvuspb.ShowPartitionsRequest, opts ...grpc.CallOption) (*milvuspb.ShowPartitionsResponse, error) {
 	if m.ShowPartitionsFunc != nil {
 		return m.ShowPartitionsFunc(ctx, request)
 	}
 	return nil, errors.New("mock")
 }
 
-func (m *mockRootCoord) ShowSegments(ctx context.Context, request *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error) {
+func (m *mockRootCoord) ShowPartitionsInternal(ctx context.Context, request *milvuspb.ShowPartitionsRequest, opts ...grpc.CallOption) (*milvuspb.ShowPartitionsResponse, error) {
+	return m.ShowPartitions(ctx, request)
+}
+
+func (m *mockRootCoord) ShowSegments(ctx context.Context, request *milvuspb.ShowSegmentsRequest, opts ...grpc.CallOption) (*milvuspb.ShowSegmentsResponse, error) {
 	if m.ShowSegmentsFunc != nil {
 		return m.ShowSegmentsFunc(ctx, request)
 	}
 	return nil, errors.New("mock")
 }
 
-func (m *mockRootCoord) Import(ctx context.Context, request *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
+func (m *mockRootCoord) Import(ctx context.Context, request *milvuspb.ImportRequest, opts ...grpc.CallOption) (*milvuspb.ImportResponse, error) {
 	if m.ImportFunc != nil {
 		return m.ImportFunc(ctx, request)
 	}
 	return nil, errors.New("mock")
 }
 
-func (m *mockRootCoord) DropCollection(ctx context.Context, request *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
+func (m *mockRootCoord) DropCollection(ctx context.Context, request *milvuspb.DropCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	if m.DropCollectionFunc != nil {
 		return m.DropCollectionFunc(ctx, request)
 	}
 	return nil, errors.New("mock")
 }
 
-func (m *mockRootCoord) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest) (*internalpb.ListPolicyResponse, error) {
+func (m *mockRootCoord) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest, opts ...grpc.CallOption) (*internalpb.ListPolicyResponse, error) {
 	return &internalpb.ListPolicyResponse{}, nil
 }
 
-func (m *mockRootCoord) CheckHealth(ctx context.Context, req *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error) {
+func (m *mockRootCoord) CheckHealth(ctx context.Context, req *milvuspb.CheckHealthRequest, opts ...grpc.CallOption) (*milvuspb.CheckHealthResponse, error) {
 	return &milvuspb.CheckHealthResponse{
 		IsHealthy: true,
 	}, nil
+}
+
+func (m *mockRootCoord) CreateDatabase(ctx context.Context, in *milvuspb.CreateDatabaseRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, nil
+}
+
+func (m *mockRootCoord) DropDatabase(ctx context.Context, in *milvuspb.DropDatabaseRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, nil
+}
+
+func (m *mockRootCoord) ListDatabases(ctx context.Context, in *milvuspb.ListDatabasesRequest, opts ...grpc.CallOption) (*milvuspb.ListDatabasesResponse, error) {
+	return &milvuspb.ListDatabasesResponse{}, nil
 }
 
 func newMockRootCoord() *mockRootCoord {

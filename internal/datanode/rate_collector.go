@@ -19,8 +19,14 @@ package datanode
 import (
 	"sync"
 
-	"github.com/milvus-io/milvus/internal/util/ratelimitutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/ratelimitutil"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
+)
+
+// rateCol is global rateCollector in DataNode.
+var (
+	rateCol  *rateCollector
+	initOnce sync.Once
 )
 
 // rateCollector helps to collect and calculate values (like rate, timeTick and etc...).
@@ -29,6 +35,14 @@ type rateCollector struct {
 
 	flowGraphTtMu sync.Mutex
 	flowGraphTt   map[string]Timestamp
+}
+
+func initGlobalRateCollector() error {
+	var err error
+	initOnce.Do(func() {
+		rateCol, err = newRateCollector()
+	})
+	return err
 }
 
 // newRateCollector returns a new rateCollector.

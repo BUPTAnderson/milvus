@@ -16,58 +16,97 @@
 
 #pragma once
 
-#include <iostream>
+#include <string>
 #include <memory>
 
-#include "arrow/api.h"
-#include "storage/Types.h"
-#include "storage/PayloadStream.h"
+#include <oneapi/tbb/concurrent_queue.h>
+
+#include "storage/FieldDataInterface.h"
+#include "common/Channel.h"
 
 namespace milvus::storage {
 
-using DataType = milvus::DataType;
-
-class FieldData {
+template <typename Type>
+class FieldData : public FieldDataImpl<Type, true> {
  public:
-    explicit FieldData(const Payload& payload);
+    static_assert(IsScalar<Type> || std::is_same_v<Type, PkType>);
+    explicit FieldData(DataType data_type, int64_t buffered_num_rows = 0)
+        : FieldDataImpl<Type, true>::FieldDataImpl(
+              1, data_type, buffered_num_rows) {
+    }
+};
 
-    explicit FieldData(std::shared_ptr<arrow::Array> raw_data, DataType data_type);
+template <>
+class FieldData<std::string> : public FieldDataStringImpl {
+ public:
+    static_assert(IsScalar<std::string> || std::is_same_v<std::string, PkType>);
+    explicit FieldData(DataType data_type, int64_t buffered_num_rows = 0)
+        : FieldDataStringImpl(data_type, buffered_num_rows) {
+    }
+};
 
-    explicit FieldData(const uint8_t* data, int length);
+template <>
+class FieldData<Json> : public FieldDataJsonImpl {
+ public:
+    static_assert(IsScalar<std::string> || std::is_same_v<std::string, PkType>);
+    explicit FieldData(DataType data_type, int64_t buffered_num_rows = 0)
+        : FieldDataJsonImpl(data_type, buffered_num_rows) {
+    }
+};
 
-    //    explicit FieldData(std::unique_ptr<uint8_t[]> data, int length, DataType data_type): data_(std::move(data)),
-    //    data_len_(length), data_type_(data_type) {}
+template <>
+class FieldData<Array> : public FieldDataArrayImpl {
+ public:
+    static_assert(IsScalar<Array> || std::is_same_v<std::string, PkType>);
+    explicit FieldData(DataType data_type, int64_t buffered_num_rows = 0)
+        : FieldDataArrayImpl(data_type, buffered_num_rows) {
+    }
+};
 
-    ~FieldData() = default;
+template <>
+class FieldData<FloatVector> : public FieldDataImpl<float, false> {
+ public:
+    explicit FieldData(int64_t dim,
+                       DataType data_type,
+                       int64_t buffered_num_rows = 0)
+        : FieldDataImpl<float, false>::FieldDataImpl(
+              dim, data_type, buffered_num_rows) {
+    }
+};
 
-    DataType
-    get_data_type() const {
-        return data_type_;
+template <>
+class FieldData<BinaryVector> : public FieldDataImpl<uint8_t, false> {
+ public:
+    explicit FieldData(int64_t dim,
+                       DataType data_type,
+                       int64_t buffered_num_rows = 0)
+        : binary_dim_(dim),
+          FieldDataImpl(dim / 8, data_type, buffered_num_rows) {
+        Assert(dim % 8 == 0);
     }
 
-    bool
-    get_bool_payload(int idx) const;
-
-    void
-    get_one_string_payload(int idx, char** cstr, int* str_size) const;
-
-    // get the bytes stream of the arrow array data
-    std::unique_ptr<Payload>
-    get_payload() const;
-
-    int
-    get_payload_length() const {
-        return array_->length();
+    int64_t
+    get_dim() const {
+        return binary_dim_;
     }
-
-    int
-    get_data_size() const;
 
  private:
-    std::shared_ptr<arrow::Array> array_;
-    //    std::unique_ptr<uint8_t[]> data_;
-    //    int64_t data_len_;
-    DataType data_type_;
+    int64_t binary_dim_;
 };
+
+template <>
+class FieldData<Float16Vector> : public FieldDataImpl<float16, false> {
+ public:
+    explicit FieldData(int64_t dim,
+                       DataType data_type,
+                       int64_t buffered_num_rows = 0)
+        : FieldDataImpl<float16, false>::FieldDataImpl(
+              dim, data_type, buffered_num_rows) {
+    }
+};
+
+using FieldDataPtr = std::shared_ptr<FieldDataBase>;
+using FieldDataChannel = Channel<storage::FieldDataPtr>;
+using FieldDataChannelPtr = std::shared_ptr<FieldDataChannel>;
 
 }  // namespace milvus::storage

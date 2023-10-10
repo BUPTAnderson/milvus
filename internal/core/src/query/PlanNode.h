@@ -19,7 +19,6 @@
 
 #include "common/QueryInfo.h"
 #include "query/Expr.h"
-#include "knowhere/common/Config.h"
 
 namespace milvus::query {
 
@@ -53,12 +52,20 @@ struct BinaryVectorANNS : VectorPlanNode {
     accept(PlanNodeVisitor&) override;
 };
 
+struct Float16VectorANNS : VectorPlanNode {
+ public:
+    void
+    accept(PlanNodeVisitor&) override;
+};
+
 struct RetrievePlanNode : PlanNode {
  public:
     void
     accept(PlanNodeVisitor&) override;
 
-    ExprPtr predicate_;
+    std::optional<ExprPtr> predicate_;
+    bool is_count_;
+    int64_t limit_;
 };
 
 }  // namespace milvus::query

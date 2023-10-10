@@ -26,13 +26,17 @@ namespace milvus::indexbuilder {
 // TODO: better to distinguish binary vec & float vec.
 class VecIndexCreator : public IndexCreatorBase {
  public:
-    explicit VecIndexCreator(DataType data_type,
-                             const char* serialized_type_params,
-                             const char* serialized_index_params,
-                             const storage::StorageConfig& storage_config);
+    explicit VecIndexCreator(
+        DataType data_type,
+        Config& config,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
 
     void
     Build(const milvus::DatasetPtr& dataset) override;
+
+    void
+    Build() override;
 
     milvus::BinarySet
     Serialize() override;
@@ -44,7 +48,12 @@ class VecIndexCreator : public IndexCreatorBase {
     dim();
 
     std::unique_ptr<SearchResult>
-    Query(const milvus::DatasetPtr& dataset, const SearchInfo& search_info, const BitsetView& bitset);
+    Query(const milvus::DatasetPtr& dataset,
+          const SearchInfo& search_info,
+          const BitsetView& bitset);
+
+    BinarySet
+    Upload() override;
 
  public:
     void

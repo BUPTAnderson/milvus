@@ -21,11 +21,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
 
 func TestUpperLimitCalBySchema(t *testing.T) {
@@ -53,7 +55,7 @@ func TestUpperLimitCalBySchema(t *testing.T) {
 					{
 						DataType: schemapb.DataType_FloatVector,
 						TypeParams: []*commonpb.KeyValuePair{
-							{Key: "dim", Value: "bad_dim"},
+							{Key: common.DimKey, Value: "bad_dim"},
 						},
 					},
 				},
@@ -73,19 +75,19 @@ func TestUpperLimitCalBySchema(t *testing.T) {
 					{
 						DataType: schemapb.DataType_FloatVector,
 						TypeParams: []*commonpb.KeyValuePair{
-							{Key: "dim", Value: "128"},
+							{Key: common.DimKey, Value: "128"},
 						},
 					},
 				},
 			},
-			expected:  int(Params.DataCoordCfg.SegmentMaxSize * 1024 * 1024 / float64(524)),
+			expected:  int(Params.DataCoordCfg.SegmentMaxSize.GetAsFloat() * 1024 * 1024 / float64(524)),
 			expectErr: false,
 		},
 	}
 	for _, c := range testCases {
 		result, err := calBySchemaPolicy(c.schema)
 		if c.expectErr {
-			assert.NotNil(t, err)
+			assert.Error(t, err)
 		} else {
 			assert.Equal(t, c.expected, result)
 		}

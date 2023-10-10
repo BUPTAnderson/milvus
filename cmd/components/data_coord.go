@@ -19,13 +19,14 @@ package components
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcdatacoordclient "github.com/milvus-io/milvus/internal/distributed/datacoord"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // DataCoord implements grpc server of DataCoord server
@@ -47,6 +48,7 @@ func NewDataCoord(ctx context.Context, factory dependency.Factory) (*DataCoord, 
 // Run starts service
 func (s *DataCoord) Run() error {
 	if err := s.svr.Run(); err != nil {
+		log.Error("DataCoord starts error", zap.Error(err))
 		return err
 	}
 	log.Debug("DataCoord successfully started")

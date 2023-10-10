@@ -16,31 +16,27 @@
 
 cmake_minimum_required( VERSION 3.18 )
 
-# To debug memory issues, you can comment out these below two lines.
-# Also, they are identical to that you define these environments:
-# CFLAGS="-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address"
-# CXXFLAGS="-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address"
-# LDFLAGS="-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address"
-
-# add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
-# add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
-
 if ( APPLE )
     set( CMAKE_CROSSCOMPILING TRUE )
     set( RUN_HAVE_GNU_POSIX_REGEX 0 )
-    set( CMAKE_C_COMPILER "/usr/local/opt/llvm/bin/clang" )
-    set( CMAKE_CXX_COMPILER "/usr/local/opt/llvm/bin/clang++" )
 endif ()
 
 add_definitions(-DELPP_THREAD_SAFE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 message( STATUS "Building using CMake version: ${CMAKE_VERSION}" )
 
+if ( MILVUS_GPU_VERSION )
+    add_definitions(-DMILVUS_GPU_VERSION)
+endif ()
+
+if ( USE_DYNAMIC_SIMD )
+    add_definitions(-DUSE_DYNAMIC_SIMD)
+endif()
+
 project(core)
 include(CheckCXXCompilerFlag)
 if ( APPLE )
     message(STATUS "==============Darwin Environment==============")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I/usr/local/opt/llvm/include -I/usr/local/include -I/usr/local/opt/libomp/include -L/usr/local/opt/libomp/lib")
 elseif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     message(STATUS "==============Linux Environment===============")
     set(LINUX TRUE)
@@ -49,6 +45,8 @@ elseif ( MSYS )
 else ()
     message(FATAL_ERROR "Unsupported platform!" )
 endif ()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 
 if (CMAKE_COMPILER_IS_GNUCC)
     if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 11.99)
@@ -93,6 +91,13 @@ set( CMAKE_INSTALL_RPATH "/usr/lib" "${CMAKE_INSTALL_PREFIX}/lib" "${CMAKE_INSTA
 set( CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE )
 
 # **************************** Dependencies ****************************
+list( APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR}/conan )
+include( ${CMAKE_BINARY_DIR}/conan/conanbuildinfo.cmake )
+set( CONAN_DISABLE_CHECK_COMPILER ON )
+conan_basic_setup( KEEP_RPATHS )
+
+set( CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} ${CONAN_PROTOBUF_ROOT})
+
 include( CTest )
 include( BuildUtils )
 include( DefineOptions )
@@ -101,7 +106,9 @@ using_ccache_if_defined(MILVUS_USE_CCACHE)
 include( ExternalProject )
 include( GNUInstallDirs )
 include( FetchContent )
+
 include_directories( thirdparty )
+
 set( FETCHCONTENT_BASE_DIR ${MILVUS_BINARY_DIR}/3rdparty_download )
 set( FETCHCONTENT_QUIET OFF )
 include( ThirdPartyPackages )
@@ -110,13 +117,18 @@ include( ThirdPartyPackages )
 message( STATUS "Building Milvus CPU version" )
 
 if (LINUX OR MSYS)
-append_flags( CMAKE_CXX_FLAGS
-              FLAGS
-              "-fPIC"
-              "-DELPP_THREAD_SAFE"
-              "-fopenmp"
-              "-Werror"
-              )
+    append_flags( CMAKE_CXX_FLAGS
+                  FLAGS
+                  "-fPIC"
+                  "-DELPP_THREAD_SAFE"
+                  "-fopenmp"
+                  "-Werror"
+                  )
+    if (CMAKE_BUILD_TYPE STREQUAL "Release")
+        append_flags( CMAKE_CXX_FLAGS
+                "-O3"
+                )
+    endif()
 endif ()
 
 if ( APPLE )
@@ -134,7 +146,22 @@ if ( APPLE )
             "-Wno-unused-parameter"
             "-Wno-deprecated"
             "-DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED=1"
+            #"-fvisibility=hidden"
+            #"-fvisibility-inlines-hidden"
             )
+endif ()
+
+# Set SIMD to CMAKE_CXX_FLAGS
+if (OPEN_SIMD)
+    message(STATUS "open simd function, CPU_ARCH:${CPU_ARCH}")
+    if (${CPU_ARCH} STREQUAL "avx")
+      #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}  -ftree-vectorize -mavx2 -mfma -mavx -mf16c ")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -mavx -mf16c ")
+    elseif (${CPU_ARCH} STREQUAL "sse")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2 ")
+    elseif (${CPU_ARCH} STREQUAL "arm64")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=apple-m1+crc ")
+    endif()
 endif ()
 
 # **************************** Coding style check tools ****************************
@@ -173,6 +200,17 @@ add_custom_target(lint
 
 find_program( CPPLINT_BIN NAMES cpplint cpplint.py HINTS ${BUILD_SUPPORT_DIR} )
 message( STATUS "Found cpplint executable at ${CPPLINT_BIN}" )
+
+# Use the first Python installation on PATH, not the newest one
+set(Python3_FIND_STRATEGY "LOCATION")
+# On Windows, use registry last, not first
+set(Python3_FIND_REGISTRY "LAST")
+# On macOS, use framework last, not first
+set(Python3_FIND_FRAMEWORK "LAST")
+find_package(Python3)
+set(PYTHON_EXECUTABLE ${Python3_EXECUTABLE})
+
+message( STATUS "Found Python at ${PYTHON_EXECUTABLE}")
 
 #
 # "make clang-format" and "make check-clang-format" targets
@@ -276,3 +314,8 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/common/
         DESTINATION include/common
         FILES_MATCHING PATTERN "*_c.h"
 )
+
+install(DIRECTORY ${CMAKE_BINARY_DIR}/lib/
+        DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
+)
+

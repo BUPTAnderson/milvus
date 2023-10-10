@@ -19,13 +19,13 @@ package datanode
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/util/hardware"
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-	"github.com/milvus-io/milvus/internal/util/ratelimitutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/pkg/util/hardware"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/ratelimitutil"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // getQuotaMetrics returns DataNodeQuotaMetrics.
@@ -48,6 +48,7 @@ func (node *DataNode) getQuotaMetrics() (*metricsinfo.DataNodeQuotaMetrics, erro
 	if err != nil {
 		return nil, err
 	}
+
 	minFGChannel, minFGTt := rateCol.getMinFlowGraphTt()
 	return &metricsinfo.DataNodeQuotaMetrics{
 		Hms: metricsinfo.HardwareMetrics{},
@@ -57,29 +58,11 @@ func (node *DataNode) getQuotaMetrics() (*metricsinfo.DataNodeQuotaMetrics, erro
 			MinFlowGraphTt:      minFGTt,
 			NumFlowGraph:        node.flowgraphManager.getFlowGraphNum(),
 		},
-	}, nil
-}
-
-//getComponentConfigurations returns the configurations of dataNode matching req.Pattern
-func getComponentConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) *internalpb.ShowConfigurationsResponse {
-	prefix := "datanode."
-	matchedConfig := Params.DataNodeCfg.Base.GetByPattern(prefix + req.Pattern)
-	configList := make([]*commonpb.KeyValuePair, 0, len(matchedConfig))
-	for key, value := range matchedConfig {
-		configList = append(configList,
-			&commonpb.KeyValuePair{
-				Key:   key,
-				Value: value,
-			})
-	}
-
-	return &internalpb.ShowConfigurationsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
+		Effect: metricsinfo.NodeEffect{
+			NodeID:        node.GetSession().ServerID,
+			CollectionIDs: node.flowgraphManager.collections(),
 		},
-		Configuations: configList,
-	}
+	}, nil
 }
 
 func (node *DataNode) getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
@@ -90,11 +73,8 @@ func (node *DataNode) getSystemInfoMetrics(ctx context.Context, req *milvuspb.Ge
 	quotaMetrics, err := node.getQuotaMetrics()
 	if err != nil {
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    err.Error(),
-			},
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, Params.DataNodeCfg.GetNodeID()),
+			Status:        merr.Status(err),
+			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, paramtable.GetNodeID()),
 		}, nil
 	}
 	hardwareMetrics := metricsinfo.HardwareMetrics{
@@ -110,16 +90,16 @@ func (node *DataNode) getSystemInfoMetrics(ctx context.Context, req *milvuspb.Ge
 
 	nodeInfos := metricsinfo.DataNodeInfos{
 		BaseComponentInfos: metricsinfo.BaseComponentInfos{
-			Name:          metricsinfo.ConstructComponentName(typeutil.DataNodeRole, Params.DataNodeCfg.GetNodeID()),
+			Name:          metricsinfo.ConstructComponentName(typeutil.DataNodeRole, paramtable.GetNodeID()),
 			HardwareInfos: hardwareMetrics,
 			SystemInfo:    metricsinfo.DeployMetrics{},
-			CreatedTime:   Params.DataNodeCfg.CreatedTime.String(),
-			UpdatedTime:   Params.DataNodeCfg.UpdatedTime.String(),
+			CreatedTime:   paramtable.GetCreateTime().String(),
+			UpdatedTime:   paramtable.GetUpdateTime().String(),
 			Type:          typeutil.DataNodeRole,
-			ID:            node.session.ServerID,
+			ID:            node.GetSession().ServerID,
 		},
 		SystemConfigurations: metricsinfo.DataNodeConfiguration{
-			FlushInsertBufferSize: Params.DataNodeCfg.FlushInsertBufferSize,
+			FlushInsertBufferSize: Params.DataNodeCfg.FlushInsertBufferSize.GetAsInt64(),
 		},
 		QuotaMetrics: quotaMetrics,
 	}
@@ -129,21 +109,15 @@ func (node *DataNode) getSystemInfoMetrics(ctx context.Context, req *milvuspb.Ge
 	resp, err := metricsinfo.MarshalComponentInfos(nodeInfos)
 	if err != nil {
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    err.Error(),
-			},
+			Status:        merr.Status(err),
 			Response:      "",
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, Params.DataNodeCfg.GetNodeID()),
+			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, paramtable.GetNodeID()),
 		}, nil
 	}
 
 	return &milvuspb.GetMetricsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:        merr.Status(nil),
 		Response:      resp,
-		ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, Params.DataNodeCfg.GetNodeID()),
+		ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, paramtable.GetNodeID()),
 	}, nil
 }

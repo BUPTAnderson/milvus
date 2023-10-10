@@ -17,16 +17,21 @@
 package datacoord
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/milvus-io/milvus/internal/kv"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"go.uber.org/zap/zapcore"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
 )
 
 const (
@@ -86,6 +91,8 @@ type ROChannelStore interface {
 	GetBufferChannelInfo() *NodeChannelInfo
 	// GetNodes gets all node ids in store.
 	GetNodes() []int64
+	// GetNodeChannelCount
+	GetNodeChannelCount(nodeID int64) int
 }
 
 // RWChannelStore is the read write channel store for channels and nodes.
@@ -131,7 +138,8 @@ func NewChannelStore(kv kv.TxnKV) *ChannelStore {
 
 // Reload restores the buffer channels and node-channels mapping from kv.
 func (c *ChannelStore) Reload() error {
-	keys, values, err := c.store.LoadWithPrefix(Params.DataCoordCfg.ChannelWatchSubPath)
+	record := timerecord.NewTimeRecorder("datacoord")
+	keys, values, err := c.store.LoadWithPrefix(Params.CommonCfg.DataCoordWatchSubPath.GetValue())
 	if err != nil {
 		return err
 	}
@@ -153,9 +161,14 @@ func (c *ChannelStore) Reload() error {
 		channel := &channel{
 			Name:         cw.GetVchan().GetChannelName(),
 			CollectionID: cw.GetVchan().GetCollectionID(),
+			Schema:       cw.GetSchema(),
 		}
 		c.channelsInfo[nodeID].Channels = append(c.channelsInfo[nodeID].Channels, channel)
+		log.Info("channel store reload channel",
+			zap.Int64("nodeID", nodeID), zap.String("channel", channel.Name))
+		metrics.DataCoordDmlChannelNum.WithLabelValues(strconv.FormatInt(nodeID, 10)).Set(float64(len(c.channelsInfo[nodeID].Channels)))
 	}
+	log.Info("channel store reload done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 
@@ -263,6 +276,7 @@ func (c *ChannelStore) update(opSet ChannelOpSet) error {
 		default:
 			return errUnknownOpType
 		}
+		metrics.DataCoordDmlChannelNum.WithLabelValues(strconv.FormatInt(op.NodeID, 10)).Set(float64(len(c.channelsInfo[op.NodeID].Channels)))
 	}
 	return nil
 }
@@ -307,14 +321,23 @@ func (c *ChannelStore) GetNode(nodeID int64) *NodeChannelInfo {
 	return nil
 }
 
+func (c *ChannelStore) GetNodeChannelCount(nodeID int64) int {
+	for id, info := range c.channelsInfo {
+		if id == nodeID {
+			return len(info.Channels)
+		}
+	}
+	return 0
+}
+
 // Delete removes the given node from the channel store and returns its channels.
 func (c *ChannelStore) Delete(nodeID int64) ([]*channel, error) {
 	for id, info := range c.channelsInfo {
 		if id == nodeID {
-			delete(c.channelsInfo, id)
 			if err := c.remove(nodeID); err != nil {
 				return nil, err
 			}
+			delete(c.channelsInfo, id)
 			return info.Channels, nil
 		}
 	}
@@ -364,12 +387,12 @@ func (c *ChannelStore) txn(opSet ChannelOpSet) error {
 
 // buildNodeChannelKey generates a key for kv store, where the key is a concatenation of ChannelWatchSubPath, nodeID and channel name.
 func buildNodeChannelKey(nodeID int64, chName string) string {
-	return fmt.Sprintf("%s%s%d%s%s", Params.DataCoordCfg.ChannelWatchSubPath, delimiter, nodeID, delimiter, chName)
+	return fmt.Sprintf("%s%s%d%s%s", Params.CommonCfg.DataCoordWatchSubPath.GetValue(), delimiter, nodeID, delimiter, chName)
 }
 
 // buildKeyPrefix generates a key *prefix* for kv store, where the key prefix is a concatenation of ChannelWatchSubPath and nodeID.
 func buildKeyPrefix(nodeID int64) string {
-	return fmt.Sprintf("%s%s%d", Params.DataCoordCfg.ChannelWatchSubPath, delimiter, nodeID)
+	return fmt.Sprintf("%s%s%d", Params.CommonCfg.DataCoordWatchSubPath.GetValue(), delimiter, nodeID)
 }
 
 // parseNodeKey validates a given node key, then extracts and returns the corresponding node id on success.

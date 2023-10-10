@@ -24,15 +24,15 @@
 
 #include "storage/IndexData.h"
 #include "storage/FileManager.h"
-#include "storage/MinioChunkManager.h"
+#include "storage/ChunkManager.h"
+
+#include "common/Consts.h"
 
 namespace milvus::storage {
 
 class DiskFileManagerImpl : public FileManagerImpl {
  public:
-    explicit DiskFileManagerImpl(const FieldDataMeta& field_mata,
-                                 const IndexMeta& index_meta,
-                                 const StorageConfig& storage_config);
+    explicit DiskFileManagerImpl(const FileManagerContext& fileManagerContext);
 
     virtual ~DiskFileManagerImpl();
 
@@ -55,9 +55,6 @@ class DiskFileManagerImpl : public FileManagerImpl {
     }
 
     std::string
-    GetRemoteIndexObjectPrefix();
-
-    std::string
     GetLocalIndexObjectPrefix();
 
     std::string
@@ -74,17 +71,21 @@ class DiskFileManagerImpl : public FileManagerImpl {
     }
 
     void
-    CacheIndexToDisk(std::vector<std::string> remote_files);
+    CacheIndexToDisk(const std::vector<std::string>& remote_files);
 
-    FieldDataMeta
-    GetFileDataMeta() const {
-        return field_meta_;
-    }
+    uint64_t
+    CacheBatchIndexFilesToDisk(const std::vector<std::string>& remote_files,
+                               const std::string& local_file_name,
+                               uint64_t local_file_init_offfset);
 
-    IndexMeta
-    GetIndexMeta() const {
-        return index_meta_;
-    }
+    void
+    AddBatchIndexFiles(const std::string& local_file_name,
+                       const std::vector<int64_t>& local_file_offsets,
+                       const std::vector<std::string>& remote_files,
+                       const std::vector<int64_t>& remote_file_sizes);
+
+    std::string
+    CacheRawDataToDisk(std::vector<std::string> remote_files);
 
  private:
     int64_t
@@ -95,21 +96,15 @@ class DiskFileManagerImpl : public FileManagerImpl {
     std::string
     GetFileName(const std::string& localfile);
 
+    std::string
+    GetRemoteIndexPath(const std::string& file_name, int64_t slice_num) const;
+
  private:
-    // collection meta
-    FieldDataMeta field_meta_;
-
-    // index meta
-    IndexMeta index_meta_;
-
     // local file path (abs path)
     std::vector<std::string> local_paths_;
 
     // remote file path
     std::map<std::string, int64_t> remote_paths_to_size_;
-
-    RemoteChunkManagerPtr rcm_;
-    std::string remote_root_path_;
 };
 
 using DiskANNFileManagerImplPtr = std::shared_ptr<DiskFileManagerImpl>;

@@ -18,18 +18,22 @@ package flowgraph
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
+
+	"github.com/cockroachdb/errors"
+	"go.uber.org/atomic"
 )
 
 // Flow Graph is no longer a graph rather than a simple pipeline, this simplified our code and increase recovery speed - xiaofan.
 
 // TimeTickedFlowGraph flowgraph with input from tt msg stream
 type TimeTickedFlowGraph struct {
-	nodeCtx   map[NodeName]*nodeCtx
-	stopOnce  sync.Once
-	startOnce sync.Once
-	closeWg   *sync.WaitGroup
+	nodeCtx         map[NodeName]*nodeCtx
+	stopOnce        sync.Once
+	startOnce       sync.Once
+	closeWg         *sync.WaitGroup
+	closeGracefully *atomic.Bool
 }
 
 // AddNode add Node into flowgraph
@@ -92,6 +96,14 @@ func (fg *TimeTickedFlowGraph) Unblock() {
 	}
 }
 
+func (fg *TimeTickedFlowGraph) SetCloseMethod(gracefully bool) {
+	for _, v := range fg.nodeCtx {
+		if v.node.IsInputNode() {
+			v.node.(*InputNode).SetCloseMethod(gracefully)
+		}
+	}
+}
+
 // Close closes all nodes in flowgraph
 func (fg *TimeTickedFlowGraph) Close() {
 	fg.stopOnce.Do(func() {
@@ -107,9 +119,28 @@ func (fg *TimeTickedFlowGraph) Close() {
 // NewTimeTickedFlowGraph create timetick flowgraph
 func NewTimeTickedFlowGraph(ctx context.Context) *TimeTickedFlowGraph {
 	flowGraph := TimeTickedFlowGraph{
-		nodeCtx: make(map[string]*nodeCtx),
-		closeWg: &sync.WaitGroup{},
+		nodeCtx:         make(map[string]*nodeCtx),
+		closeWg:         &sync.WaitGroup{},
+		closeGracefully: atomic.NewBool(CloseImmediately),
 	}
 
 	return &flowGraph
+}
+
+func (fg *TimeTickedFlowGraph) AssembleNodes(orderedNodes ...Node) error {
+	for _, node := range orderedNodes {
+		fg.AddNode(node)
+	}
+
+	for i, node := range orderedNodes {
+		// Set edge to the next node
+		if i < len(orderedNodes)-1 {
+			err := fg.SetEdges(node.Name(), []string{orderedNodes[i+1].Name()})
+			if err != nil {
+				errMsg := fmt.Sprintf("set edges failed for flow graph, node=%s", node.Name())
+				return errors.New(errMsg)
+			}
+		}
+	}
+	return nil
 }

@@ -1,22 +1,18 @@
 package querycoord
 
 import (
-	"errors"
 	"fmt"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
 	"github.com/samber/lo"
-	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/kv"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/util"
 )
 
-var (
-	ErrInvalidKey = errors.New("invalid load info key")
-)
+var ErrInvalidKey = errors.New("invalid load info key")
 
 const (
 	CollectionLoadInfoPrefix = "querycoord-collection-loadinfo"
@@ -24,9 +20,8 @@ const (
 	ReplicaPrefix            = "querycoord-replica"
 	CollectionMetaPrefixV1   = "queryCoord-collectionMeta"
 	ReplicaMetaPrefixV1      = "queryCoord-ReplicaMeta"
+	ResourceGroupPrefix      = "queryCoord-ResourceGroup"
 )
-
-type WatchStoreChan = clientv3.WatchChan
 
 type Catalog struct {
 	cli kv.MetaKv
@@ -38,35 +33,61 @@ func NewCatalog(cli kv.MetaKv) Catalog {
 	}
 }
 
-func (s Catalog) SaveCollection(info *querypb.CollectionLoadInfo) error {
-	k := EncodeCollectionLoadInfoKey(info.GetCollectionID())
-	v, err := proto.Marshal(info)
+func (s Catalog) SaveCollection(collection *querypb.CollectionLoadInfo, partitions ...*querypb.PartitionLoadInfo) error {
+	k := EncodeCollectionLoadInfoKey(collection.GetCollectionID())
+	v, err := proto.Marshal(collection)
 	if err != nil {
 		return err
 	}
-	return s.cli.Save(k, string(v))
+	err = s.cli.Save(k, string(v))
+	if err != nil {
+		return err
+	}
+	return s.SavePartition(partitions...)
 }
 
 func (s Catalog) SavePartition(info ...*querypb.PartitionLoadInfo) error {
-	kvs := make(map[string]string)
 	for _, partition := range info {
-		key := EncodePartitionLoadInfoKey(partition.GetCollectionID(), partition.GetPartitionID())
-		value, err := proto.Marshal(partition)
+		k := EncodePartitionLoadInfoKey(partition.GetCollectionID(), partition.GetPartitionID())
+		v, err := proto.Marshal(partition)
 		if err != nil {
 			return err
 		}
-		kvs[key] = string(value)
+		err = s.cli.Save(k, string(v))
+		if err != nil {
+			return err
+		}
 	}
-	return s.cli.MultiSave(kvs)
+	return nil
 }
 
 func (s Catalog) SaveReplica(replica *querypb.Replica) error {
-	key := EncodeReplicaKey(replica.GetCollectionID(), replica.GetID())
+	key := encodeReplicaKey(replica.GetCollectionID(), replica.GetID())
 	value, err := proto.Marshal(replica)
 	if err != nil {
 		return err
 	}
 	return s.cli.Save(key, string(value))
+}
+
+func (s Catalog) SaveResourceGroup(rgs ...*querypb.ResourceGroup) error {
+	ret := make(map[string]string)
+	for _, rg := range rgs {
+		key := encodeResourceGroupKey(rg.GetName())
+		value, err := proto.Marshal(rg)
+		if err != nil {
+			return err
+		}
+
+		ret[key] = string(value)
+	}
+
+	return s.cli.MultiSave(ret)
+}
+
+func (s Catalog) RemoveResourceGroup(rgName string) error {
+	key := encodeResourceGroupKey(rgName)
+	return s.cli.Remove(key)
 }
 
 func (s Catalog) GetCollections() ([]*querypb.CollectionLoadInfo, error) {
@@ -149,9 +170,46 @@ func (s Catalog) getReplicasFromV1() ([]*querypb.Replica, error) {
 	return ret, nil
 }
 
-func (s Catalog) ReleaseCollection(id int64) error {
-	k := EncodeCollectionLoadInfoKey(id)
-	return s.cli.Remove(k)
+func (s Catalog) GetResourceGroups() ([]*querypb.ResourceGroup, error) {
+	_, rgs, err := s.cli.LoadWithPrefix(ResourceGroupPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := make([]*querypb.ResourceGroup, 0, len(rgs))
+	for _, value := range rgs {
+		rg := &querypb.ResourceGroup{}
+		err := proto.Unmarshal([]byte(value), rg)
+		if err != nil {
+			return nil, err
+		}
+
+		ret = append(ret, rg)
+	}
+	return ret, nil
+}
+
+func (s Catalog) ReleaseCollection(collection int64) error {
+	// obtain partitions of this collection
+	_, values, err := s.cli.LoadWithPrefix(fmt.Sprintf("%s/%d", PartitionLoadInfoPrefix, collection))
+	if err != nil {
+		return err
+	}
+	partitions := make([]*querypb.PartitionLoadInfo, 0)
+	for _, v := range values {
+		info := querypb.PartitionLoadInfo{}
+		if err = proto.Unmarshal([]byte(v), &info); err != nil {
+			return err
+		}
+		partitions = append(partitions, &info)
+	}
+	// remove collection and obtained partitions
+	keys := lo.Map(partitions, func(partition *querypb.PartitionLoadInfo, _ int) string {
+		return EncodePartitionLoadInfoKey(collection, partition.GetPartitionID())
+	})
+	k := EncodeCollectionLoadInfoKey(collection)
+	keys = append(keys, k)
+	return s.cli.MultiRemove(keys)
 }
 
 func (s Catalog) ReleasePartition(collection int64, partitions ...int64) error {
@@ -162,17 +220,12 @@ func (s Catalog) ReleasePartition(collection int64, partitions ...int64) error {
 }
 
 func (s Catalog) ReleaseReplicas(collectionID int64) error {
-	key := EncodeCollectionReplicaKey(collectionID)
+	key := encodeCollectionReplicaKey(collectionID)
 	return s.cli.RemoveWithPrefix(key)
 }
 
 func (s Catalog) ReleaseReplica(collection, replica int64) error {
-	key := EncodeReplicaKey(collection, replica)
-	return s.cli.Remove(key)
-}
-
-func (s Catalog) RemoveHandoffEvent(info *querypb.SegmentInfo) error {
-	key := EncodeHandoffEventKey(info.CollectionID, info.PartitionID, info.SegmentID)
+	key := encodeReplicaKey(collection, replica)
 	return s.cli.Remove(key)
 }
 
@@ -184,14 +237,14 @@ func EncodePartitionLoadInfoKey(collection, partition int64) string {
 	return fmt.Sprintf("%s/%d/%d", PartitionLoadInfoPrefix, collection, partition)
 }
 
-func EncodeReplicaKey(collection, replica int64) string {
+func encodeReplicaKey(collection, replica int64) string {
 	return fmt.Sprintf("%s/%d/%d", ReplicaPrefix, collection, replica)
 }
 
-func EncodeCollectionReplicaKey(collection int64) string {
+func encodeCollectionReplicaKey(collection int64) string {
 	return fmt.Sprintf("%s/%d", ReplicaPrefix, collection)
 }
 
-func EncodeHandoffEventKey(collection, partition, segment int64) string {
-	return fmt.Sprintf("%s/%d/%d/%d", util.HandoffSegmentPrefix, collection, partition, segment)
+func encodeResourceGroupKey(rgName string) string {
+	return fmt.Sprintf("%s/%s", ResourceGroupPrefix, rgName)
 }

@@ -28,19 +28,21 @@
 
 namespace milvus::segcore {
 
+// see also internal/querynode/load_index_info.go
 struct LoadIndexInfo {
     int64_t collection_id;
     int64_t partition_id;
     int64_t segment_id;
     int64_t field_id;
     DataType field_type;
+    std::string mmap_dir_path;
     int64_t index_id;
     int64_t index_build_id;
     int64_t index_version;
     std::map<std::string, std::string> index_params;
     std::vector<std::string> index_files;
     index::IndexBasePtr index;
-    storage::StorageConfig storage_config;
+    IndexVersion index_engine_version;
 };
 
 }  // namespace milvus::segcore

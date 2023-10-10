@@ -22,7 +22,19 @@ extern "C" {
 #include "common/type_c.h"
 
 CStatus
-GetLocalUsedSize(int64_t* size);
+GetLocalUsedSize(const char* c_path, int64_t* size);
+
+CStatus
+InitLocalChunkManagerSingleton(const char* path);
+
+CStatus
+InitRemoteChunkManagerSingleton(CStorageConfig c_storage_config);
+
+CStatus
+InitChunkCacheSingleton(const char* c_dir_path, const char* read_ahead_policy);
+
+void
+CleanRemoteChunkManagerSingleton();
 
 #ifdef __cplusplus
 };

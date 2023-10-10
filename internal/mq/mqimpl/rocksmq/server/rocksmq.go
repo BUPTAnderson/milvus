@@ -13,7 +13,8 @@ package server
 
 // ProducerMessage that will be written to rocksdb
 type ProducerMessage struct {
-	Payload []byte
+	Payload    []byte
+	Properties map[string]string
 }
 
 // Consumer is rocksmq consumer
@@ -25,8 +26,9 @@ type Consumer struct {
 
 // ConsumerMessage that consumed from rocksdb
 type ConsumerMessage struct {
-	MsgID   UniqueID
-	Payload []byte
+	MsgID      UniqueID
+	Payload    []byte
+	Properties map[string]string
 }
 
 // RocksMQ is an interface thatmay be implemented by the application
@@ -40,6 +42,7 @@ type RocksMQ interface {
 
 	RegisterConsumer(consumer *Consumer) error
 	GetLatestMsg(topicName string) (int64, error)
+	CheckTopicValid(topicName string) error
 
 	Produce(topicName string, messages []ProducerMessage) ([]UniqueID, error)
 	Consume(topicName string, groupName string, n int) ([]ConsumerMessage, error)

@@ -1,20 +1,27 @@
-//go:build linux
-// +build linux
-
 package indexcgowrapper
 
 import (
 	"math/rand"
+	"os"
 	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/metric"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
+
+func TestMain(m *testing.M) {
+	paramtable.Init()
+	exitCode := m.Run()
+	os.Exit(exitCode)
+}
 
 type indexTestCase struct {
 	dtype       schemapb.DataType
@@ -164,14 +171,14 @@ func genScalarIndexCases(dtype schemapb.DataType) []indexTestCase {
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type": "inverted_index",
+				common.IndexTypeKey: "inverted_index",
 			},
 		},
 		{
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type": "flat",
+				common.IndexTypeKey: "flat",
 			},
 		},
 	}
@@ -183,14 +190,14 @@ func genStringIndexCases(dtype schemapb.DataType) []indexTestCase {
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type": "inverted_index",
+				common.IndexTypeKey: "inverted_index",
 			},
 		},
 		{
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type": "marisa-trie",
+				common.IndexTypeKey: "marisa-trie",
 			},
 		},
 	}
@@ -202,22 +209,22 @@ func genFloatVecIndexCases(dtype schemapb.DataType) []indexTestCase {
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type":  IndexFaissIVFPQ,
-				"metric_type": L2,
-				"dim":         strconv.Itoa(dim),
-				"nlist":       strconv.Itoa(nlist),
-				"m":           strconv.Itoa(m),
-				"nbits":       strconv.Itoa(nbits),
+				common.IndexTypeKey:  IndexFaissIVFPQ,
+				common.MetricTypeKey: metric.L2,
+				common.DimKey:        strconv.Itoa(dim),
+				"nlist":              strconv.Itoa(nlist),
+				"m":                  strconv.Itoa(m),
+				"nbits":              strconv.Itoa(nbits),
 			},
 		},
 		{
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type":  IndexFaissIVFFlat,
-				"metric_type": L2,
-				"dim":         strconv.Itoa(dim),
-				"nlist":       strconv.Itoa(nlist),
+				common.IndexTypeKey:  IndexFaissIVFFlat,
+				common.MetricTypeKey: metric.L2,
+				common.DimKey:        strconv.Itoa(dim),
+				"nlist":              strconv.Itoa(nlist),
 			},
 		},
 	}
@@ -229,11 +236,11 @@ func genBinaryVecIndexCases(dtype schemapb.DataType) []indexTestCase {
 			dtype:      dtype,
 			typeParams: nil,
 			indexParams: map[string]string{
-				"index_type":  IndexFaissBinIVFFlat,
-				"metric_type": Jaccard,
-				"dim":         strconv.Itoa(dim),
-				"nlist":       strconv.Itoa(nlist),
-				"nbits":       strconv.Itoa(nbits),
+				common.IndexTypeKey:  IndexFaissBinIVFFlat,
+				common.MetricTypeKey: metric.JACCARD,
+				common.DimKey:        strconv.Itoa(dim),
+				"nlist":              strconv.Itoa(nlist),
+				"nbits":              strconv.Itoa(nbits),
 			},
 		},
 	}
@@ -290,25 +297,23 @@ func genIndexCase() []indexTestCase {
 }
 
 func genStorageConfig() *indexpb.StorageConfig {
-	InitOnce.Do(func() {
-		Params.Init()
-	})
+	params := paramtable.Get()
 
 	return &indexpb.StorageConfig{
-		Address:         Params.MinioCfg.Address,
-		AccessKeyID:     Params.MinioCfg.AccessKeyID,
-		SecretAccessKey: Params.MinioCfg.SecretAccessKey,
-		BucketName:      Params.MinioCfg.BucketName,
-		RootPath:        Params.MinioCfg.RootPath,
-		IAMEndpoint:     Params.MinioCfg.IAMEndpoint,
-		UseSSL:          Params.MinioCfg.UseSSL,
-		UseIAM:          Params.MinioCfg.UseIAM,
+		Address:         params.MinioCfg.Address.GetValue(),
+		AccessKeyID:     params.MinioCfg.AccessKeyID.GetValue(),
+		SecretAccessKey: params.MinioCfg.SecretAccessKey.GetValue(),
+		BucketName:      params.MinioCfg.BucketName.GetValue(),
+		RootPath:        params.MinioCfg.RootPath.GetValue(),
+		IAMEndpoint:     params.MinioCfg.IAMEndpoint.GetValue(),
+		UseSSL:          params.MinioCfg.UseSSL.GetAsBool(),
+		UseIAM:          params.MinioCfg.UseIAM.GetAsBool(),
 	}
 }
 
 func TestCgoIndex(t *testing.T) {
 	for _, testCase := range genIndexCase() {
-		index, err := NewCgoIndex(testCase.dtype, testCase.typeParams, testCase.indexParams, genStorageConfig())
+		index, err := NewCgoIndex(testCase.dtype, testCase.typeParams, testCase.indexParams)
 		assert.NoError(t, err, testCase)
 
 		dataset := GenDataset(genFieldData(testCase.dtype, nb, dim))
@@ -317,7 +322,7 @@ func TestCgoIndex(t *testing.T) {
 		blobs, err := index.Serialize()
 		assert.NoError(t, err, testCase)
 
-		copyIndex, err := NewCgoIndex(testCase.dtype, testCase.typeParams, testCase.indexParams, genStorageConfig())
+		copyIndex, err := NewCgoIndex(testCase.dtype, testCase.typeParams, testCase.indexParams)
 		assert.NoError(t, err, testCase)
 
 		assert.NoError(t, copyIndex.Load(blobs), testCase)

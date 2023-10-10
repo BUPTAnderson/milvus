@@ -19,11 +19,12 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 
-	"github.com/milvus-io/milvus/internal/common"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/pkg/common"
 )
 
 // BinlogReader is an object to read binlog file. Binlog file's format can be

@@ -19,17 +19,18 @@ package importutil
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // A struct to hold insert log paths and delta log paths of a segment
@@ -41,20 +42,17 @@ type SegmentFilesHolder struct {
 
 // Adapter class to process insertlog/deltalog of a backuped segment
 // This class do the following works:
-// 1. read insert log of each field, then constructs map[storage.FieldID]storage.FieldData in memory.
+// 1. read insert log of each field, then constructs SegmentData in memory.
 // 2. read delta log to remove deleted entities(TimeStampField is used to apply or skip the operation).
 // 3. split data according to shard number
 // 4. call the callFlushFunc function to flush data into new binlog file if data size reaches blockSize.
 type BinlogAdapter struct {
-	ctx              context.Context            // for canceling parse process
-	collectionSchema *schemapb.CollectionSchema // collection schema
-	chunkManager     storage.ChunkManager       // storage interfaces to read binlog files
-	callFlushFunc    ImportFlushFunc            // call back function to flush segment
-	shardNum         int32                      // sharding number of the collection
-	blockSize        int64                      // maximum size of a read block(unit:byte)
-	maxTotalSize     int64                      // maximum size of in-memory segments(unit:byte)
-	primaryKey       storage.FieldID            // id of primary key
-	primaryType      schemapb.DataType          // data type of primary key
+	ctx            context.Context      // for canceling parse process
+	collectionInfo *CollectionInfo      // collection details including schema
+	chunkManager   storage.ChunkManager // storage interfaces to read binlog files
+	callFlushFunc  ImportFlushFunc      // call back function to flush segment
+	blockSize      int64                // maximum size of a read block(unit:byte)
+	maxTotalSize   int64                // maximum size of in-memory segments(unit:byte)
 
 	// a timestamp to define the start time point of restore, data before this time point will be ignored
 	// set this value to 0, all the data will be imported
@@ -70,39 +68,38 @@ type BinlogAdapter struct {
 }
 
 func NewBinlogAdapter(ctx context.Context,
-	collectionSchema *schemapb.CollectionSchema,
-	shardNum int32,
+	collectionInfo *CollectionInfo,
 	blockSize int64,
 	maxTotalSize int64,
 	chunkManager storage.ChunkManager,
 	flushFunc ImportFlushFunc,
 	tsStartPoint uint64,
-	tsEndPoint uint64) (*BinlogAdapter, error) {
-	if collectionSchema == nil {
-		log.Error("Binlog adapter: collection schema is nil")
+	tsEndPoint uint64,
+) (*BinlogAdapter, error) {
+	if collectionInfo == nil {
+		log.Warn("Binlog adapter: collection schema is nil")
 		return nil, errors.New("collection schema is nil")
 	}
 
 	if chunkManager == nil {
-		log.Error("Binlog adapter: chunk manager pointer is nil")
+		log.Warn("Binlog adapter: chunk manager pointer is nil")
 		return nil, errors.New("chunk manager pointer is nil")
 	}
 
 	if flushFunc == nil {
-		log.Error("Binlog adapter: flush function is nil")
+		log.Warn("Binlog adapter: flush function is nil")
 		return nil, errors.New("flush function is nil")
 	}
 
 	adapter := &BinlogAdapter{
-		ctx:              ctx,
-		collectionSchema: collectionSchema,
-		chunkManager:     chunkManager,
-		callFlushFunc:    flushFunc,
-		shardNum:         shardNum,
-		blockSize:        blockSize,
-		maxTotalSize:     maxTotalSize,
-		tsStartPoint:     tsStartPoint,
-		tsEndPoint:       tsEndPoint,
+		ctx:            ctx,
+		collectionInfo: collectionInfo,
+		chunkManager:   chunkManager,
+		callFlushFunc:  flushFunc,
+		blockSize:      blockSize,
+		maxTotalSize:   maxTotalSize,
+		tsStartPoint:   tsStartPoint,
+		tsEndPoint:     tsEndPoint,
 	}
 
 	// amend the segment size to avoid portential OOM risk
@@ -110,28 +107,12 @@ func NewBinlogAdapter(ctx context.Context,
 		adapter.blockSize = MaxSegmentSizeInMemory
 	}
 
-	// find out the primary key ID and its data type
-	adapter.primaryKey = -1
-	for i := 0; i < len(collectionSchema.Fields); i++ {
-		schema := collectionSchema.Fields[i]
-		if schema.GetIsPrimaryKey() {
-			adapter.primaryKey = schema.GetFieldID()
-			adapter.primaryType = schema.GetDataType()
-			break
-		}
-	}
-	// primary key not found
-	if adapter.primaryKey == -1 {
-		log.Error("Binlog adapter: collection schema has no primary key")
-		return nil, errors.New("collection schema has no primary key")
-	}
-
 	return adapter, nil
 }
 
 func (p *BinlogAdapter) Read(segmentHolder *SegmentFilesHolder) error {
 	if segmentHolder == nil {
-		log.Error("Binlog adapter: segment files holder is nil")
+		log.Warn("Binlog adapter: segment files holder is nil")
 		return errors.New("segment files holder is nil")
 	}
 
@@ -162,25 +143,26 @@ func (p *BinlogAdapter) Read(segmentHolder *SegmentFilesHolder) error {
 		break
 	}
 
-	// prepare FieldData list
-	segmentsData := make([]map[storage.FieldID]storage.FieldData, 0, p.shardNum)
-	for i := 0; i < int(p.shardNum); i++ {
-		segmentData := initSegmentData(p.collectionSchema)
-		if segmentData == nil {
-			log.Error("Binlog adapter: failed to initialize FieldData list")
-			return errors.New("failed to initialize FieldData list")
+	// prepare shards in-memory data
+	shardsData := make([]ShardData, 0, p.collectionInfo.ShardNum)
+	for i := 0; i < int(p.collectionInfo.ShardNum); i++ {
+		shardData := initShardData(p.collectionInfo.Schema, p.collectionInfo.PartitionIDs)
+		if shardData == nil {
+			log.Warn("Binlog adapter: fail to initialize in-memory segment data", zap.Int("shardID", i))
+			return fmt.Errorf("fail to initialize in-memory segment data for shard id %d", i)
 		}
-		segmentsData = append(segmentsData, segmentData)
+		shardsData = append(shardsData, shardData)
 	}
 
 	// read binlog files batch by batch
+	primaryKey := p.collectionInfo.PrimaryKey
 	for i := 0; i < batchCount; i++ {
 		// batchFiles excludes the primary key field and the timestamp field
 		// timestamp field is used to compare the tsEndPoint to skip some rows, no need to pass old timestamp to new segment.
 		// once a new segment generated, the timestamp field will be re-generated, too.
 		batchFiles := make(map[storage.FieldID]string)
 		for fieldID, files := range segmentHolder.fieldFiles {
-			if fieldID == p.primaryKey || fieldID == common.TimeStampField {
+			if fieldID == primaryKey.GetFieldID() || fieldID == common.TimeStampField {
 				continue
 			}
 			batchFiles[fieldID] = files[i]
@@ -188,8 +170,9 @@ func (p *BinlogAdapter) Read(segmentHolder *SegmentFilesHolder) error {
 		log.Info("Binlog adapter: batch files to read", zap.Any("batchFiles", batchFiles))
 
 		// read primary keys firstly
-		primaryLog := segmentHolder.fieldFiles[p.primaryKey][i] // no need to check existence, already verified
-		log.Info("Binlog adapter: prepare to read primary key binglog", zap.Int64("pk", p.primaryKey), zap.String("logPath", primaryLog))
+		primaryLog := segmentHolder.fieldFiles[primaryKey.GetFieldID()][i] // no need to check existence, already verified
+		log.Info("Binlog adapter: prepare to read primary key binglog",
+			zap.Int64("pk", primaryKey.GetFieldID()), zap.String("logPath", primaryLog))
 		intList, strList, err := p.readPrimaryKeys(primaryLog)
 		if err != nil {
 			return err
@@ -204,21 +187,21 @@ func (p *BinlogAdapter) Read(segmentHolder *SegmentFilesHolder) error {
 		}
 
 		var shardList []int32
-		if p.primaryType == schemapb.DataType_Int64 {
+		if primaryKey.GetDataType() == schemapb.DataType_Int64 {
 			// calculate a shard num list by primary keys and deleted entities
-			shardList, err = p.getShardingListByPrimaryInt64(intList, timestampList, segmentsData, intDeletedList)
+			shardList, err = p.getShardingListByPrimaryInt64(intList, timestampList, shardsData, intDeletedList)
 			if err != nil {
 				return err
 			}
-		} else if p.primaryType == schemapb.DataType_VarChar {
+		} else if primaryKey.GetDataType() == schemapb.DataType_VarChar {
 			// calculate a shard num list by primary keys and deleted entities
-			shardList, err = p.getShardingListByPrimaryVarchar(strList, timestampList, segmentsData, strDeletedList)
+			shardList, err = p.getShardingListByPrimaryVarchar(strList, timestampList, shardsData, strDeletedList)
 			if err != nil {
 				return err
 			}
 		} else {
-			log.Error("Binlog adapter: unknow primary key type", zap.Int("type", int(p.primaryType)))
-			return errors.New("unknow primary key type")
+			log.Warn("Binlog adapter: unsupported primary key type", zap.Int("type", int(primaryKey.GetDataType())))
+			return fmt.Errorf("unsupported primary key type %d, primary key should be int64 or varchar", primaryKey.GetDataType())
 		}
 
 		// if shardList is empty, that means all the primary keys have been deleted(or skipped), no need to read other files
@@ -230,25 +213,25 @@ func (p *BinlogAdapter) Read(segmentHolder *SegmentFilesHolder) error {
 		for fieldID, file := range batchFiles {
 			// outside context might be canceled(service stop, or future enhancement for canceling import task)
 			if isCanceled(p.ctx) {
-				log.Error("Binlog adapter: import task was canceled")
+				log.Warn("Binlog adapter: import task was canceled")
 				return errors.New("import task was canceled")
 			}
 
-			err = p.readInsertlog(fieldID, file, segmentsData, shardList)
+			err = p.readInsertlog(fieldID, file, shardsData, shardList)
 			if err != nil {
 				return err
 			}
 		}
 
 		// flush segment whose size exceed blockSize
-		err = tryFlushBlocks(p.ctx, segmentsData, p.collectionSchema, p.callFlushFunc, p.blockSize, p.maxTotalSize, false)
+		err = tryFlushBlocks(p.ctx, shardsData, p.collectionInfo.Schema, p.callFlushFunc, p.blockSize, p.maxTotalSize, false)
 		if err != nil {
 			return err
 		}
 	}
 
 	// finally, force to flush
-	return tryFlushBlocks(p.ctx, segmentsData, p.collectionSchema, p.callFlushFunc, p.blockSize, p.maxTotalSize, true)
+	return tryFlushBlocks(p.ctx, shardsData, p.collectionInfo.Schema, p.callFlushFunc, p.blockSize, p.maxTotalSize, true)
 }
 
 // verify method verify the schema and binlog files
@@ -258,19 +241,19 @@ func (p *BinlogAdapter) Read(segmentHolder *SegmentFilesHolder) error {
 //     but the segmentHolder.fieldFiles need to contains the two fields.
 func (p *BinlogAdapter) verify(segmentHolder *SegmentFilesHolder) error {
 	if segmentHolder == nil {
-		log.Error("Binlog adapter: segment files holder is nil")
+		log.Warn("Binlog adapter: segment files holder is nil")
 		return errors.New("segment files holder is nil")
 	}
 
 	firstFieldFileCount := 0
 	//  each field must has binlog file
-	for i := 0; i < len(p.collectionSchema.Fields); i++ {
-		schema := p.collectionSchema.Fields[i]
+	for i := 0; i < len(p.collectionInfo.Schema.Fields); i++ {
+		schema := p.collectionInfo.Schema.Fields[i]
 
 		files, ok := segmentHolder.fieldFiles[schema.FieldID]
 		if !ok {
-			log.Error("Binlog adapter: a field has no binlog file", zap.Int64("fieldID", schema.FieldID))
-			return errors.New("the field " + strconv.Itoa(int(schema.FieldID)) + " has no binlog file")
+			log.Warn("Binlog adapter: a field has no binlog file", zap.Int64("fieldID", schema.FieldID))
+			return fmt.Errorf("the field %d has no binlog file", schema.FieldID)
 		}
 
 		if i == 0 {
@@ -281,22 +264,23 @@ func (p *BinlogAdapter) verify(segmentHolder *SegmentFilesHolder) error {
 	// the segmentHolder.fieldFiles need to contains RowIDField
 	_, ok := segmentHolder.fieldFiles[common.RowIDField]
 	if !ok {
-		log.Error("Binlog adapter: the binlog files of RowIDField is missed")
+		log.Warn("Binlog adapter: the binlog files of RowIDField is missed")
 		return errors.New("the binlog files of RowIDField is missed")
 	}
 
 	// the segmentHolder.fieldFiles need to contains TimeStampField
 	_, ok = segmentHolder.fieldFiles[common.TimeStampField]
 	if !ok {
-		log.Error("Binlog adapter: the binlog files of TimeStampField is missed")
+		log.Warn("Binlog adapter: the binlog files of TimeStampField is missed")
 		return errors.New("the binlog files of TimeStampField is missed")
 	}
 
 	// binlog file count of each field must be equal
 	for _, files := range segmentHolder.fieldFiles {
 		if firstFieldFileCount != len(files) {
-			log.Error("Binlog adapter: file count of each field must be equal", zap.Int("firstFieldFileCount", firstFieldFileCount))
-			return errors.New("binlog file count of each field must be equal")
+			log.Warn("Binlog adapter: file count of each field must be equal", zap.Int("firstFieldFileCount", firstFieldFileCount))
+			return fmt.Errorf("binlog file count of each field must be equal, first field files count: %d, other field files count: %d",
+				firstFieldFileCount, len(files))
 		}
 	}
 
@@ -317,14 +301,15 @@ func (p *BinlogAdapter) readDeltalogs(segmentHolder *SegmentFilesHolder) (map[in
 		return nil, nil, nil // no deletion
 	}
 
-	if p.primaryType == schemapb.DataType_Int64 {
+	primaryKey := p.collectionInfo.PrimaryKey
+	if primaryKey.GetDataType() == schemapb.DataType_Int64 {
 		deletedIDDict := make(map[int64]uint64)
 		for _, deleteLog := range deleteLogs {
 			deletedIDDict[deleteLog.Pk.GetValue().(int64)] = deleteLog.Ts
 		}
 		log.Info("Binlog adapter: count of deleted entities", zap.Int("deletedCount", len(deletedIDDict)))
 		return deletedIDDict, nil, nil
-	} else if p.primaryType == schemapb.DataType_VarChar {
+	} else if primaryKey.GetDataType() == schemapb.DataType_VarChar {
 		deletedIDDict := make(map[string]uint64)
 		for _, deleteLog := range deleteLogs {
 			deletedIDDict[deleteLog.Pk.GetValue().(string)] = deleteLog.Ts
@@ -332,8 +317,8 @@ func (p *BinlogAdapter) readDeltalogs(segmentHolder *SegmentFilesHolder) (map[in
 		log.Info("Binlog adapter: count of deleted entities", zap.Int("deletedCount", len(deletedIDDict)))
 		return nil, deletedIDDict, nil
 	} else {
-		log.Error("Binlog adapter: primary key is neither int64 nor varchar")
-		return nil, nil, errors.New("primary key is neither int64 nor varchar")
+		log.Warn("Binlog adapter: unsupported primary key type", zap.Int("type", int(primaryKey.GetDataType())))
+		return nil, nil, fmt.Errorf("unsupported primary key type %d, primary key should be int64 or varchar", primaryKey.GetDataType())
 	}
 }
 
@@ -373,12 +358,14 @@ func (p *BinlogAdapter) decodeDeleteLogs(segmentHolder *SegmentFilesHolder) ([]*
 	log.Info("Binlog adapter: deletion count after filtering", zap.Int("count", len(deleteLogs)))
 
 	// step 3: verify the current collection primary key type and the delete logs data type
+	primaryKey := p.collectionInfo.PrimaryKey
 	for i := 0; i < len(deleteLogs); i++ {
-		if deleteLogs[i].PkType != int64(p.primaryType) {
-			log.Error("Binlog adapter: delta log data type is not equal to collection's primary key data type",
+		if deleteLogs[i].PkType != int64(primaryKey.GetDataType()) {
+			log.Warn("Binlog adapter: delta log data type is not equal to collection's primary key data type",
 				zap.Int64("deltaDataType", deleteLogs[i].PkType),
-				zap.Int64("pkDataType", int64(p.primaryType)))
-			return nil, errors.New("delta log data type is not equal to collection's primary key data type")
+				zap.Int64("pkDataType", int64(primaryKey.GetDataType())))
+			return nil, fmt.Errorf("delta log data type %d is not equal to collection's primary key data type %d",
+				deleteLogs[i].PkType, primaryKey.GetDataType())
 		}
 	}
 
@@ -395,14 +382,14 @@ func (p *BinlogAdapter) decodeDeleteLog(deltaStr string) (*storage.DeleteLog, er
 		// compatible error info (unmarshal err invalid character ',' after top-level value)
 		splits := strings.Split(deltaStr, ",")
 		if len(splits) != 2 {
-			log.Error("Binlog adapter: the format of deletion string is incorrect", zap.String("deltaStr", deltaStr))
-			return nil, fmt.Errorf("the format of deletion string is incorrect, %v can not be split", deltaStr)
+			log.Warn("Binlog adapter: the format of deletion string is incorrect", zap.String("deltaStr", deltaStr))
+			return nil, fmt.Errorf("the format of deletion string is incorrect, '%s' can not be split", deltaStr)
 		}
 		pk, err := strconv.ParseInt(splits[0], 10, 64)
 		if err != nil {
-			log.Error("Binlog adapter: failed to parse primary key of deletion string from old version",
+			log.Warn("Binlog adapter: failed to parse primary key of deletion string from old version",
 				zap.String("deltaStr", deltaStr), zap.Error(err))
-			return nil, err
+			return nil, fmt.Errorf("failed to parse primary key of deletion string '%s' from old version, error: %w", deltaStr, err)
 		}
 		deleteLog.Pk = &storage.Int64PrimaryKey{
 			Value: pk,
@@ -410,9 +397,9 @@ func (p *BinlogAdapter) decodeDeleteLog(deltaStr string) (*storage.DeleteLog, er
 		deleteLog.PkType = int64(schemapb.DataType_Int64)
 		deleteLog.Ts, err = strconv.ParseUint(splits[1], 10, 64)
 		if err != nil {
-			log.Error("Binlog adapter: failed to parse timestamp of deletion string from old version",
+			log.Warn("Binlog adapter: failed to parse timestamp of deletion string from old version",
 				zap.String("deltaStr", deltaStr), zap.Error(err))
-			return nil, err
+			return nil, fmt.Errorf("failed to parse timestamp of deletion string '%s' from old version, error: %w", deltaStr, err)
 		}
 	}
 
@@ -424,22 +411,22 @@ func (p *BinlogAdapter) readDeltalog(logPath string) ([]string, error) {
 	// open the delta log file
 	binlogFile, err := NewBinlogFile(p.chunkManager)
 	if err != nil {
-		log.Error("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
-		return nil, err
+		log.Warn("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
+		return nil, fmt.Errorf("failed to initialize binlog file '%s', error: %w", logPath, err)
 	}
 
 	err = binlogFile.Open(logPath)
 	if err != nil {
-		log.Error("Binlog adapter: failed to open delta log", zap.String("logPath", logPath), zap.Error(err))
-		return nil, err
+		log.Warn("Binlog adapter: failed to open delta log", zap.String("logPath", logPath), zap.Error(err))
+		return nil, fmt.Errorf("failed to open delta log '%s', error: %w", logPath, err)
 	}
 	defer binlogFile.Close()
 
 	// delta log type is varchar, return a string array(marshaled from an array of storage.DeleteLog objects)
 	data, err := binlogFile.ReadVarchar()
 	if err != nil {
-		log.Error("Binlog adapter: failed to read delta log", zap.String("logPath", logPath), zap.Error(err))
-		return nil, err
+		log.Warn("Binlog adapter: failed to read delta log", zap.String("logPath", logPath), zap.Error(err))
+		return nil, fmt.Errorf("failed to read delta log '%s', error: %w", logPath, err)
 	}
 	log.Info("Binlog adapter: successfully read deltalog", zap.Int("deleteCount", len(data)))
 
@@ -451,22 +438,22 @@ func (p *BinlogAdapter) readTimestamp(logPath string) ([]int64, error) {
 	// open the log file
 	binlogFile, err := NewBinlogFile(p.chunkManager)
 	if err != nil {
-		log.Error("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
-		return nil, err
+		log.Warn("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
+		return nil, fmt.Errorf("failed to initialize binlog file '%s', error: %w", logPath, err)
 	}
 
 	err = binlogFile.Open(logPath)
 	if err != nil {
-		log.Error("Binlog adapter: failed to open timestamp log file", zap.String("logPath", logPath))
-		return nil, err
+		log.Warn("Binlog adapter: failed to open timestamp log file", zap.String("logPath", logPath))
+		return nil, fmt.Errorf("failed to open timestamp log file '%s', error: %w", logPath, err)
 	}
 	defer binlogFile.Close()
 
 	// read int64 data
 	int64List, err := binlogFile.ReadInt64()
 	if err != nil {
-		log.Error("Binlog adapter: failed to read timestamp data from log file", zap.String("logPath", logPath))
-		return nil, err
+		log.Warn("Binlog adapter: failed to read timestamp data from log file", zap.String("logPath", logPath))
+		return nil, fmt.Errorf("failed to read timestamp data from log file '%s', error: %w", logPath, err)
 	}
 
 	log.Info("Binlog adapter: read timestamp from log file", zap.Int("tsCount", len(int64List)))
@@ -479,37 +466,38 @@ func (p *BinlogAdapter) readPrimaryKeys(logPath string) ([]int64, []string, erro
 	// open the delta log file
 	binlogFile, err := NewBinlogFile(p.chunkManager)
 	if err != nil {
-		log.Error("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
-		return nil, nil, err
+		log.Warn("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
+		return nil, nil, fmt.Errorf("failed to initialize binlog file '%s', error: %w", logPath, err)
 	}
 
 	err = binlogFile.Open(logPath)
 	if err != nil {
-		log.Error("Binlog adapter: failed to open primary key binlog", zap.String("logPath", logPath))
-		return nil, nil, err
+		log.Warn("Binlog adapter: failed to open primary key binlog", zap.String("logPath", logPath))
+		return nil, nil, fmt.Errorf("failed to open primary key binlog '%s', error: %w", logPath, err)
 	}
 	defer binlogFile.Close()
 
 	// primary key can be int64 or varchar, we need to handle the two cases
-	if p.primaryType == schemapb.DataType_Int64 {
+	primaryKey := p.collectionInfo.PrimaryKey
+	if primaryKey.GetDataType() == schemapb.DataType_Int64 {
 		idList, err := binlogFile.ReadInt64()
 		if err != nil {
-			log.Error("Binlog adapter: failed to read int64 primary key from binlog", zap.String("logPath", logPath), zap.Error(err))
-			return nil, nil, err
+			log.Warn("Binlog adapter: failed to read int64 primary key from binlog", zap.String("logPath", logPath), zap.Error(err))
+			return nil, nil, fmt.Errorf("failed to read int64 primary key from binlog '%s', error: %w", logPath, err)
 		}
 		log.Info("Binlog adapter: succeed to read int64 primary key binlog", zap.Int("len", len(idList)))
 		return idList, nil, nil
-	} else if p.primaryType == schemapb.DataType_VarChar {
+	} else if primaryKey.GetDataType() == schemapb.DataType_VarChar {
 		idList, err := binlogFile.ReadVarchar()
 		if err != nil {
-			log.Error("Binlog adapter: failed to read varchar primary key from binlog", zap.String("logPath", logPath), zap.Error(err))
-			return nil, nil, err
+			log.Warn("Binlog adapter: failed to read varchar primary key from binlog", zap.String("logPath", logPath), zap.Error(err))
+			return nil, nil, fmt.Errorf("failed to read varchar primary key from binlog '%s', error: %w", logPath, err)
 		}
 		log.Info("Binlog adapter: succeed to read varchar primary key binlog", zap.Int("len", len(idList)))
 		return nil, idList, nil
 	} else {
-		log.Error("Binlog adapter: primary key is neither int64 nor varchar")
-		return nil, nil, errors.New("primary key is neither int64 nor varchar")
+		log.Warn("Binlog adapter: unsupported primary key type", zap.Int("type", int(primaryKey.GetDataType())))
+		return nil, nil, fmt.Errorf("unsupported primary key type %d, primary key should be int64 or varchar", primaryKey.GetDataType())
 	}
 }
 
@@ -519,12 +507,13 @@ func (p *BinlogAdapter) readPrimaryKeys(logPath string) ([]int64, []string, erro
 // Compare timestampList with tsEndPoint to skip some rows.
 func (p *BinlogAdapter) getShardingListByPrimaryInt64(primaryKeys []int64,
 	timestampList []int64,
-	memoryData []map[storage.FieldID]storage.FieldData,
-	intDeletedList map[int64]uint64) ([]int32, error) {
+	memoryData []ShardData,
+	intDeletedList map[int64]uint64,
+) ([]int32, error) {
 	if len(timestampList) != len(primaryKeys) {
-		log.Error("Binlog adapter: primary key length is not equal to timestamp list length",
+		log.Warn("Binlog adapter: primary key length is not equal to timestamp list length",
 			zap.Int("primaryKeysLen", len(primaryKeys)), zap.Int("timestampLen", len(timestampList)))
-		return nil, errors.New("primary key length is not equal to timestamp list length")
+		return nil, fmt.Errorf("primary key length %d is not equal to timestamp list length %d", len(primaryKeys), len(timestampList))
 	}
 
 	log.Info("Binlog adapter: building shard list", zap.Int("pkLen", len(primaryKeys)), zap.Int("tsLen", len(timestampList)))
@@ -532,6 +521,7 @@ func (p *BinlogAdapter) getShardingListByPrimaryInt64(primaryKeys []int64,
 	actualDeleted := 0
 	excluded := 0
 	shardList := make([]int32, 0, len(primaryKeys))
+	primaryKey := p.collectionInfo.PrimaryKey
 	for i, key := range primaryKeys {
 		// if this entity's timestamp is greater than the tsEndPoint, or less than tsStartPoint, set shardID = -1 to skip this entity
 		// timestamp is stored as int64 type in log file, actually it is uint64, compare with uint64
@@ -549,13 +539,13 @@ func (p *BinlogAdapter) getShardingListByPrimaryInt64(primaryKeys []int64,
 			actualDeleted++
 		} else {
 			hash, _ := typeutil.Hash32Int64(key)
-			shardID := hash % uint32(p.shardNum)
-			fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-			field := fields[p.primaryKey] // initSegmentData() can ensure the existence, no need to check here
+			shardID := hash % uint32(p.collectionInfo.ShardNum)
+			partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+			fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+			field := fields[primaryKey.GetFieldID()]               // initBlockData() can ensure the existence, no need to check here
 
 			// append the entity to primary key's FieldData
 			field.(*storage.Int64FieldData).Data = append(field.(*storage.Int64FieldData).Data, key)
-			field.(*storage.Int64FieldData).NumRows[0]++
 
 			shardList = append(shardList, int32(shardID))
 		}
@@ -571,12 +561,13 @@ func (p *BinlogAdapter) getShardingListByPrimaryInt64(primaryKeys []int64,
 // [0, 1, -1, 1, 0, 1, -1, 1, 0, 1]
 func (p *BinlogAdapter) getShardingListByPrimaryVarchar(primaryKeys []string,
 	timestampList []int64,
-	memoryData []map[storage.FieldID]storage.FieldData,
-	strDeletedList map[string]uint64) ([]int32, error) {
+	memoryData []ShardData,
+	strDeletedList map[string]uint64,
+) ([]int32, error) {
 	if len(timestampList) != len(primaryKeys) {
-		log.Error("Binlog adapter: primary key length is not equal to timestamp list length",
+		log.Warn("Binlog adapter: primary key length is not equal to timestamp list length",
 			zap.Int("primaryKeysLen", len(primaryKeys)), zap.Int("timestampLen", len(timestampList)))
-		return nil, errors.New("primary key length is not equal to timestamp list length")
+		return nil, fmt.Errorf("primary key length %d is not equal to timestamp list length %d", len(primaryKeys), len(timestampList))
 	}
 
 	log.Info("Binlog adapter: building shard list", zap.Int("pkLen", len(primaryKeys)), zap.Int("tsLen", len(timestampList)))
@@ -584,6 +575,7 @@ func (p *BinlogAdapter) getShardingListByPrimaryVarchar(primaryKeys []string,
 	actualDeleted := 0
 	excluded := 0
 	shardList := make([]int32, 0, len(primaryKeys))
+	primaryKey := p.collectionInfo.PrimaryKey
 	for i, key := range primaryKeys {
 		// if this entity's timestamp is greater than the tsEndPoint, or less than tsStartPoint, set shardID = -1 to skip this entity
 		// timestamp is stored as int64 type in log file, actually it is uint64, compare with uint64
@@ -601,13 +593,13 @@ func (p *BinlogAdapter) getShardingListByPrimaryVarchar(primaryKeys []string,
 			actualDeleted++
 		} else {
 			hash := typeutil.HashString2Uint32(key)
-			shardID := hash % uint32(p.shardNum)
-			fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-			field := fields[p.primaryKey] // initSegmentData() can ensure the existence, no need to check existence here
+			shardID := hash % uint32(p.collectionInfo.ShardNum)
+			partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+			fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+			field := fields[primaryKey.GetFieldID()]               // initBlockData() can ensure the existence, no need to check existence here
 
 			// append the entity to primary key's FieldData
 			field.(*storage.StringFieldData).Data = append(field.(*storage.StringFieldData).Data, key)
-			field.(*storage.StringFieldData).NumRows[0]++
 
 			shardList = append(shardList, int32(shardID))
 		}
@@ -616,6 +608,20 @@ func (p *BinlogAdapter) getShardingListByPrimaryVarchar(primaryKeys []string,
 		zap.Int("excluded", excluded), zap.Int("len", len(shardList)))
 
 	return shardList, nil
+}
+
+// Sometimes the fieldID doesn't exist in the memoryData in the following case:
+// Use an old backup tool(v0.2.2) to backup a collection of milvus v2.2.9, use a new backup tool to restore the collection
+func (p *BinlogAdapter) verifyField(fieldID storage.FieldID, memoryData []ShardData) error {
+	for _, partitions := range memoryData {
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		_, ok := fields[fieldID]
+		if !ok {
+			log.Warn("Binlog adapter: the field ID doesn't exist in collection schema", zap.Int64("fieldID", fieldID))
+			return fmt.Errorf("the field ID %d doesn't exist in collection schema", fieldID)
+		}
+	}
+	return nil
 }
 
 // readInsertlog method reads an insert log, and split the data into different shards according to a shard list
@@ -628,18 +634,25 @@ func (p *BinlogAdapter) getShardingListByPrimaryVarchar(primaryKeys []string,
 // the no.2, no.4, no.6, no.8, no.10 will be put into shard_1
 // Note: the row count of insert log need to be equal to length of shardList
 func (p *BinlogAdapter) readInsertlog(fieldID storage.FieldID, logPath string,
-	memoryData []map[storage.FieldID]storage.FieldData, shardList []int32) error {
+	memoryData []ShardData, shardList []int32,
+) error {
+	err := p.verifyField(fieldID, memoryData)
+	if err != nil {
+		log.Warn("Binlog adapter: could not read binlog file", zap.String("logPath", logPath), zap.Error(err))
+		return fmt.Errorf("could not read binlog file %s, error: %w", logPath, err)
+	}
+
 	// open the insert log file
 	binlogFile, err := NewBinlogFile(p.chunkManager)
 	if err != nil {
-		log.Error("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
-		return err
+		log.Warn("Binlog adapter: failed to initialize binlog file", zap.String("logPath", logPath), zap.Error(err))
+		return fmt.Errorf("failed to initialize binlog file %s, error: %w", logPath, err)
 	}
 
 	err = binlogFile.Open(logPath)
 	if err != nil {
-		log.Error("Binlog adapter: failed to open insert log", zap.String("logPath", logPath), zap.Error(err))
-		return err
+		log.Warn("Binlog adapter: failed to open insert log", zap.String("logPath", logPath), zap.Error(err))
+		return fmt.Errorf("failed to open insert log %s, error: %w", logPath, err)
 	}
 	defer binlogFile.Close()
 
@@ -725,6 +738,16 @@ func (p *BinlogAdapter) readInsertlog(fieldID storage.FieldID, logPath string,
 		if err != nil {
 			return err
 		}
+	case schemapb.DataType_JSON:
+		data, err := binlogFile.ReadJSON()
+		if err != nil {
+			return err
+		}
+
+		err = p.dispatchBytesToShards(data, memoryData, shardList, fieldID)
+		if err != nil {
+			return err
+		}
 	case schemapb.DataType_BinaryVector:
 		data, dim, err := binlogFile.ReadBinaryVector()
 		if err != nil {
@@ -746,19 +769,20 @@ func (p *BinlogAdapter) readInsertlog(fieldID storage.FieldID, logPath string,
 			return err
 		}
 	default:
-		return errors.New("unsupported data type")
+		return fmt.Errorf("unsupported data type %d", binlogFile.DataType())
 	}
 	log.Info("Binlog adapter: read data into shard list", zap.Int("dataType", int(binlogFile.DataType())), zap.Int("shardLen", len(shardList)))
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchBoolToShards(data []bool, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchBoolToShards(data []bool, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: bool field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("bool field row count is not equal to primary key")
+		log.Warn("Binlog adapter: bool field row count is not equal to shard list row count %d", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("bool field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -767,22 +791,33 @@ func (p *BinlogAdapter) dispatchBoolToShards(data []bool, memoryData []map[stora
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: bool field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("bool field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.BoolFieldData).Data = append(field.(*storage.BoolFieldData).Data, val)
-		field.(*storage.BoolFieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.BoolFieldData)        // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is bool type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is bool type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchInt8ToShards(data []int8, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchInt8ToShards(data []int8, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: int8 field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("int8 field row count is not equal to primary key")
+		log.Warn("Binlog adapter: int8 field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("int8 field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entity acoording to shard list
@@ -791,22 +826,33 @@ func (p *BinlogAdapter) dispatchInt8ToShards(data []int8, memoryData []map[stora
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: int8 field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("int8 field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.Int8FieldData).Data = append(field.(*storage.Int8FieldData).Data, val)
-		field.(*storage.Int8FieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.Int8FieldData)        // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is int8 type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is int8 type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchInt16ToShards(data []int16, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchInt16ToShards(data []int16, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: int16 field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("int16 field row count is not equal to primary key")
+		log.Warn("Binlog adapter: int16 field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("int16 field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -815,22 +861,33 @@ func (p *BinlogAdapter) dispatchInt16ToShards(data []int16, memoryData []map[sto
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: int16 field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("int16 field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.Int16FieldData).Data = append(field.(*storage.Int16FieldData).Data, val)
-		field.(*storage.Int16FieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.Int16FieldData)       // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is int16 type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is int16 type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchInt32ToShards(data []int32, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchInt32ToShards(data []int32, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: int32 field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("int32 field row count is not equal to primary key")
+		log.Warn("Binlog adapter: int32 field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("int32 field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -839,22 +896,33 @@ func (p *BinlogAdapter) dispatchInt32ToShards(data []int32, memoryData []map[sto
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: int32 field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("int32 field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.Int32FieldData).Data = append(field.(*storage.Int32FieldData).Data, val)
-		field.(*storage.Int32FieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.Int32FieldData)       // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is int32 type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is int32 type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchInt64ToShards(data []int64, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchInt64ToShards(data []int64, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: int64 field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("int64 field row count is not equal to primary key")
+		log.Warn("Binlog adapter: int64 field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("int64 field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -863,22 +931,33 @@ func (p *BinlogAdapter) dispatchInt64ToShards(data []int64, memoryData []map[sto
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: int64 field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("int64 field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.Int64FieldData).Data = append(field.(*storage.Int64FieldData).Data, val)
-		field.(*storage.Int64FieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.Int64FieldData)       // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is int64 type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is int64 type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchFloatToShards(data []float32, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchFloatToShards(data []float32, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: float field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("float field row count is not equal to primary key")
+		log.Warn("Binlog adapter: float field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("float field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -887,22 +966,33 @@ func (p *BinlogAdapter) dispatchFloatToShards(data []float32, memoryData []map[s
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: float field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("float field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.FloatFieldData).Data = append(field.(*storage.FloatFieldData).Data, val)
-		field.(*storage.FloatFieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.FloatFieldData)       // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is float type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is float type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchDoubleToShards(data []float64, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchDoubleToShards(data []float64, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: double field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("double field row count is not equal to primary key")
+		log.Warn("Binlog adapter: double field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("double field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -911,22 +1001,33 @@ func (p *BinlogAdapter) dispatchDoubleToShards(data []float64, memoryData []map[
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: double field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("double field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.DoubleFieldData).Data = append(field.(*storage.DoubleFieldData).Data, val)
-		field.(*storage.DoubleFieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.DoubleFieldData)      // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is double type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is double type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchVarcharToShards(data []string, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchVarcharToShards(data []string, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	if len(data) != len(shardList) {
-		log.Error("Binlog adapter: varchar field row count is not equal to primary key", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
-		return errors.New("varchar field row count is not equal to primary key")
+		log.Warn("Binlog adapter: varchar field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("varchar field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -935,24 +1036,71 @@ func (p *BinlogAdapter) dispatchVarcharToShards(data []string, memoryData []map[
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: varchar field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("varchar field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
 
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		field.(*storage.StringFieldData).Data = append(field.(*storage.StringFieldData).Data, val)
-		field.(*storage.StringFieldData).NumRows[0]++
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.StringFieldData)      // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is varchar type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is varchar type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchBinaryVecToShards(data []byte, dim int, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchBytesToShards(data [][]byte, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
+	// verify row count
+	if len(data) != len(shardList) {
+		log.Warn("Binlog adapter: JSON field row count is not equal to shard list row count", zap.Int("dataLen", len(data)), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("varchar JSON row count %d is not equal to shard list row count %d", len(data), len(shardList))
+	}
+
+	// dispatch entities acoording to shard list
+	for i, val := range data {
+		shardID := shardList[i]
+		if shardID < 0 {
+			continue // this entity has been deleted or excluded by timestamp
+		}
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: JSON field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("JSON field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
+		}
+
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.JSONFieldData)        // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is JSON type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is JSON type, unequal to field %d", fieldID)
+		}
+		fieldData.Data = append(fieldData.Data, val)
+	}
+
+	return nil
+}
+
+func (p *BinlogAdapter) dispatchBinaryVecToShards(data []byte, dim int, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	bytesPerVector := dim / 8
 	count := len(data) / bytesPerVector
 	if count != len(shardList) {
-		log.Error("Binlog adapter: binary vector field row count is not equal to primary key", zap.Int("dataLen", count), zap.Int("shardLen", len(shardList)))
-		return errors.New("binary vector field row count is not equal to primary key")
+		log.Warn("Binlog adapter: binary vector field row count is not equal to shard list row count",
+			zap.Int("dataLen", count), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("binary vector field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -961,36 +1109,45 @@ func (p *BinlogAdapter) dispatchBinaryVecToShards(data []byte, dim int, memoryDa
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
-
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		binVecField := field.(*storage.BinaryVectorFieldData)
-		if binVecField == nil {
-			log.Error("Binlog adapter: the in-memory field is not a binary vector field")
-			return errors.New("the in-memory field is not a binary vector field")
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: binary vector field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("binary vector field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
 		}
-		if binVecField.Dim != dim {
-			log.Error("Binlog adapter: binary vector dimension mismatch", zap.Int("sourceDim", dim), zap.Int("schemaDim", binVecField.Dim))
-			return errors.New("binary vector dimension mismatch")
+
+		partitions := memoryData[shardID]                       // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]]  // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                                // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.BinaryVectorFieldData) // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is binary vector type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is binary vector type, unequal to field %d", fieldID)
+		}
+
+		if fieldData.Dim != dim {
+			log.Warn("Binlog adapter: binary vector dimension mismatch",
+				zap.Int("sourceDim", dim), zap.Int("schemaDim", fieldData.Dim))
+			return fmt.Errorf("binary vector dimension %d is not equal to schema dimension %d", dim, fieldData.Dim)
 		}
 		for j := 0; j < bytesPerVector; j++ {
 			val := data[bytesPerVector*i+j]
 
-			binVecField.Data = append(binVecField.Data, val)
+			fieldData.Data = append(fieldData.Data, val)
 		}
-		binVecField.NumRows[0]++
 	}
 
 	return nil
 }
 
-func (p *BinlogAdapter) dispatchFloatVecToShards(data []float32, dim int, memoryData []map[storage.FieldID]storage.FieldData,
-	shardList []int32, fieldID storage.FieldID) error {
+func (p *BinlogAdapter) dispatchFloatVecToShards(data []float32, dim int, memoryData []ShardData,
+	shardList []int32, fieldID storage.FieldID,
+) error {
 	// verify row count
 	count := len(data) / dim
 	if count != len(shardList) {
-		log.Error("Binlog adapter: float vector field row count is not equal to primary key", zap.Int("dataLen", count), zap.Int("shardLen", len(shardList)))
-		return errors.New("float vector field row count is not equal to primary key")
+		log.Warn("Binlog adapter: float vector field row count is not equal to shard list row count",
+			zap.Int("dataLen", count), zap.Int("shardLen", len(shardList)))
+		return fmt.Errorf("float vector field row count %d is not equal to shard list row count %d", len(data), len(shardList))
 	}
 
 	// dispatch entities acoording to shard list
@@ -999,23 +1156,30 @@ func (p *BinlogAdapter) dispatchFloatVecToShards(data []float32, dim int, memory
 		if shardID < 0 {
 			continue // this entity has been deleted or excluded by timestamp
 		}
-
-		fields := memoryData[shardID] // initSegmentData() can ensure the existence, no need to check bound here
-		field := fields[fieldID]      // initSegmentData() can ensure the existence, no need to check existence here
-		floatVecField := field.(*storage.FloatVectorFieldData)
-		if floatVecField == nil {
-			log.Error("Binlog adapter: the in-memory field is not a float vector field")
-			return errors.New("the in-memory field is not a float vector field")
+		if shardID >= int32(len(memoryData)) {
+			log.Warn("Binlog adapter: float vector field's shard ID is illegal", zap.Int32("shardID", shardID), zap.Int("shardsCount", len(memoryData)))
+			return fmt.Errorf("float vector field's shard ID %d is larger than shards number %d", shardID, len(memoryData))
 		}
-		if floatVecField.Dim != dim {
-			log.Error("Binlog adapter: float vector dimension mismatch", zap.Int("sourceDim", dim), zap.Int("schemaDim", floatVecField.Dim))
-			return errors.New("float vector dimension mismatch")
+
+		partitions := memoryData[shardID]                      // initBlockData() can ensure the existence, no need to check bound here
+		fields := partitions[p.collectionInfo.PartitionIDs[0]] // NewBinlogAdapter() can ensure only one partition
+		field := fields[fieldID]                               // initBlockData() can ensure the existence, no need to check existence here
+		fieldData, ok := field.(*storage.FloatVectorFieldData) // avoid data type mismatch between binlog file and schema
+		if !ok {
+			log.Warn("Binlog adapter: binlog is float vector type, unequal to field",
+				zap.Int64("fieldID", fieldID), zap.Int32("shardID", shardID))
+			return fmt.Errorf("binlog is float vector type, unequal to field %d", fieldID)
+		}
+
+		if fieldData.Dim != dim {
+			log.Warn("Binlog adapter: float vector dimension mismatch",
+				zap.Int("sourceDim", dim), zap.Int("schemaDim", fieldData.Dim))
+			return fmt.Errorf("binary vector dimension %d is not equal to schema dimension %d", dim, fieldData.Dim)
 		}
 		for j := 0; j < dim; j++ {
 			val := data[dim*i+j]
-			floatVecField.Data = append(floatVecField.Data, val)
+			fieldData.Data = append(fieldData.Data, val)
 		}
-		floatVecField.NumRows[0]++
 	}
 
 	return nil

@@ -2,23 +2,24 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"testing"
 
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestInitHook(t *testing.T) {
-	Params.ProxyCfg.SoPath = ""
+	paramtable.Get().Save(Params.ProxyCfg.SoPath.Key, "")
 	initHook()
 	assert.IsType(t, defaultHook{}, hoo)
 
-	Params.ProxyCfg.SoPath = "/a/b/hook.so"
+	paramtable.Get().Save(Params.ProxyCfg.SoPath.Key, "/a/b/hook.so")
 	err := initHook()
-	assert.NotNil(t, err)
-	Params.ProxyCfg.SoPath = ""
+	assert.Error(t, err)
+	paramtable.Get().Save(Params.ProxyCfg.SoPath.Key, "")
 }
 
 type mockHook struct {
@@ -79,6 +80,9 @@ func TestHookInterceptor(t *testing.T) {
 		info = &grpc.UnaryServerInfo{
 			FullMethod: "test",
 		}
+		emptyFullMethod = &grpc.UnaryServerInfo{
+			FullMethod: "",
+		}
 		interceptor = UnaryServerHookInterceptor()
 		mockHoo     = mockHook{mockRes: "mock", mockErr: errors.New("mock")}
 		r           = &req{method: "req"}
@@ -92,6 +96,11 @@ func TestHookInterceptor(t *testing.T) {
 
 	hoo = mockHoo
 	res, err = interceptor(ctx, "request", info, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return nil, nil
+	})
+	assert.Equal(t, res, mockHoo.mockRes)
+	assert.Equal(t, err, mockHoo.mockErr)
+	res, err = interceptor(ctx, "request", emptyFullMethod, func(ctx context.Context, req interface{}) (interface{}, error) {
 		return nil, nil
 	})
 	assert.Equal(t, res, mockHoo.mockRes)
@@ -135,5 +144,13 @@ func TestDefaultHook(t *testing.T) {
 	assert.NoError(t, d.Init(nil))
 	assert.NotPanics(t, func() {
 		d.Release()
+	})
+}
+
+func TestUpdateProxyFunctionCallMetric(t *testing.T) {
+	assert.NotPanics(t, func() {
+		updateProxyFunctionCallMetric("/milvus.proto.milvus.MilvusService/Flush")
+		updateProxyFunctionCallMetric("Flush")
+		updateProxyFunctionCallMetric("")
 	})
 }

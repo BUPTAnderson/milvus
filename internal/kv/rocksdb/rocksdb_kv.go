@@ -17,12 +17,15 @@
 package rocksdbkv
 
 import (
-	"errors"
 	"fmt"
 
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/tecbot/gorocksdb"
+
+	"github.com/milvus-io/milvus/internal/kv"
+	"github.com/milvus-io/milvus/internal/kv/predicates"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 var _ kv.BaseKV = (*RocksdbKV)(nil)
@@ -161,6 +164,36 @@ func (kv *RocksdbKV) LoadWithPrefix(prefix string) ([]string, []string, error) {
 	return keys, values, nil
 }
 
+func (kv *RocksdbKV) Has(key string) (bool, error) {
+	if kv.DB == nil {
+		return false, fmt.Errorf("rocksdb instance is nil when check if has %s", key)
+	}
+
+	option := gorocksdb.NewDefaultReadOptions()
+	defer option.Destroy()
+
+	value, err := kv.DB.Get(option, []byte(key))
+	if err != nil {
+		return false, err
+	}
+
+	return value.Size() != 0, nil
+}
+
+func (kv *RocksdbKV) HasPrefix(prefix string) (bool, error) {
+	if kv.DB == nil {
+		return false, fmt.Errorf("rocksdb instance is nil when check if has prefix %s", prefix)
+	}
+
+	option := gorocksdb.NewDefaultReadOptions()
+	defer option.Destroy()
+	iter := NewRocksIteratorWithUpperBound(kv.DB, typeutil.AddOne(prefix), option)
+	defer iter.Close()
+
+	iter.Seek([]byte(prefix))
+	return iter.Valid(), nil
+}
+
 func (kv *RocksdbKV) LoadBytesWithPrefix(prefix string) ([]string, [][]byte, error) {
 	if kv.DB == nil {
 		return nil, nil, fmt.Errorf("rocksdb instance is nil when load %s", prefix)
@@ -169,7 +202,6 @@ func (kv *RocksdbKV) LoadBytesWithPrefix(prefix string) ([]string, [][]byte, err
 	option := gorocksdb.NewDefaultReadOptions()
 	defer option.Destroy()
 
-	NewRocksIterator(kv.DB, option)
 	iter := NewRocksIteratorWithUpperBound(kv.DB, typeutil.AddOne(prefix), option)
 	defer iter.Close()
 
@@ -201,16 +233,22 @@ func (kv *RocksdbKV) MultiLoad(keys []string) ([]string, error) {
 	if kv.DB == nil {
 		return nil, errors.New("rocksdb instance is nil when do MultiLoad")
 	}
+
+	keyInBytes := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		keyInBytes = append(keyInBytes, []byte(key))
+	}
 	values := make([]string, 0, len(keys))
 	option := gorocksdb.NewDefaultReadOptions()
 	defer option.Destroy()
-	for _, key := range keys {
-		value, err := kv.DB.Get(option, []byte(key))
-		if err != nil {
-			return nil, err
-		}
-		values = append(values, string(value.Data()))
-		value.Free()
+
+	valueSlice, err := kv.DB.MultiGet(option, keyInBytes...)
+	if err != nil {
+		return nil, err
+	}
+	for i := range valueSlice {
+		values = append(values, string(valueSlice[i].Data()))
+		valueSlice[i].Free()
 	}
 	return values, nil
 }
@@ -219,21 +257,25 @@ func (kv *RocksdbKV) MultiLoadBytes(keys []string) ([][]byte, error) {
 	if kv.DB == nil {
 		return nil, errors.New("rocksdb instance is nil when do MultiLoad")
 	}
+
+	keyInBytes := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		keyInBytes = append(keyInBytes, []byte(key))
+	}
 	values := make([][]byte, 0, len(keys))
 	option := gorocksdb.NewDefaultReadOptions()
 	defer option.Destroy()
 
-	for _, key := range keys {
-		value, err := kv.DB.Get(option, []byte(key))
-		if err != nil {
-			return nil, err
-		}
-
-		data := value.Data()
+	valueSlice, err := kv.DB.MultiGet(option, keyInBytes...)
+	if err != nil {
+		return nil, err
+	}
+	for i := range valueSlice {
+		data := valueSlice[i].Data()
 		v := make([]byte, len(data))
 		copy(v, data)
 		values = append(values, v)
-		value.Free()
+		valueSlice[i].Free()
 	}
 	return values, nil
 }
@@ -349,7 +391,10 @@ func (kv *RocksdbKV) MultiRemove(keys []string) error {
 }
 
 // MultiSaveAndRemove provides a transaction to execute a batch of operations
-func (kv *RocksdbKV) MultiSaveAndRemove(saves map[string]string, removals []string) error {
+func (kv *RocksdbKV) MultiSaveAndRemove(saves map[string]string, removals []string, preds ...predicates.Predicate) error {
+	if len(preds) > 0 {
+		return merr.WrapErrServiceUnavailable("predicates not supported")
+	}
 	if kv.DB == nil {
 		return errors.New("Rocksdb instance is nil when do MultiSaveAndRemove")
 	}
@@ -380,20 +425,11 @@ func (kv *RocksdbKV) DeleteRange(startKey, endKey string) error {
 	return err
 }
 
-// MultiRemoveWithPrefix is used to remove a batch of key-values with the same prefix
-func (kv *RocksdbKV) MultiRemoveWithPrefix(prefixes []string) error {
-	if kv.DB == nil {
-		return errors.New("rocksdb instance is nil when do RemoveWithPrefix")
-	}
-	writeBatch := gorocksdb.NewWriteBatch()
-	defer writeBatch.Destroy()
-	kv.prepareRemovePrefix(prefixes, writeBatch)
-	err := kv.DB.Write(kv.WriteOptions, writeBatch)
-	return err
-}
-
 // MultiSaveAndRemoveWithPrefix is used to execute a batch operators with the same prefix
-func (kv *RocksdbKV) MultiSaveAndRemoveWithPrefix(saves map[string]string, removals []string) error {
+func (kv *RocksdbKV) MultiSaveAndRemoveWithPrefix(saves map[string]string, removals []string, preds ...predicates.Predicate) error {
+	if len(preds) > 0 {
+		return merr.WrapErrServiceUnavailable("predicates not supported")
+	}
 	if kv.DB == nil {
 		return errors.New("Rocksdb instance is nil when do MultiSaveAndRemove")
 	}

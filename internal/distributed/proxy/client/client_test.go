@@ -18,51 +18,45 @@ package grpcproxyclient
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/proxy"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/internal/proto/proxypb"
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func Test_NewClient(t *testing.T) {
-	proxy.Params.InitOnce()
+	paramtable.Init()
 
 	ctx := context.Background()
-	client, err := NewClient(ctx, "")
+	client, err := NewClient(ctx, "", 1)
 	assert.Nil(t, client)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	client, err = NewClient(ctx, "test")
-	assert.Nil(t, err)
+	client, err = NewClient(ctx, "test", 2)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret interface{}, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetStatisticsChannel(ctx)
+		r2, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
 		r3, err := client.InvalidateCollectionMetaCache(ctx, nil)
@@ -120,13 +114,13 @@ func Test_NewClient(t *testing.T) {
 
 	retCheck := func(ret interface{}, err error) {
 		assert.Nil(t, ret)
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	}
 
-	r1Timeout, err := client.GetComponentStates(shortCtx)
+	r1Timeout, err := client.GetComponentStates(shortCtx, nil)
 	retCheck(r1Timeout, err)
 
-	r2Timeout, err := client.GetStatisticsChannel(shortCtx)
+	r2Timeout, err := client.GetStatisticsChannel(shortCtx, nil)
 	retCheck(r2Timeout, err)
 
 	r3Timeout, err := client.InvalidateCollectionMetaCache(shortCtx, nil)
@@ -144,6 +138,6 @@ func Test_NewClient(t *testing.T) {
 	}
 
 	// cleanup
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

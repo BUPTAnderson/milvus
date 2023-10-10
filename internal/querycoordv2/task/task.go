@@ -21,33 +21,48 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/atomic"
+
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	. "github.com/milvus-io/milvus/internal/util/typeutil"
-	"go.uber.org/atomic"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	. "github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-type Status = int32
-type Priority = int32
+type (
+	Status   = int32
+	Priority int32
+)
 
 const (
 	TaskStatusCreated Status = iota + 1
 	TaskStatusStarted
 	TaskStatusSucceeded
 	TaskStatusCanceled
-	TaskStatusStale
+	TaskStatusFailed
 )
 
 const (
-	TaskPriorityLow = iota
-	TaskPriorityNormal
-	TaskPriorityHigh
+	TaskPriorityLow    Priority = iota // for balance checker
+	TaskPriorityNormal                 // for segment checker
+	TaskPriorityHigh                   // for channel checker
 )
 
-var (
-	// All task priorities from low to high
-	TaskPriorities = []Priority{TaskPriorityLow, TaskPriorityNormal, TaskPriorityHigh}
-)
+var TaskPriorityName = map[Priority]string{
+	TaskPriorityLow:    "Low",
+	TaskPriorityNormal: "Normal",
+	TaskPriorityHigh:   "Hight",
+}
+
+func (p Priority) String() string {
+	return TaskPriorityName[p]
+}
+
+// All task priorities from low to high
+var TaskPriorities = []Priority{TaskPriorityLow, TaskPriorityNormal, TaskPriorityHigh}
 
 type Task interface {
 	Context() context.Context
@@ -59,15 +74,21 @@ type Task interface {
 	Status() Status
 	SetStatus(status Status)
 	Err() error
-	SetErr(err error)
 	Priority() Priority
 	SetPriority(priority Priority)
+	Index() string // dedup indexing string
 
-	Cancel()
+	// cancel the task as we don't need to continue it
+	Cancel(err error)
+	// fail the task as we encounter some error so be unable to continue,
+	// this error will be recorded for response to user requests
+	Fail(err error)
 	Wait() error
 	Actions() []Action
 	Step() int
+	StepUp() int
 	IsFinished(dist *meta.DistributionManager) bool
+	SetReason(reason string)
 	String() string
 }
 
@@ -89,10 +110,15 @@ type baseTask struct {
 	err      error
 	actions  []Action
 	step     int
+	reason   string
+
+	// span for tracing
+	span trace.Span
 }
 
 func newBaseTask(ctx context.Context, sourceID, collectionID, replicaID UniqueID, shard string) *baseTask {
 	ctx, cancel := context.WithCancel(ctx)
+	ctx, span := otel.Tracer("QueryCoord").Start(ctx, "QueryCoord-BaseTask")
 
 	return &baseTask{
 		sourceID:     sourceID,
@@ -106,6 +132,7 @@ func newBaseTask(ctx context.Context, sourceID, collectionID, replicaID UniqueID
 		cancel:   cancel,
 		doneCh:   make(chan struct{}),
 		canceled: atomic.NewBool(false),
+		span:     span,
 	}
 }
 
@@ -153,17 +180,40 @@ func (task *baseTask) SetPriority(priority Priority) {
 	task.priority = priority
 }
 
+func (task *baseTask) Index() string {
+	return fmt.Sprintf("[replica=%d]", task.replicaID)
+}
+
 func (task *baseTask) Err() error {
-	return task.err
+	select {
+	case <-task.doneCh:
+		return task.err
+	default:
+		return nil
+	}
 }
 
-func (task *baseTask) SetErr(err error) {
-	task.err = err
-}
-
-func (task *baseTask) Cancel() {
-	if task.canceled.CAS(false, true) {
+func (task *baseTask) Cancel(err error) {
+	if task.canceled.CompareAndSwap(false, true) {
 		task.cancel()
+		if task.Status() != TaskStatusSucceeded {
+			task.SetStatus(TaskStatusCanceled)
+		}
+		task.err = err
+		close(task.doneCh)
+		if task.span != nil {
+			task.span.End()
+		}
+	}
+}
+
+func (task *baseTask) Fail(err error) {
+	if task.canceled.CompareAndSwap(false, true) {
+		task.cancel()
+		if task.Status() != TaskStatusSucceeded {
+			task.SetStatus(TaskStatusFailed)
+		}
+		task.err = err
 		close(task.doneCh)
 	}
 }
@@ -181,18 +231,20 @@ func (task *baseTask) Step() int {
 	return task.step
 }
 
+func (task *baseTask) StepUp() int {
+	task.step++
+	return task.step
+}
+
 func (task *baseTask) IsFinished(distMgr *meta.DistributionManager) bool {
 	if task.Status() != TaskStatusStarted {
 		return false
 	}
+	return task.Step() >= len(task.Actions())
+}
 
-	actions, step := task.Actions(), task.Step()
-	for step < len(actions) && actions[step].IsFinished(distMgr) {
-		task.step++
-		step++
-	}
-
-	return task.Step() >= len(actions)
+func (task *baseTask) SetReason(reason string) {
+	task.reason = reason
 }
 
 func (task *baseTask) String() string {
@@ -208,12 +260,14 @@ func (task *baseTask) String() string {
 		}
 	}
 	return fmt.Sprintf(
-		"[id=%d] [type=%v] [collectionID=%d] [replicaID=%d] [priority=%d] [actionsCount=%d] [actions=%s]",
+		"[id=%d] [type=%s] [source=%d] [reason=%s] [collectionID=%d] [replicaID=%d] [priority=%s] [actionsCount=%d] [actions=%s]",
 		task.id,
-		GetTaskType(task),
+		GetTaskType(task).String(),
+		task.sourceID,
+		task.reason,
 		task.collectionID,
 		task.replicaID,
-		task.priority,
+		task.priority.String(),
 		len(task.actions),
 		actionsStr,
 	)
@@ -233,9 +287,10 @@ func NewSegmentTask(ctx context.Context,
 	sourceID,
 	collectionID,
 	replicaID UniqueID,
-	actions ...Action) *SegmentTask {
+	actions ...Action,
+) (*SegmentTask, error) {
 	if len(actions) == 0 {
-		panic("empty actions is not allowed")
+		return nil, errors.WithStack(merr.WrapErrParameterInvalid("non-empty actions", "no action"))
 	}
 
 	segmentID := int64(-1)
@@ -243,13 +298,13 @@ func NewSegmentTask(ctx context.Context,
 	for _, action := range actions {
 		action, ok := action.(*SegmentAction)
 		if !ok {
-			panic("SegmentTask can only contain SegmentActions")
+			return nil, errors.WithStack(merr.WrapErrParameterInvalid("SegmentAction", "other action", "all actions must be with the same type"))
 		}
 		if segmentID == -1 {
 			segmentID = action.SegmentID()
 			shard = action.Shard()
 		} else if segmentID != action.SegmentID() {
-			panic("all actions must process the same segment")
+			return nil, errors.WithStack(merr.WrapErrParameterInvalid(segmentID, action.SegmentID(), "all actions must operate the same segment"))
 		}
 	}
 
@@ -258,7 +313,7 @@ func NewSegmentTask(ctx context.Context,
 	return &SegmentTask{
 		baseTask:  base,
 		segmentID: segmentID,
-	}
+	}, nil
 }
 
 func (task *SegmentTask) Shard() string {
@@ -267,6 +322,10 @@ func (task *SegmentTask) Shard() string {
 
 func (task *SegmentTask) SegmentID() UniqueID {
 	return task.segmentID
+}
+
+func (task *SegmentTask) Index() string {
+	return fmt.Sprintf("%s[segment=%d][growing=%t]", task.baseTask.Index(), task.segmentID, task.Actions()[0].(*SegmentAction).Scope() == querypb.DataScope_Streaming)
 }
 
 func (task *SegmentTask) String() string {
@@ -285,21 +344,22 @@ func NewChannelTask(ctx context.Context,
 	sourceID,
 	collectionID,
 	replicaID UniqueID,
-	actions ...Action) *ChannelTask {
+	actions ...Action,
+) (*ChannelTask, error) {
 	if len(actions) == 0 {
-		panic("empty actions is not allowed")
+		return nil, errors.WithStack(merr.WrapErrParameterInvalid("non-empty actions", "no action"))
 	}
 
 	channel := ""
 	for _, action := range actions {
-		channelAction, ok := action.(interface{ ChannelName() string })
+		channelAction, ok := action.(*ChannelAction)
 		if !ok {
-			panic("ChannelTask must contain only ChannelAction")
+			return nil, errors.WithStack(merr.WrapErrParameterInvalid("ChannelAction", "other action", "all actions must be with the same type"))
 		}
 		if channel == "" {
 			channel = channelAction.ChannelName()
 		} else if channel != channelAction.ChannelName() {
-			panic("all actions must process the same channel")
+			return nil, errors.WithStack(merr.WrapErrParameterInvalid(channel, channelAction.ChannelName(), "all actions must operate the same segment"))
 		}
 	}
 
@@ -307,11 +367,15 @@ func NewChannelTask(ctx context.Context,
 	base.actions = actions
 	return &ChannelTask{
 		baseTask: base,
-	}
+	}, nil
 }
 
 func (task *ChannelTask) Channel() string {
 	return task.shard
+}
+
+func (task *ChannelTask) Index() string {
+	return fmt.Sprintf("%s[channel=%s]", task.baseTask.Index(), task.shard)
 }
 
 func (task *ChannelTask) String() string {

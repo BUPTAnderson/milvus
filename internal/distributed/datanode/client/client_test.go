@@ -18,52 +18,43 @@ package grpcdatanodeclient
 
 import (
 	"context"
-	"errors"
 	"testing"
+
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/util/mock"
-	"google.golang.org/grpc"
-
-	"github.com/milvus-io/milvus/internal/proxy"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func Test_NewClient(t *testing.T) {
-	proxy.Params.InitOnce()
+	paramtable.Init()
 	ctx := context.Background()
-	client, err := NewClient(ctx, "")
+	client, err := NewClient(ctx, "", 1)
 	assert.Nil(t, client)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	client, err = NewClient(ctx, "test")
-	assert.Nil(t, err)
+	client, err = NewClient(ctx, "test", 2)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret interface{}, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetStatisticsChannel(ctx)
+		r2, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
 		r3, err := client.WatchDmChannels(ctx, nil)
@@ -92,6 +83,12 @@ func Test_NewClient(t *testing.T) {
 
 		r11, err := client.GetCompactionState(ctx, nil)
 		retCheck(retNotNil, r11, err)
+
+		r12, err := client.NotifyChannelOperation(ctx, nil)
+		retCheck(retNotNil, r12, err)
+
+		r13, err := client.CheckChannelOperationProgress(ctx, nil)
+		retCheck(retNotNil, r13, err)
 	}
 
 	client.grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
@@ -128,6 +125,6 @@ func Test_NewClient(t *testing.T) {
 
 	checkFunc(true)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

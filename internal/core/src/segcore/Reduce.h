@@ -15,11 +15,13 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <queue>
+#include <unordered_set>
 
-#include "utils/Status.h"
 #include "common/type_c.h"
 #include "common/QueryResult.h"
 #include "query/PlanImpl.h"
+#include "ReduceStructure.h"
 
 namespace milvus::segcore {
 
@@ -70,7 +72,9 @@ class ReduceHelper {
     FillEntryData();
 
     int64_t
-    ReduceSearchResultForOneNQ(int64_t qi, int64_t topk, int64_t& result_offset);
+    ReduceSearchResultForOneNQ(int64_t qi,
+                               int64_t topk,
+                               int64_t& result_offset);
 
     void
     ReduceResultData();
@@ -79,14 +83,14 @@ class ReduceHelper {
     GetSearchResultDataSlice(int slice_index_);
 
  private:
-    std::vector<int64_t> slice_topKs_;
+    std::vector<SearchResult*>& search_results_;
+    milvus::query::Plan* plan_;
+
     std::vector<int64_t> slice_nqs_;
+    std::vector<int64_t> slice_topKs_;
     int64_t total_nq_;
     int64_t num_segments_;
     int64_t num_slices_;
-
-    milvus::query::Plan* plan_;
-    std::vector<SearchResult*>& search_results_;
 
     std::vector<int64_t> slice_nqs_prefix_sum_;
 
@@ -95,6 +99,15 @@ class ReduceHelper {
 
     // output
     std::unique_ptr<SearchResultDataBlobs> search_result_data_blobs_;
+
+    // Used for merge results,
+    // define these here to avoid allocating them for each query
+    std::vector<SearchResultPair> pairs_;
+    std::priority_queue<SearchResultPair*,
+                        std::vector<SearchResultPair*>,
+                        SearchResultPairComparator>
+        heap_;
+    std::unordered_set<milvus::PkType> pk_set_;
 };
 
 }  // namespace milvus::segcore

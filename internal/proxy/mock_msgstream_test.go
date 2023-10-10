@@ -2,9 +2,10 @@ package proxy
 
 import (
 	"context"
-	"errors"
 
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 )
 
 type mockMsgStream struct {
@@ -53,13 +54,6 @@ func (m *mockMsgStreamFactory) NewMsgStream(ctx context.Context) (msgstream.MsgS
 func (m *mockMsgStreamFactory) NewTtMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
 	if m.fTtStream != nil {
 		return m.fTtStream(ctx)
-	}
-	return nil, errors.New("mock")
-}
-
-func (m *mockMsgStreamFactory) NewQueryMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
-	if m.fQStream != nil {
-		return m.fQStream(ctx)
 	}
 	return nil, errors.New("mock")
 }

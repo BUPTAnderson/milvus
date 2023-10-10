@@ -28,11 +28,10 @@
 #include "InsertRecord.h"
 #include "SealedIndexingRecord.h"
 #include "SegmentGrowing.h"
-
-#include "exceptions/EasyAssert.h"
+#include "common/Types.h"
+#include "common/EasyAssert.h"
 #include "query/PlanNode.h"
-#include "query/deprecated/GeneralQuery.h"
-#include "utils/Status.h"
+#include "common/IndexMeta.h"
 
 namespace milvus::segcore {
 
@@ -48,18 +47,26 @@ class SegmentGrowingImpl : public SegmentGrowing {
            const Timestamp* timestamps,
            const InsertData* insert_data) override;
 
-    int64_t
-    PreDelete(int64_t size) override;
+    bool
+    Contain(const PkType& pk) const override {
+        return insert_record_.contain(pk);
+    }
 
     // TODO: add id into delete log, possibly bitmap
-    Status
-    Delete(int64_t reserverd_offset, int64_t size, const IdArray* pks, const Timestamp* timestamps) override;
+    SegcoreError
+    Delete(int64_t reserved_offset,
+           int64_t size,
+           const IdArray* pks,
+           const Timestamp* timestamps) override;
 
     int64_t
     GetMemoryUsageInBytes() const override;
 
     void
     LoadDeletedRecord(const LoadDeletedRecordInfo& info) override;
+
+    void
+    LoadFieldData(const LoadFieldDataInfo& info) override;
 
     std::string
     debug() const override;
@@ -83,6 +90,11 @@ class SegmentGrowingImpl : public SegmentGrowing {
     const DeletedRecord&
     get_deleted_record() const {
         return deleted_record_;
+    }
+
+    std::shared_mutex&
+    get_chunk_mutex() const {
+        return chunk_mutex_;
     }
 
     const SealedIndexingRecord&
@@ -111,7 +123,8 @@ class SegmentGrowingImpl : public SegmentGrowing {
     // deprecated
     const index::IndexBase*
     chunk_index_impl(FieldId field_id, int64_t chunk_id) const final {
-        return indexing_record_.get_field_indexing(field_id).get_chunk_indexing(chunk_id);
+        return indexing_record_.get_field_indexing(field_id).get_chunk_indexing(
+            chunk_id);
     }
 
     int64_t
@@ -119,13 +132,10 @@ class SegmentGrowingImpl : public SegmentGrowing {
         return segcore_config_.get_chunk_rows();
     }
 
- public:
-    // only for debug
     void
-    disable_small_index() override {
-        enable_small_index_ = false;
-    }
+    try_remove_chunks(FieldId fieldId);
 
+ public:
     int64_t
     get_row_count() const override {
         return insert_record_.ack_responder_.GetAck();
@@ -133,45 +143,68 @@ class SegmentGrowingImpl : public SegmentGrowing {
 
     int64_t
     get_deleted_count() const override {
-        return deleted_record_.ack_responder_.GetAck();
+        return deleted_record_.size();
     }
 
     int64_t
     get_active_count(Timestamp ts) const override;
 
     // for scalar vectors
-    template <typename T>
+    template <typename S, typename T = S>
     void
-    bulk_subscript_impl(const VectorBase& vec_raw, const int64_t* seg_offsets, int64_t count, void* output_raw) const;
+    bulk_subscript_impl(const VectorBase* vec_raw,
+                        const int64_t* seg_offsets,
+                        int64_t count,
+                        void* output_raw) const;
+
+    // for scalar array vectors
+    void
+    bulk_subscript_impl(const VectorBase& vec_raw,
+                        const int64_t* seg_offsets,
+                        int64_t count,
+                        void* output_raw) const;
 
     template <typename T>
     void
-    bulk_subscript_impl(int64_t element_sizeof,
-                        const VectorBase& vec_raw,
+    bulk_subscript_impl(FieldId field_id,
+                        int64_t element_sizeof,
+                        const VectorBase* vec_raw,
                         const int64_t* seg_offsets,
                         int64_t count,
                         void* output_raw) const;
 
     void
-    bulk_subscript(SystemFieldType system_type, const int64_t* seg_offsets, int64_t count, void* output) const override;
+    bulk_subscript(SystemFieldType system_type,
+                   const int64_t* seg_offsets,
+                   int64_t count,
+                   void* output) const override;
 
     std::unique_ptr<DataArray>
-    bulk_subscript(FieldId field_id, const int64_t* seg_offsets, int64_t count) const override;
+    bulk_subscript(FieldId field_id,
+                   const int64_t* seg_offsets,
+                   int64_t count) const override;
 
  public:
     friend std::unique_ptr<SegmentGrowing>
-    CreateGrowingSegment(SchemaPtr schema, const SegcoreConfig& segcore_config, int64_t segment_id);
+    CreateGrowingSegment(SchemaPtr schema,
+                         const SegcoreConfig& segcore_config,
+                         int64_t segment_id);
 
-    explicit SegmentGrowingImpl(SchemaPtr schema, const SegcoreConfig& segcore_config, int64_t segment_id)
+    explicit SegmentGrowingImpl(SchemaPtr schema,
+                                IndexMetaPtr indexMeta,
+                                const SegcoreConfig& segcore_config,
+                                int64_t segment_id)
         : segcore_config_(segcore_config),
           schema_(std::move(schema)),
+          index_meta_(indexMeta),
           insert_record_(*schema_, segcore_config.get_chunk_rows()),
-          indexing_record_(*schema_, segcore_config_),
+          indexing_record_(*schema_, index_meta_, segcore_config_),
           id_(segment_id) {
     }
 
     void
-    mask_with_timestamps(BitsetType& bitset_chunk, Timestamp timestamp) const override;
+    mask_with_timestamps(BitsetType& bitset_chunk,
+                         Timestamp timestamp) const override;
 
     void
     vector_search(SearchInfo& search_info,
@@ -183,16 +216,12 @@ class SegmentGrowingImpl : public SegmentGrowing {
 
  public:
     void
-    mask_with_delete(BitsetType& bitset, int64_t ins_barrier, Timestamp timestamp) const override;
+    mask_with_delete(BitsetType& bitset,
+                     int64_t ins_barrier,
+                     Timestamp timestamp) const override;
 
     std::pair<std::unique_ptr<IdArray>, std::vector<SegOffset>>
     search_ids(const IdArray& id_array, Timestamp timestamp) const override;
-
-    std::vector<SegOffset>
-    search_ids(const BitsetType& view, Timestamp timestamp) const override;
-
-    std::vector<SegOffset>
-    search_ids(const BitsetView& view, Timestamp timestamp) const override;
 
     bool
     HasIndex(FieldId field_id) const override {
@@ -202,6 +231,25 @@ class SegmentGrowingImpl : public SegmentGrowing {
     bool
     HasFieldData(FieldId field_id) const override {
         return true;
+    }
+
+    bool
+    HasRawData(int64_t field_id) const override {
+        //growing index hold raw data when
+        // 1. growing index enabled and it holds raw data
+        // 2. growing index disabled then raw data held by chunk
+        if (indexing_record_.is_in(FieldId(field_id))) {
+            return indexing_record_.HasRawData(FieldId(field_id));
+        }
+        return true;
+    }
+
+    std::vector<OffsetMap::OffsetType>
+    find_first(int64_t limit,
+               const BitsetType& bitset,
+               bool false_filtered_out) const override {
+        return insert_record_.pk2offset_->find_first(
+            limit, bitset, false_filtered_out);
     }
 
  protected:
@@ -216,9 +264,15 @@ class SegmentGrowingImpl : public SegmentGrowing {
         Assert(plan);
     }
 
+    const ConcurrentVector<Timestamp>&
+    get_timestamps() const override {
+        return insert_record_.timestamps_;
+    }
+
  private:
     SegcoreConfig segcore_config_;
     SchemaPtr schema_;
+    IndexMetaPtr index_meta_;
 
     // small indexes for every chunk
     IndexingRecord indexing_record_;
@@ -227,20 +281,26 @@ class SegmentGrowingImpl : public SegmentGrowing {
     // inserted fields data and row_ids, timestamps
     InsertRecord<false> insert_record_;
 
+    mutable std::shared_mutex chunk_mutex_;
+
     // deleted pks
     mutable DeletedRecord deleted_record_;
 
     int64_t id_;
-
- private:
-    bool enable_small_index_ = true;
 };
 
+const static IndexMetaPtr empty_index_meta =
+    std::make_shared<CollectionIndexMeta>(1024,
+                                          std::map<FieldId, FieldIndexMeta>());
+
 inline SegmentGrowingPtr
-CreateGrowingSegment(SchemaPtr schema,
-                     int64_t segment_id = -1,
-                     const SegcoreConfig& conf = SegcoreConfig::default_config()) {
-    return std::make_unique<SegmentGrowingImpl>(schema, conf, segment_id);
+CreateGrowingSegment(
+    SchemaPtr schema,
+    IndexMetaPtr indexMeta,
+    int64_t segment_id = -1,
+    const SegcoreConfig& conf = SegcoreConfig::default_config()) {
+    return std::make_unique<SegmentGrowingImpl>(
+        schema, indexMeta, conf, segment_id);
 }
 
 }  // namespace milvus::segcore

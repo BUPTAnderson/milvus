@@ -16,20 +16,21 @@
 
 #pragma once
 
-#if defined(__linux__) || defined(__APPLE__)
-
 #include <marisa.h>
 #include "index/StringIndex.h"
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
+#include "storage/MemFileManagerImpl.h"
 
 namespace milvus::index {
 
 class StringIndexMarisa : public StringIndex {
  public:
-    StringIndexMarisa() = default;
+    explicit StringIndexMarisa(
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
 
     int64_t
     Size() override;
@@ -40,6 +41,9 @@ class StringIndexMarisa : public StringIndex {
     void
     Load(const BinarySet& set, const Config& config = {}) override;
 
+    void
+    Load(const Config& config = {}) override;
+
     int64_t
     Count() override {
         return str_ids_.size();
@@ -48,23 +52,32 @@ class StringIndexMarisa : public StringIndex {
     void
     Build(size_t n, const std::string* values) override;
 
-    const TargetBitmapPtr
+    void
+    Build(const Config& config = {}) override;
+
+    const TargetBitmap
     In(size_t n, const std::string* values) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
     NotIn(size_t n, const std::string* values) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
     Range(std::string value, OpType op) override;
 
-    const TargetBitmapPtr
-    Range(std::string lower_bound_value, bool lb_inclusive, std::string upper_bound_value, bool ub_inclusive) override;
+    const TargetBitmap
+    Range(std::string lower_bound_value,
+          bool lb_inclusive,
+          std::string upper_bound_value,
+          bool ub_inclusive) override;
 
-    const TargetBitmapPtr
-    PrefixMatch(std::string prefix) override;
+    const TargetBitmap
+    PrefixMatch(const std::string_view prefix) override;
 
     std::string
     Reverse_Lookup(size_t offset) const override;
+
+    BinarySet
+    Upload(const Config& config = {}) override;
 
  private:
     void
@@ -75,10 +88,13 @@ class StringIndexMarisa : public StringIndex {
 
     // get str_id by str, if str not found, -1 was returned.
     size_t
-    lookup(const std::string& str);
+    lookup(const std::string_view str);
 
     std::vector<size_t>
-    prefix_match(const std::string& prefix);
+    prefix_match(const std::string_view prefix);
+
+    void
+    LoadWithoutAssemble(const BinarySet& binary_set, const Config& config);
 
  private:
     Config config_;
@@ -86,15 +102,16 @@ class StringIndexMarisa : public StringIndex {
     std::vector<size_t> str_ids_;  // used to retrieve.
     std::map<size_t, std::vector<size_t>> str_ids_to_offsets_;
     bool built_ = false;
+    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
 };
 
 using StringIndexMarisaPtr = std::unique_ptr<StringIndexMarisa>;
 
 inline StringIndexPtr
-CreateStringIndexMarisa() {
-    return std::make_unique<StringIndexMarisa>();
+CreateStringIndexMarisa(
+    const storage::FileManagerContext& file_manager_context =
+        storage::FileManagerContext()) {
+    return std::make_unique<StringIndexMarisa>(file_manager_context);
 }
 
 }  // namespace milvus::index
-
-#endif

@@ -22,50 +22,22 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
-
-func TestPmsFactory(t *testing.T) {
-	pmsFactory := NewPmsFactory(&Params.PulsarCfg)
-
-	ctx := context.Background()
-	_, err := pmsFactory.NewMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = pmsFactory.NewTtMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = pmsFactory.NewQueryMsgStream(ctx)
-	assert.Nil(t, err)
-}
 
 func TestRmsFactory(t *testing.T) {
 	defer os.Unsetenv("ROCKSMQ_PATH")
+	paramtable.Init()
 
 	dir := t.TempDir()
 
-	rmsFactory := NewRmsFactory(dir)
+	rmsFactory := NewRocksmqFactory(dir, &paramtable.Get().ServiceParam)
 
 	ctx := context.Background()
 	_, err := rmsFactory.NewMsgStream(ctx)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	_, err = rmsFactory.NewTtMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = rmsFactory.NewQueryMsgStream(ctx)
-	assert.Nil(t, err)
-}
-
-func TestKafkaFactory(t *testing.T) {
-	kmsFactory := NewKmsFactory(&Params.KafkaCfg)
-
-	ctx := context.Background()
-	_, err := kmsFactory.NewMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = kmsFactory.NewTtMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = kmsFactory.NewQueryMsgStream(ctx)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 }

@@ -18,54 +18,76 @@ package grpcdatacoordclient
 
 import (
 	"context"
-	"errors"
+	"math/rand"
+	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proxy"
-	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/mock"
-	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
+func TestMain(m *testing.M) {
+	// init embed etcd
+	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
+	if err != nil {
+		log.Fatal("failed to start embed etcd server", zap.Error(err))
+	}
+	defer os.RemoveAll(tempDir)
+	defer embedetcdServer.Close()
+
+	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
+
+	paramtable.Init()
+	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
+
+	rand.Seed(time.Now().UnixNano())
+	os.Exit(m.Run())
+}
+
 func Test_NewClient(t *testing.T) {
-	proxy.Params.InitOnce()
-
 	ctx := context.Background()
-	etcdCli, err := etcd.GetEtcdClient(&proxy.Params.EtcdCfg)
-	assert.Nil(t, err)
-	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath, etcdCli)
-	assert.Nil(t, err)
+	etcdCli, err := etcd.GetEtcdClient(
+		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
+		Params.EtcdCfg.Endpoints.GetAsStrings(),
+		Params.EtcdCfg.EtcdTLSCert.GetValue(),
+		Params.EtcdCfg.EtcdTLSKey.GetValue(),
+		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
+		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
+	assert.NoError(t, err)
+	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret any, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetTimeTickChannel(ctx)
+		r2, err := client.GetTimeTickChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
-		r3, err := client.GetStatisticsChannel(ctx)
+		r3, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r3, err)
 
 		r4, err := client.Flush(ctx, nil)
@@ -89,7 +111,7 @@ func Test_NewClient(t *testing.T) {
 		r10, err := client.GetPartitionStatistics(ctx, nil)
 		retCheck(retNotNil, r10, err)
 
-		r11, err := client.GetSegmentInfoChannel(ctx)
+		r11, err := client.GetSegmentInfoChannel(ctx, nil)
 		retCheck(retNotNil, r11, err)
 
 		// r12, err := client.SaveBinlogPaths(ctx, nil)
@@ -128,12 +150,6 @@ func Test_NewClient(t *testing.T) {
 		r24, err := client.UpdateSegmentStatistics(ctx, nil)
 		retCheck(retNotNil, r24, err)
 
-		r25, err := client.AcquireSegmentLock(ctx, nil)
-		retCheck(retNotNil, r25, err)
-
-		r26, err := client.ReleaseSegmentLock(ctx, nil)
-		retCheck(retNotNil, r26, err)
-
 		r27, err := client.SaveImportSegment(ctx, nil)
 		retCheck(retNotNil, r27, err)
 
@@ -146,6 +162,33 @@ func Test_NewClient(t *testing.T) {
 		r31, err := client.ShowConfigurations(ctx, nil)
 		retCheck(retNotNil, r31, err)
 
+		r32, err := client.CreateIndex(ctx, nil)
+		retCheck(retNotNil, r32, err)
+
+		r33, err := client.DescribeIndex(ctx, nil)
+		retCheck(retNotNil, r33, err)
+
+		r34, err := client.DropIndex(ctx, nil)
+		retCheck(retNotNil, r34, err)
+
+		r35, err := client.GetIndexState(ctx, nil)
+		retCheck(retNotNil, r35, err)
+
+		r36, err := client.GetIndexBuildProgress(ctx, nil)
+		retCheck(retNotNil, r36, err)
+
+		r37, err := client.GetIndexInfos(ctx, nil)
+		retCheck(retNotNil, r37, err)
+
+		r38, err := client.GetSegmentIndexState(ctx, nil)
+		retCheck(retNotNil, r38, err)
+
+		r39, err := client.UpdateChannelCheckpoint(ctx, nil)
+		retCheck(retNotNil, r39, err)
+
+		r, err := client.GetFlushAllState(ctx, nil)
+		retCheck(retNotNil, r, err)
+
 		{
 			ret, err := client.BroadcastAlteredCollection(ctx, nil)
 			retCheck(retNotNil, ret, err)
@@ -155,6 +198,12 @@ func Test_NewClient(t *testing.T) {
 			ret, err := client.CheckHealth(ctx, nil)
 			retCheck(retNotNil, ret, err)
 		}
+
+		r40, err := client.GetRecoveryInfoV2(ctx, nil)
+		retCheck(retNotNil, r40, err)
+
+		r41, err := client.GetIndexStatistics(ctx, nil)
+		retCheck(retNotNil, r41, err)
 	}
 
 	client.grpcClient = &mock.GRPCClientBase[datapb.DataCoordClient]{
@@ -171,7 +220,7 @@ func Test_NewClient(t *testing.T) {
 	// special case since this method didn't use recall()
 	ret, err := client.SaveBinlogPaths(ctx, nil)
 	assert.Nil(t, ret)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
 	client.grpcClient = &mock.GRPCClientBase[datapb.DataCoordClient]{
 		GetGrpcClientErr: nil,
@@ -185,7 +234,7 @@ func Test_NewClient(t *testing.T) {
 	// special case since this method didn't use recall()
 	ret, err = client.SaveBinlogPaths(ctx, nil)
 	assert.Nil(t, ret)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
 	client.grpcClient = &mock.GRPCClientBase[datapb.DataCoordClient]{
 		GetGrpcClientErr: nil,
@@ -199,8 +248,8 @@ func Test_NewClient(t *testing.T) {
 	// special case since this method didn't use recall()
 	ret, err = client.SaveBinlogPaths(ctx, nil)
 	assert.NotNil(t, ret)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

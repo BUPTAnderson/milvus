@@ -9,19 +9,23 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#pragma once
+
 #include <unordered_map>
 #include <exception>
 #include <memory>
 #include <stdexcept>
-#include <stdlib.h>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "common/QueryResult.h"
+#include "common/Types.h"
 #include "segcore/DeletedRecord.h"
 #include "segcore/InsertRecord.h"
 #include "index/Index.h"
+#include "storage/FieldData.h"
 
 namespace milvus::segcore {
 
@@ -29,25 +33,51 @@ void
 ParsePksFromFieldData(std::vector<PkType>& pks, const DataArray& data);
 
 void
-ParsePksFromIDs(std::vector<PkType>& pks, DataType data_type, const IdArray& data);
+ParsePksFromFieldData(DataType data_type,
+                      std::vector<PkType>& pks,
+                      const std::vector<storage::FieldDataPtr>& datas);
+
+void
+ParsePksFromIDs(std::vector<PkType>& pks,
+                DataType data_type,
+                const IdArray& data);
 
 int64_t
 GetSizeOfIdArray(const IdArray& data);
 
+int64_t
+GetRawDataSizeOfDataArray(const DataArray* data,
+                          const FieldMeta& field_meta,
+                          int64_t num_rows);
+
 // Note: this is temporary solution.
 // modify bulk script implement to make process more clear
 std::unique_ptr<DataArray>
-CreateScalarDataArrayFrom(const void* data_raw, int64_t count, const FieldMeta& field_meta);
+CreateScalarDataArray(int64_t count, const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
-CreateVectorDataArrayFrom(const void* data_raw, int64_t count, const FieldMeta& field_meta);
+CreateVectorDataArray(int64_t count, const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
-CreateDataArrayFrom(const void* data_raw, int64_t count, const FieldMeta& field_meta);
+CreateScalarDataArrayFrom(const void* data_raw,
+                          int64_t count,
+                          const FieldMeta& field_meta);
+
+std::unique_ptr<DataArray>
+CreateVectorDataArrayFrom(const void* data_raw,
+                          int64_t count,
+                          const FieldMeta& field_meta);
+
+std::unique_ptr<DataArray>
+CreateDataArrayFrom(const void* data_raw,
+                    int64_t count,
+                    const FieldMeta& field_meta);
 
 // TODO remove merge dataArray, instead fill target entity when get data slice
 std::unique_ptr<DataArray>
-MergeDataArray(std::vector<std::pair<milvus::SearchResult*, int64_t>>& result_offsets, const FieldMeta& field_meta);
+MergeDataArray(
+    std::vector<std::pair<milvus::SearchResult*, int64_t>>& result_offsets,
+    const FieldMeta& field_meta);
 
 template <bool is_sealed>
 std::shared_ptr<DeletedRecord::TmpBitmap>
@@ -59,7 +89,8 @@ get_deleted_bitmap(int64_t del_barrier,
     // if insert_barrier and del_barrier have not changed, use cache data directly
     bool hit_cache = false;
     int64_t old_del_barrier = 0;
-    auto current = delete_record.clone_lru_entry(insert_barrier, del_barrier, old_del_barrier, hit_cache);
+    auto current = delete_record.clone_lru_entry(
+        insert_barrier, del_barrier, old_del_barrier, hit_cache);
     if (hit_cache) {
         return current;
     }
@@ -70,7 +101,7 @@ get_deleted_bitmap(int64_t del_barrier,
     if (del_barrier < old_del_barrier) {
         // in this case, ts of delete record[current_del_barrier : old_del_barrier] > query_timestamp
         // so these deletion records do not take effect in query/search
-        // so bitmap corresponding to those pks in delete record[current_del_barrier:old_del_barrier] wil be reset to 0
+        // so bitmap corresponding to those pks in delete record[current_del_barrier:old_del_barrier] will be reset to 0
         // for example, current_del_barrier = 2, query_time = 120, the bitmap will be reset to [0, 1, 1, 0, 0, 0, 0, 0]
         start = del_barrier;
         end = old_del_barrier;
@@ -84,31 +115,28 @@ get_deleted_bitmap(int64_t del_barrier,
     // Avoid invalid calculations when there are a lot of repeated delete pks
     std::unordered_map<PkType, Timestamp> delete_timestamps;
     for (auto del_index = start; del_index < end; ++del_index) {
-        auto pk = delete_record.pks_[del_index];
-        auto timestamp = delete_record.timestamps_[del_index];
+        auto pk = delete_record.pks()[del_index];
+        auto timestamp = delete_record.timestamps()[del_index];
 
-        delete_timestamps[pk] = timestamp > delete_timestamps[pk] ? timestamp : delete_timestamps[pk];
+        delete_timestamps[pk] = timestamp > delete_timestamps[pk]
+                                    ? timestamp
+                                    : delete_timestamps[pk];
     }
 
-    for (auto iter = delete_timestamps.begin(); iter != delete_timestamps.end(); iter++) {
-        auto pk = iter->first;
-        auto delete_timestamp = iter->second;
+    for (auto& [pk, timestamp] : delete_timestamps) {
         auto segOffsets = insert_record.search_pk(pk, insert_barrier);
         for (auto offset : segOffsets) {
             int64_t insert_row_offset = offset.get();
-            // for now, insert_barrier == insert count of segment, so this Assert will always work
-            AssertInfo(insert_row_offset < insert_barrier, "Timestamp offset is larger than insert barrier");
 
-            // insert after delete with same pk, delete will not task effect on this insert record
+            // The deletion record do not take effect in search/query,
             // and reset bitmap to 0
-            if (insert_record.timestamps_[insert_row_offset] > delete_timestamp) {
+            if (timestamp > query_timestamp) {
                 bitmap->reset(insert_row_offset);
                 continue;
             }
-
-            // the deletion record do not take effect in search/query
+            // Insert after delete with same pk, delete will not task effect on this insert record,
             // and reset bitmap to 0
-            if (delete_timestamp > query_timestamp) {
+            if (insert_record.timestamps_[insert_row_offset] >= timestamp) {
                 bitmap->reset(insert_row_offset);
                 continue;
             }
@@ -127,4 +155,23 @@ ReverseDataFromIndex(const index::IndexBase* index,
                      int64_t count,
                      const FieldMeta& field_meta);
 
+void
+LoadFieldDatasFromRemote(std::vector<std::string>& remote_files,
+                         storage::FieldDataChannelPtr channel);
+
+/**
+ * Returns an index pointing to the first element in the range [first, last) such that `value < element` is true
+ * (i.e. that is strictly greater than value), or last if no such element is found.
+ *
+ * @param timestamps
+ * @param first
+ * @param last
+ * @param value
+ * @return The index of answer, last will be returned if no timestamp is bigger than the value.
+ */
+int64_t
+upper_bound(const ConcurrentVector<Timestamp>& timestamps,
+            int64_t first,
+            int64_t last,
+            Timestamp value);
 }  // namespace milvus::segcore

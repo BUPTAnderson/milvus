@@ -18,16 +18,19 @@ package datanode
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 
-	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 // metaService initialize channel collection in data node from root coord.
@@ -36,11 +39,11 @@ import (
 type metaService struct {
 	channel      Channel
 	collectionID UniqueID
-	rootCoord    types.RootCoord
+	rootCoord    types.RootCoordClient
 }
 
 // newMetaService creates a new metaService with provided RootCoord and collectionID.
-func newMetaService(rc types.RootCoord, collectionID UniqueID) *metaService {
+func newMetaService(rc types.RootCoordClient, collectionID UniqueID) *metaService {
 	return &metaService{
 		rootCoord:    rc,
 		collectionID: collectionID,
@@ -61,22 +64,24 @@ func (mService *metaService) getCollectionInfo(ctx context.Context, collID Uniqu
 	req := &milvuspb.DescribeCollectionRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_DescribeCollection),
-			commonpbutil.WithMsgID(0),     //GOOSE TODO
-			commonpbutil.WithTimeStamp(0), //GOOSE TODO
-			commonpbutil.WithSourceID(Params.DataNodeCfg.GetNodeID()),
+			commonpbutil.WithMsgID(0), // GOOSE TODO
+			commonpbutil.WithSourceID(paramtable.GetNodeID()),
 		),
-		DbName:       "default", // GOOSE TODO
+		// please do not specify the collection name alone after database feature.
 		CollectionID: collID,
 		TimeStamp:    timestamp,
 	}
 
-	response, err := mService.rootCoord.DescribeCollection(ctx, req)
+	response, err := mService.rootCoord.DescribeCollectionInternal(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("grpc error when describe collection %v from rootcoord: %s", collID, err.Error())
+		log.Error("grpc error when describe", zap.Int64("collectionID", collID), zap.Error(err))
+		return nil, err
 	}
 
 	if response.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		return nil, fmt.Errorf("describe collection %v from rootcoord wrong: %s", collID, response.GetStatus().GetReason())
+		err := merr.Error(response.Status)
+		log.Error("describe collection from rootcoord failed", zap.Int64("collectionID", collID), zap.Error(err))
+		return nil, err
 	}
 
 	return response, nil
@@ -92,6 +97,6 @@ func printCollectionStruct(obj *etcdpb.CollectionMeta) {
 		if typeOfS.Field(i).Name == "GrpcMarshalString" {
 			continue
 		}
-		fmt.Printf("Field: %s\tValue: %v\n", typeOfS.Field(i).Name, v.Field(i).Interface())
+		log.Info("Collection field", zap.String("field", typeOfS.Field(i).Name), zap.Any("value", v.Field(i).Interface()))
 	}
 }

@@ -21,131 +21,155 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 // RateLimitInterceptor returns a new unary server interceptors that performs request rate limiting.
 func RateLimitInterceptor(limiter types.Limiter) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		rt, n, err := getRequestInfo(req)
-		if err == nil {
-			limit, rate := limiter.Limit(rt, n)
-			if rate == 0 {
-				res, err1 := getFailedResponse(req, commonpb.ErrorCode_ForceDeny, fmt.Sprintf("force to deny %s.", info.FullMethod))
-				if err1 == nil {
-					return res, nil
-				}
-			}
-			if limit {
-				res, err2 := getFailedResponse(req, commonpb.ErrorCode_RateLimit, fmt.Sprintf("%s is rejected by grpc RateLimiter middleware, please retry later.", info.FullMethod))
-				if err2 == nil {
-					return res, nil
-				}
+		collectionID, rt, n, err := getRequestInfo(req)
+		if err != nil {
+			return handler(ctx, req)
+		}
+
+		err = limiter.Check(collectionID, rt, n)
+		if err != nil {
+			rsp := getFailedResponse(req, rt, err, info.FullMethod)
+			if rsp != nil {
+				return rsp, nil
 			}
 		}
 		return handler(ctx, req)
 	}
 }
 
-// getRequestInfo returns rateType of request and return tokens needed.
-func getRequestInfo(req interface{}) (internalpb.RateType, int, error) {
+// getRequestInfo returns collection name and rateType of request and return tokens needed.
+func getRequestInfo(req interface{}) (int64, internalpb.RateType, int, error) {
 	switch r := req.(type) {
 	case *milvuspb.InsertRequest:
-		return internalpb.RateType_DMLInsert, proto.Size(r), nil
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DMLInsert, proto.Size(r), nil
+	case *milvuspb.UpsertRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DMLUpsert, proto.Size(r), nil
 	case *milvuspb.DeleteRequest:
-		return internalpb.RateType_DMLDelete, proto.Size(r), nil
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DMLDelete, proto.Size(r), nil
 	case *milvuspb.ImportRequest:
-		return internalpb.RateType_DMLBulkLoad, proto.Size(r), nil
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DMLBulkLoad, proto.Size(r), nil
 	case *milvuspb.SearchRequest:
-		return internalpb.RateType_DQLSearch, int(r.GetNq()), nil
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DQLSearch, int(r.GetNq()), nil
 	case *milvuspb.QueryRequest:
-		return internalpb.RateType_DQLQuery, 1, nil // think of the query request's nq as 1
-	case *milvuspb.CreateCollectionRequest, *milvuspb.DropCollectionRequest:
-		return internalpb.RateType_DDLCollection, 1, nil
-	case *milvuspb.LoadCollectionRequest, *milvuspb.ReleaseCollectionRequest:
-		return internalpb.RateType_DDLCollection, 1, nil
-	case *milvuspb.CreatePartitionRequest, *milvuspb.DropPartitionRequest:
-		return internalpb.RateType_DDLPartition, 1, nil
-	case *milvuspb.LoadPartitionsRequest, *milvuspb.ReleasePartitionsRequest:
-		return internalpb.RateType_DDLPartition, 1, nil
-	case *milvuspb.CreateIndexRequest, *milvuspb.DropIndexRequest:
-		return internalpb.RateType_DDLIndex, 1, nil
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DQLQuery, 1, nil // think of the query request's nq as 1
+	case *milvuspb.CreateCollectionRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLCollection, 1, nil
+	case *milvuspb.DropCollectionRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLCollection, 1, nil
+	case *milvuspb.LoadCollectionRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLCollection, 1, nil
+	case *milvuspb.ReleaseCollectionRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLCollection, 1, nil
+	case *milvuspb.CreatePartitionRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLPartition, 1, nil
+	case *milvuspb.DropPartitionRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLPartition, 1, nil
+	case *milvuspb.LoadPartitionsRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLPartition, 1, nil
+	case *milvuspb.ReleasePartitionsRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLPartition, 1, nil
+	case *milvuspb.CreateIndexRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLIndex, 1, nil
+	case *milvuspb.DropIndexRequest:
+		collectionID, _ := globalMetaCache.GetCollectionID(context.TODO(), r.GetDbName(), r.GetCollectionName())
+		return collectionID, internalpb.RateType_DDLIndex, 1, nil
 	case *milvuspb.FlushRequest:
-		return internalpb.RateType_DDLFlush, 1, nil
+		return 0, internalpb.RateType_DDLFlush, 1, nil
 	case *milvuspb.ManualCompactionRequest:
-		return internalpb.RateType_DDLCompaction, 1, nil
+		return 0, internalpb.RateType_DDLCompaction, 1, nil
 		// TODO: support more request
 	default:
 		if req == nil {
-			return 0, 0, fmt.Errorf("null request")
+			return 0, 0, 0, fmt.Errorf("null request")
 		}
-		return 0, 0, fmt.Errorf("unsupported request type %s", reflect.TypeOf(req).Name())
-	}
-}
-
-// failedStatus returns failed status.
-func failedStatus(code commonpb.ErrorCode, reason string) *commonpb.Status {
-	return &commonpb.Status{
-		ErrorCode: code,
-		Reason:    reason,
+		return 0, 0, 0, fmt.Errorf("unsupported request type %s", reflect.TypeOf(req).Name())
 	}
 }
 
 // failedMutationResult returns failed mutation result.
-func failedMutationResult(code commonpb.ErrorCode, reason string) *milvuspb.MutationResult {
+func failedMutationResult(err error) *milvuspb.MutationResult {
 	return &milvuspb.MutationResult{
-		Status: failedStatus(code, reason),
+		Status: merr.Status(err),
 	}
 }
 
-// failedBoolResponse returns failed boolean response.
-func failedBoolResponse(code commonpb.ErrorCode, reason string) *milvuspb.BoolResponse {
-	return &milvuspb.BoolResponse{
-		Status: failedStatus(code, reason),
+func wrapQuotaError(rt internalpb.RateType, err error, fullMethod string) error {
+	if errors.Is(err, merr.ErrServiceRateLimit) {
+		return errors.Wrapf(err, "request %s is rejected by grpc RateLimiter middleware, please retry later", fullMethod)
 	}
+
+	// deny to write/read
+	var op string
+	switch rt {
+	case internalpb.RateType_DMLInsert, internalpb.RateType_DMLUpsert, internalpb.RateType_DMLDelete, internalpb.RateType_DMLBulkLoad:
+		op = "write"
+	case internalpb.RateType_DQLSearch, internalpb.RateType_DQLQuery:
+		op = "read"
+	}
+
+	return merr.WrapErrServiceForceDeny(op, err, fullMethod)
 }
 
 // getFailedResponse returns failed response.
-func getFailedResponse(req interface{}, code commonpb.ErrorCode, reason string) (interface{}, error) {
+func getFailedResponse(req any, rt internalpb.RateType, err error, fullMethod string) any {
+	err = wrapQuotaError(rt, err, fullMethod)
 	switch req.(type) {
-	case *milvuspb.InsertRequest, *milvuspb.DeleteRequest:
-		return failedMutationResult(code, reason), nil
+	case *milvuspb.InsertRequest, *milvuspb.DeleteRequest, *milvuspb.UpsertRequest:
+		return failedMutationResult(err)
 	case *milvuspb.ImportRequest:
 		return &milvuspb.ImportResponse{
-			Status: failedStatus(code, reason),
-		}, nil
+			Status: merr.Status(err),
+		}
 	case *milvuspb.SearchRequest:
 		return &milvuspb.SearchResults{
-			Status: failedStatus(code, reason),
-		}, nil
+			Status: merr.Status(err),
+		}
 	case *milvuspb.QueryRequest:
 		return &milvuspb.QueryResults{
-			Status: failedStatus(code, reason),
-		}, nil
+			Status: merr.Status(err),
+		}
 	case *milvuspb.CreateCollectionRequest, *milvuspb.DropCollectionRequest,
 		*milvuspb.LoadCollectionRequest, *milvuspb.ReleaseCollectionRequest,
 		*milvuspb.CreatePartitionRequest, *milvuspb.DropPartitionRequest,
 		*milvuspb.LoadPartitionsRequest, *milvuspb.ReleasePartitionsRequest,
 		*milvuspb.CreateIndexRequest, *milvuspb.DropIndexRequest:
-		return failedStatus(code, reason), nil
+		return merr.Status(err)
 	case *milvuspb.FlushRequest:
 		return &milvuspb.FlushResponse{
-			Status: failedStatus(code, reason),
-		}, nil
+			Status: merr.Status(err),
+		}
 	case *milvuspb.ManualCompactionRequest:
 		return &milvuspb.ManualCompactionResponse{
-			Status: failedStatus(code, reason),
-		}, nil
-		// TODO: support more request
+			Status: merr.Status(err),
+		}
 	}
-	if req == nil {
-		return nil, fmt.Errorf("null request")
-	}
-	return nil, fmt.Errorf("unsupported request type %s", reflect.TypeOf(req).Name())
+	return nil
 }

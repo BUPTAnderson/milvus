@@ -13,13 +13,16 @@
 
 #include <pb/schema.pb.h>
 #include <cmath>
+#include <memory>
+#include <string>
+
+#include "common/EasyAssert.h"
 #include "indexbuilder/IndexCreatorBase.h"
 #include "indexbuilder/ScalarIndexCreator.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "indexbuilder/type_c.h"
 #include "storage/Types.h"
-#include <memory>
-#include <string>
+#include "storage/FileManager.h"
 
 namespace milvus::indexbuilder {
 
@@ -40,14 +43,13 @@ class IndexFactory {
     }
 
     IndexCreatorBasePtr
-    CreateIndex(CDataType dtype,
-                const char* type_params,
-                const char* index_params,
-                const storage::StorageConfig& storage_config) {
-        auto real_dtype = DataType(dtype);
-        auto invalid_dtype_msg = std::string("invalid data type: ") + std::to_string(int(real_dtype));
+    CreateIndex(DataType type,
+                Config& config,
+                const storage::FileManagerContext& context) {
+        auto invalid_dtype_msg =
+            std::string("invalid data type: ") + std::to_string(int(type));
 
-        switch (real_dtype) {
+        switch (type) {
             case DataType::BOOL:
             case DataType::INT8:
             case DataType::INT16:
@@ -57,13 +59,15 @@ class IndexFactory {
             case DataType::DOUBLE:
             case DataType::VARCHAR:
             case DataType::STRING:
-                return CreateScalarIndex(real_dtype, type_params, index_params);
+                return CreateScalarIndex(type, config, context);
 
             case DataType::VECTOR_FLOAT:
             case DataType::VECTOR_BINARY:
-                return std::make_unique<VecIndexCreator>(real_dtype, type_params, index_params, storage_config);
+                return std::make_unique<VecIndexCreator>(type, config, context);
             default:
-                throw std::invalid_argument(invalid_dtype_msg);
+                throw SegcoreError(
+                    DataTypeInvalid,
+                    fmt::format("invalid type is {}", invalid_dtype_msg));
         }
     }
 };

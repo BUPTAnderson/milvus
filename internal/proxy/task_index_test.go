@@ -18,19 +18,34 @@ package proxy
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
+	"os"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/config"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
+
+func TestMain(m *testing.M) {
+	paramtable.Init()
+	code := m.Run()
+	os.Exit(code)
+}
 
 func TestGetIndexStateTask_Execute(t *testing.T) {
 	dbName := funcutil.GenRandomStr()
@@ -41,8 +56,12 @@ func TestGetIndexStateTask_Execute(t *testing.T) {
 	ctx := context.Background()
 
 	rootCoord := newMockRootCoord()
-	indexCoord := newMockIndexCoord()
-	queryCoord := NewQueryCoordMock()
+	queryCoord := getMockQueryCoord()
+	queryCoord.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+		Status:        merr.Status(nil),
+		CollectionIDs: []int64{},
+	}, nil)
+	datacoord := NewDataCoordMock()
 
 	gist := &getIndexStateTask{
 		GetIndexStateRequest: &milvuspb.GetIndexStateRequest{
@@ -52,9 +71,9 @@ func TestGetIndexStateTask_Execute(t *testing.T) {
 			FieldName:      fieldName,
 			IndexName:      indexName,
 		},
-		ctx:        ctx,
-		indexCoord: indexCoord,
-		rootCoord:  rootCoord,
+		ctx:       ctx,
+		rootCoord: rootCoord,
+		dataCoord: datacoord,
 		result: &milvuspb.GetIndexStateResponse{
 			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError, Reason: "mock"},
 			State:  commonpb.IndexState_Unissued,
@@ -67,22 +86,18 @@ func TestGetIndexStateTask_Execute(t *testing.T) {
 	_ = InitMetaCache(ctx, rootCoord, queryCoord, shardMgr)
 	assert.Error(t, gist.Execute(ctx))
 
-	rootCoord.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+	rootCoord.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest, opts ...grpc.CallOption) (*milvuspb.DescribeCollectionResponse, error) {
 		return &milvuspb.DescribeCollectionResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			},
+			Status:         merr.Status(nil),
 			Schema:         newTestSchema(),
 			CollectionID:   collectionID,
 			CollectionName: request.CollectionName,
 		}, nil
 	}
 
-	indexCoord.GetIndexStateFunc = func(ctx context.Context, request *indexpb.GetIndexStateRequest) (*indexpb.GetIndexStateResponse, error) {
+	datacoord.GetIndexStateFunc = func(ctx context.Context, request *indexpb.GetIndexStateRequest, opts ...grpc.CallOption) (*indexpb.GetIndexStateResponse, error) {
 		return &indexpb.GetIndexStateResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			},
+			Status:     merr.Status(nil),
 			State:      commonpb.IndexState_Finished,
 			FailReason: "",
 		}, nil
@@ -98,24 +113,21 @@ func TestDropIndexTask_PreExecute(t *testing.T) {
 	fieldName := "field1"
 	indexName := "_default_idx_101"
 
-	Params.Init()
-	showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-		return &querypb.ShowCollectionsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-			},
-			CollectionIDs: nil,
-		}, nil
-	}
-	qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-	ic := newMockIndexCoord()
+	paramtable.Init()
+	qc := getMockQueryCoord()
+	qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+		Status:        merr.Status(nil),
+		CollectionIDs: []int64{},
+	}, nil)
+	dc := NewDataCoordMock()
 	ctx := context.Background()
-	qc.updateState(commonpb.StateCode_Healthy)
 
-	mockCache := newMockCache()
-	mockCache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return collectionID, nil
-	})
+	mockCache := NewMockCache(t)
+	mockCache.On("GetCollectionID",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(collectionID, nil)
 	globalMetaCache = mockCache
 
 	dit := dropIndexTask{
@@ -132,7 +144,7 @@ func TestDropIndexTask_PreExecute(t *testing.T) {
 			FieldName:      fieldName,
 			IndexName:      indexName,
 		},
-		indexCoord:   ic,
+		dataCoord:    dc,
 		queryCoord:   qc,
 		result:       nil,
 		collectionID: collectionID,
@@ -144,31 +156,30 @@ func TestDropIndexTask_PreExecute(t *testing.T) {
 	})
 
 	t.Run("get collectionID error", func(t *testing.T) {
-		mockCache := newMockCache()
-		mockCache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-			return 0, errors.New("error")
-		})
+		mockCache := NewMockCache(t)
+		mockCache.On("GetCollectionID",
+			mock.Anything, // context.Context
+			mock.AnythingOfType("string"),
+			mock.AnythingOfType("string"),
+		).Return(UniqueID(0), errors.New("error"))
 		globalMetaCache = mockCache
 		err := dit.PreExecute(ctx)
 		assert.Error(t, err)
 	})
 
-	mockCache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return collectionID, nil
-	})
+	mockCache.On("GetCollectionID",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(collectionID, nil)
 	globalMetaCache = mockCache
 
 	t.Run("coll has been loaded", func(t *testing.T) {
-		showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-			return &querypb.ShowCollectionsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
-				CollectionIDs: []int64{collectionID},
-			}, nil
-		}
-		qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-		qc.updateState(commonpb.StateCode_Healthy)
+		qc := getMockQueryCoord()
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+			Status:        merr.Status(nil),
+			CollectionIDs: []int64{collectionID},
+		}, nil)
 		dit.queryCoord = qc
 
 		err := dit.PreExecute(ctx)
@@ -176,11 +187,8 @@ func TestDropIndexTask_PreExecute(t *testing.T) {
 	})
 
 	t.Run("show collection error", func(t *testing.T) {
-		showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-			return nil, errors.New("error")
-		}
-		qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-		qc.updateState(commonpb.StateCode_Healthy)
+		qc := getMockQueryCoord()
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(nil, errors.New("error"))
 		dit.queryCoord = qc
 
 		err := dit.PreExecute(ctx)
@@ -188,16 +196,13 @@ func TestDropIndexTask_PreExecute(t *testing.T) {
 	})
 
 	t.Run("show collection fail", func(t *testing.T) {
-		showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-			return &querypb.ShowCollectionsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_UnexpectedError,
-					Reason:    "fail reason",
-				},
-			}, nil
-		}
-		qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-		qc.updateState(commonpb.StateCode_Healthy)
+		qc := getMockQueryCoord()
+		qc.EXPECT().ShowCollections(mock.Anything, mock.Anything).Return(&querypb.ShowCollectionsResponse{
+			Status: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_UnexpectedError,
+				Reason:    "fail reason",
+			},
+		}, nil)
 		dit.queryCoord = qc
 
 		err := dit.PreExecute(ctx)
@@ -205,22 +210,43 @@ func TestDropIndexTask_PreExecute(t *testing.T) {
 	})
 }
 
+func getMockQueryCoord() *mocks.MockQueryCoordClient {
+	qc := &mocks.MockQueryCoordClient{}
+	successStatus := &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}
+	qc.EXPECT().LoadCollection(mock.Anything, mock.Anything).Return(successStatus, nil)
+	qc.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
+		Status: successStatus,
+		Shards: []*querypb.ShardLeadersList{
+			{
+				ChannelName: "channel-1",
+				NodeIds:     []int64{1, 2, 3},
+				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
+			},
+		},
+	}, nil)
+	return qc
+}
+
 func TestCreateIndexTask_PreExecute(t *testing.T) {
 	collectionName := "collection1"
 	collectionID := UniqueID(1)
 	fieldName := newTestSchema().Fields[0].Name
 
-	Params.Init()
-	ic := newMockIndexCoord()
+	dc := NewDataCoordMock()
 	ctx := context.Background()
 
-	mockCache := newMockCache()
-	mockCache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return collectionID, nil
-	})
-	mockCache.setGetSchemaFunc(func(ctx context.Context, collectionName string) (*schemapb.CollectionSchema, error) {
-		return newTestSchema(), nil
-	})
+	mockCache := NewMockCache(t)
+	mockCache.On("GetCollectionID",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(collectionID, nil)
+	mockCache.On("GetCollectionSchema",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(newTestSchema(), nil)
+
 	globalMetaCache = mockCache
 
 	cit := createIndexTask{
@@ -232,251 +258,513 @@ func TestCreateIndexTask_PreExecute(t *testing.T) {
 			CollectionName: collectionName,
 			FieldName:      fieldName,
 		},
-		indexCoord:   ic,
-		queryCoord:   nil,
+		datacoord:    dc,
 		result:       nil,
 		collectionID: collectionID,
 	}
 
 	t.Run("normal", func(t *testing.T) {
-		showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-			return &querypb.ShowCollectionsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
-				CollectionIDs: []int64{},
-			}, nil
-		}
-		qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-		qc.updateState(commonpb.StateCode_Healthy)
-		cit.queryCoord = qc
-
 		err := cit.PreExecute(ctx)
 		assert.NoError(t, err)
 	})
+}
 
-	t.Run("coll has been loaded", func(t *testing.T) {
-		showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-			return &querypb.ShowCollectionsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
+func Test_parseIndexParams(t *testing.T) {
+	cit := &createIndexTask{
+		Condition: nil,
+		req: &milvuspb.CreateIndexRequest{
+			Base:           nil,
+			DbName:         "",
+			CollectionName: "",
+			FieldName:      "",
+			ExtraParams: []*commonpb.KeyValuePair{
+				{
+					Key:   common.IndexTypeKey,
+					Value: "HNSW",
 				},
-				CollectionIDs: []int64{collectionID},
-			}, nil
+				{
+					Key:   MetricTypeKey,
+					Value: "IP",
+				},
+				{
+					Key:   common.IndexParamsKey,
+					Value: "{\"M\": 48, \"efConstruction\": 64}",
+				},
+				{
+					Key:   DimKey,
+					Value: "128",
+				},
+			},
+			IndexName: "",
+		},
+		ctx:            nil,
+		rootCoord:      nil,
+		result:         nil,
+		isAutoIndex:    false,
+		newIndexParams: nil,
+		newTypeParams:  nil,
+		collectionID:   0,
+		fieldSchema: &schemapb.FieldSchema{
+			FieldID:      101,
+			Name:         "FieldID",
+			IsPrimaryKey: false,
+			Description:  "field no.1",
+			DataType:     schemapb.DataType_FloatVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{
+					Key:   DimKey,
+					Value: "128",
+				},
+				{
+					Key:   MetricTypeKey,
+					Value: "L2",
+				},
+			},
+		},
+	}
+
+	t.Run("parse index params", func(t *testing.T) {
+		err := cit.parseIndexParams()
+		assert.NoError(t, err)
+
+		assert.ElementsMatch(t,
+			[]*commonpb.KeyValuePair{
+				{
+					Key:   common.IndexTypeKey,
+					Value: "HNSW",
+				},
+				{
+					Key:   MetricTypeKey,
+					Value: "IP",
+				},
+				{
+					Key:   "M",
+					Value: "48",
+				},
+				{
+					Key:   "efConstruction",
+					Value: "64",
+				},
+			}, cit.newIndexParams)
+		assert.ElementsMatch(t,
+			[]*commonpb.KeyValuePair{
+				{
+					Key:   DimKey,
+					Value: "128",
+				},
+			}, cit.newTypeParams)
+	})
+
+	cit2 := &createIndexTask{
+		Condition: nil,
+		req: &milvuspb.CreateIndexRequest{
+			Base:           nil,
+			DbName:         "",
+			CollectionName: "",
+			FieldName:      "",
+			ExtraParams: []*commonpb.KeyValuePair{
+				{
+					Key:   common.IndexTypeKey,
+					Value: "IVF_FLAT",
+				},
+				{
+					Key:   MetricTypeKey,
+					Value: "L2",
+				},
+				{
+					Key:   common.IndexParamsKey,
+					Value: "{\"nlist\": 100}",
+				},
+				{
+					Key:   DimKey,
+					Value: "128",
+				},
+			},
+			IndexName: "",
+		},
+		ctx:            nil,
+		rootCoord:      nil,
+		result:         nil,
+		isAutoIndex:    false,
+		newIndexParams: nil,
+		newTypeParams:  nil,
+		collectionID:   0,
+		fieldSchema: &schemapb.FieldSchema{
+			FieldID:      101,
+			Name:         "FieldID",
+			IsPrimaryKey: false,
+			Description:  "field no.1",
+			DataType:     schemapb.DataType_FloatVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{
+					Key:   DimKey,
+					Value: "128",
+				},
+				{
+					Key:   MetricTypeKey,
+					Value: "L2",
+				},
+			},
+		},
+	}
+	t.Run("parse index params 2", func(t *testing.T) {
+		Params.Save(Params.AutoIndexConfig.Enable.Key, "true")
+		indexParams := map[string]any{
+			common.IndexTypeKey: "HNSW",
+			"M":                 10,
+			"efConstruction":    100,
 		}
-		qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-		qc.updateState(commonpb.StateCode_Healthy)
-		cit.queryCoord = qc
-		err := cit.PreExecute(ctx)
+		indexParamsStr, err := json.Marshal(indexParams)
+		assert.NoError(t, err)
+		Params.Save(Params.AutoIndexConfig.IndexParams.Key, string(indexParamsStr))
+		err = cit2.parseIndexParams()
+		assert.NoError(t, err)
+
+		assert.ElementsMatch(t,
+			[]*commonpb.KeyValuePair{
+				{
+					Key:   common.IndexTypeKey,
+					Value: "HNSW",
+				},
+				{
+					Key:   MetricTypeKey,
+					Value: "L2",
+				},
+				{
+					Key:   "M",
+					Value: "10",
+				},
+				{
+					Key:   "efConstruction",
+					Value: "100",
+				},
+				{
+					Key:   "nlist",
+					Value: "100",
+				},
+			}, cit2.newIndexParams)
+		assert.ElementsMatch(t,
+			[]*commonpb.KeyValuePair{
+				{
+					Key:   DimKey,
+					Value: "128",
+				},
+			}, cit2.newTypeParams)
+	})
+	t.Run("create index on json field", func(t *testing.T) {
+		cit3 := &createIndexTask{
+			Condition: nil,
+			req: &milvuspb.CreateIndexRequest{
+				Base:           nil,
+				DbName:         "",
+				CollectionName: "",
+				FieldName:      "",
+				ExtraParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.IndexTypeKey,
+						Value: "HNSW",
+					},
+					{
+						Key:   MetricTypeKey,
+						Value: "IP",
+					},
+					{
+						Key:   common.IndexParamsKey,
+						Value: "{\"M\": 48, \"efConstruction\": 64}",
+					},
+					{
+						Key:   DimKey,
+						Value: "128",
+					},
+				},
+				IndexName: "",
+			},
+			ctx:            nil,
+			rootCoord:      nil,
+			result:         nil,
+			isAutoIndex:    false,
+			newIndexParams: nil,
+			newTypeParams:  nil,
+			collectionID:   0,
+			fieldSchema: &schemapb.FieldSchema{
+				FieldID:      101,
+				Name:         "FieldID",
+				IsPrimaryKey: false,
+				Description:  "field no.1",
+				DataType:     schemapb.DataType_JSON,
+			},
+		}
+		err := cit3.parseIndexParams()
 		assert.Error(t, err)
 	})
 
-	t.Run("check load error", func(t *testing.T) {
-		showCollectionMock := func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
-			return &querypb.ShowCollectionsResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_UnexpectedError,
-					Reason:    "fail reason",
+	t.Run("create index on array field", func(t *testing.T) {
+		cit3 := &createIndexTask{
+			Condition: nil,
+			req: &milvuspb.CreateIndexRequest{
+				Base:           nil,
+				DbName:         "",
+				CollectionName: "",
+				FieldName:      "",
+				ExtraParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.IndexTypeKey,
+						Value: "STL_SORT",
+					},
 				},
-				CollectionIDs: nil,
-			}, errors.New("error")
+				IndexName: "",
+			},
+			ctx:            nil,
+			rootCoord:      nil,
+			result:         nil,
+			isAutoIndex:    false,
+			newIndexParams: nil,
+			newTypeParams:  nil,
+			collectionID:   0,
+			fieldSchema: &schemapb.FieldSchema{
+				FieldID:      101,
+				Name:         "FieldID",
+				IsPrimaryKey: false,
+				Description:  "field no.1",
+				DataType:     schemapb.DataType_Array,
+				ElementType:  schemapb.DataType_Int64,
+			},
 		}
-		qc := NewQueryCoordMock(withValidShardLeaders(), SetQueryCoordShowCollectionsFunc(showCollectionMock))
-		qc.updateState(commonpb.StateCode_Healthy)
-		cit.queryCoord = qc
-		err := cit.PreExecute(ctx)
+		err := cit3.parseIndexParams()
+		assert.Error(t, err)
+	})
+
+	t.Run("pass vector index type on scalar field", func(t *testing.T) {
+		cit4 := &createIndexTask{
+			Condition: nil,
+			req: &milvuspb.CreateIndexRequest{
+				Base:           nil,
+				DbName:         "",
+				CollectionName: "",
+				FieldName:      "",
+				ExtraParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.IndexTypeKey,
+						Value: "HNSW",
+					},
+					{
+						Key:   MetricTypeKey,
+						Value: "IP",
+					},
+					{
+						Key:   common.IndexParamsKey,
+						Value: "{\"M\": 48, \"efConstruction\": 64}",
+					},
+					{
+						Key:   DimKey,
+						Value: "128",
+					},
+				},
+				IndexName: "",
+			},
+			ctx:            nil,
+			rootCoord:      nil,
+			result:         nil,
+			isAutoIndex:    false,
+			newIndexParams: nil,
+			newTypeParams:  nil,
+			collectionID:   0,
+			fieldSchema: &schemapb.FieldSchema{
+				FieldID:      101,
+				Name:         "FieldID",
+				IsPrimaryKey: false,
+				Description:  "field no.1",
+				DataType:     schemapb.DataType_VarChar,
+			},
+		}
+		err := cit4.parseIndexParams()
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+
+		cit5 := &createIndexTask{
+			Condition: nil,
+			req: &milvuspb.CreateIndexRequest{
+				Base:           nil,
+				DbName:         "",
+				CollectionName: "",
+				FieldName:      "",
+				ExtraParams: []*commonpb.KeyValuePair{
+					{
+						Key:   common.IndexTypeKey,
+						Value: "HNSW",
+					},
+					{
+						Key:   MetricTypeKey,
+						Value: "IP",
+					},
+					{
+						Key:   common.IndexParamsKey,
+						Value: "{\"M\": 48, \"efConstruction\": 64}",
+					},
+					{
+						Key:   DimKey,
+						Value: "128",
+					},
+				},
+				IndexName: "",
+			},
+			ctx:            nil,
+			rootCoord:      nil,
+			result:         nil,
+			isAutoIndex:    false,
+			newIndexParams: nil,
+			newTypeParams:  nil,
+			collectionID:   0,
+			fieldSchema: &schemapb.FieldSchema{
+				FieldID:      101,
+				Name:         "FieldID",
+				IsPrimaryKey: false,
+				Description:  "field no.1",
+				DataType:     schemapb.DataType_Int64,
+			},
+		}
+		err = cit5.parseIndexParams()
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+}
+
+func Test_wrapUserIndexParams(t *testing.T) {
+	params := wrapUserIndexParams("L2")
+	assert.Equal(t, 2, len(params))
+	assert.Equal(t, "index_type", params[0].Key)
+	assert.Equal(t, AutoIndexName, params[0].Value)
+	assert.Equal(t, "metric_type", params[1].Key)
+	assert.Equal(t, "L2", params[1].Value)
+}
+
+func Test_parseIndexParams_AutoIndex(t *testing.T) {
+	paramtable.Init()
+	mgr := config.NewManager()
+	mgr.SetConfig("autoIndex.enable", "false")
+	mgr.SetConfig("autoIndex.params.build", `{"M": 30,"efConstruction": 360,"index_type": "HNSW", "metric_type": "IP"}`)
+	Params.AutoIndexConfig.Enable.Init(mgr)
+	Params.AutoIndexConfig.IndexParams.Init(mgr)
+	autoIndexConfig := Params.AutoIndexConfig.IndexParams.GetAsJSONMap()
+	fieldSchema := &schemapb.FieldSchema{
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "8"},
+		},
+	}
+
+	t.Run("case 1, empty parameters", func(t *testing.T) {
+		task := &createIndexTask{
+			fieldSchema: fieldSchema,
+			req: &milvuspb.CreateIndexRequest{
+				ExtraParams: make([]*commonpb.KeyValuePair, 0),
+			},
+		}
+		err := task.parseIndexParams()
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: AutoIndexName},
+			{Key: common.MetricTypeKey, Value: autoIndexConfig[common.MetricTypeKey]},
+		}, task.newExtraParams)
+	})
+
+	t.Run("case 2, only metric type passed", func(t *testing.T) {
+		task := &createIndexTask{
+			fieldSchema: fieldSchema,
+			req: &milvuspb.CreateIndexRequest{
+				ExtraParams: []*commonpb.KeyValuePair{
+					{Key: common.MetricTypeKey, Value: "L2"},
+				},
+			},
+		}
+		err := task.parseIndexParams()
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: AutoIndexName},
+			{Key: common.MetricTypeKey, Value: "L2"},
+		}, task.newExtraParams)
+	})
+
+	t.Run("case 3, AutoIndex & metric_type passed", func(t *testing.T) {
+		task := &createIndexTask{
+			fieldSchema: fieldSchema,
+			req: &milvuspb.CreateIndexRequest{
+				ExtraParams: []*commonpb.KeyValuePair{
+					{Key: common.MetricTypeKey, Value: "L2"},
+					{Key: common.IndexTypeKey, Value: AutoIndexName},
+				},
+			},
+		}
+		err := task.parseIndexParams()
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: AutoIndexName},
+			{Key: common.MetricTypeKey, Value: "L2"},
+		}, task.newExtraParams)
+	})
+
+	t.Run("case 4, duplicate and useless parameters passed", func(t *testing.T) {
+		task := &createIndexTask{
+			fieldSchema: fieldSchema,
+			req: &milvuspb.CreateIndexRequest{
+				ExtraParams: []*commonpb.KeyValuePair{
+					{Key: "not important", Value: "L2"},
+				},
+			},
+		}
+		err := task.parseIndexParams()
+		assert.Error(t, err)
+	})
+
+	t.Run("case 5, duplicate and useless parameters passed", func(t *testing.T) {
+		task := &createIndexTask{
+			fieldSchema: fieldSchema,
+			req: &milvuspb.CreateIndexRequest{
+				ExtraParams: []*commonpb.KeyValuePair{
+					{Key: common.MetricTypeKey, Value: "L2"},
+					{Key: "not important", Value: "L2"},
+				},
+			},
+		}
+		err := task.parseIndexParams()
+		assert.Error(t, err)
+	})
+
+	t.Run("case 6, autoindex & duplicate", func(t *testing.T) {
+		task := &createIndexTask{
+			fieldSchema: fieldSchema,
+			req: &milvuspb.CreateIndexRequest{
+				ExtraParams: []*commonpb.KeyValuePair{
+					{Key: common.IndexTypeKey, Value: AutoIndexName},
+					{Key: common.MetricTypeKey, Value: "L2"},
+					{Key: "not important", Value: "L2"},
+				},
+			},
+		}
+		err := task.parseIndexParams()
 		assert.Error(t, err)
 	})
 }
 
-func TestDropIndexTask_Execute(t *testing.T) {
-	collectionName := "collection1"
-	collectionID := UniqueID(1)
-	fieldID := UniqueID(2)
-	indexID := UniqueID(3)
-	fieldName := "field1"
-	indexName := "_default_idx_101"
-
-	ic := newMockIndexCoord()
-	ctx := context.Background()
-
-	mockCache := newMockCache()
-	mockCache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return collectionID, nil
-	})
-	globalMetaCache = mockCache
-
-	ic.DropIndexFunc = func(ctx context.Context, request *indexpb.DropIndexRequest) (*commonpb.Status, error) {
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		}, nil
-	}
-	dit := dropIndexTask{
-		ctx: ctx,
-		DropIndexRequest: &milvuspb.DropIndexRequest{
-			CollectionName: collectionName,
-			FieldName:      fieldName,
-			IndexName:      "",
-		},
-		indexCoord:   ic,
-		queryCoord:   nil,
-		result:       nil,
-		collectionID: collectionID,
+func newTestSchema() *schemapb.CollectionSchema {
+	fields := []*schemapb.FieldSchema{
+		{FieldID: 0, Name: "FieldID", IsPrimaryKey: false, Description: "field no.1", DataType: schemapb.DataType_Int64},
 	}
 
-	t.Run("one index", func(t *testing.T) {
-		ic.DescribeIndexFunc = func(ctx context.Context, request *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error) {
-			return &indexpb.DescribeIndexResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
-				IndexInfos: []*indexpb.IndexInfo{
-					{
-						CollectionID: collectionID,
-						FieldID:      fieldID,
-						IndexName:    indexName,
-						IndexID:      indexID,
-						TypeParams: []*commonpb.KeyValuePair{
-							{
-								Key:   "dim",
-								Value: "128",
-							},
-						},
-						IndexParams: []*commonpb.KeyValuePair{
-							{
-								Key:   "metrics_type",
-								Value: "L2",
-							},
-						},
-						IndexedRows:          10000,
-						TotalRows:            10000,
-						State:                commonpb.IndexState_Finished,
-						IndexStateFailReason: "",
-						IsAutoIndex:          false,
-						UserIndexParams:      nil,
-					},
-				},
-			}, nil
+	for name, value := range schemapb.DataType_value {
+		dataType := schemapb.DataType(value)
+		if !typeutil.IsIntegerType(dataType) && !typeutil.IsFloatingType(dataType) && !typeutil.IsVectorType(dataType) && !typeutil.IsStringType(dataType) {
+			continue
 		}
-		err := dit.Execute(ctx)
-		assert.NoError(t, err)
-	})
-
-	t.Run("two indexes", func(t *testing.T) {
-		ic.DescribeIndexFunc = func(ctx context.Context, request *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error) {
-			return &indexpb.DescribeIndexResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_Success,
-				},
-				IndexInfos: []*indexpb.IndexInfo{
-					{
-						CollectionID: collectionID,
-						FieldID:      fieldID,
-						IndexName:    indexName,
-						IndexID:      indexID,
-						TypeParams: []*commonpb.KeyValuePair{
-							{
-								Key:   "dim",
-								Value: "128",
-							},
-						},
-						IndexParams: []*commonpb.KeyValuePair{
-							{
-								Key:   "metrics_type",
-								Value: "L2",
-							},
-							{
-								Key:   "index_type",
-								Value: "IVF_FLAT",
-							},
-						},
-						IndexedRows:          10000,
-						TotalRows:            10000,
-						State:                commonpb.IndexState_Finished,
-						IndexStateFailReason: "",
-						IsAutoIndex:          false,
-						UserIndexParams:      nil,
-					},
-					{
-						CollectionID: collectionID,
-						FieldID:      fieldID + 1,
-						IndexName:    "_default_idx_102",
-						IndexID:      indexID + 1,
-						TypeParams: []*commonpb.KeyValuePair{
-							{
-								Key:   "dim",
-								Value: "128",
-							},
-						},
-						IndexParams: []*commonpb.KeyValuePair{
-							{
-								Key:   "metrics_type",
-								Value: "L2",
-							},
-							{
-								Key:   "index_type",
-								Value: "FLAT",
-							},
-						},
-						IndexedRows:          10000,
-						TotalRows:            10000,
-						State:                commonpb.IndexState_Finished,
-						IndexStateFailReason: "",
-						IsAutoIndex:          false,
-						UserIndexParams:      nil,
-					},
-				},
-			}, nil
+		newField := &schemapb.FieldSchema{
+			FieldID: int64(100 + value), Name: name + "Field", IsPrimaryKey: false, Description: "", DataType: dataType,
 		}
-		dit.indexCoord = ic
-		dit.IndexName = ""
+		fields = append(fields, newField)
+	}
 
-		err := dit.Execute(ctx)
-		assert.Error(t, err)
-	})
-
-	t.Run("describe index error", func(t *testing.T) {
-		ic.DescribeIndexFunc = func(ctx context.Context, request *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error) {
-			return nil, errors.New("error")
-		}
-		dit.indexCoord = ic
-		dit.IndexName = ""
-
-		err := dit.Execute(ctx)
-		assert.Error(t, err)
-	})
-
-	t.Run("describe index fail", func(t *testing.T) {
-		ic.DescribeIndexFunc = func(ctx context.Context, request *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error) {
-			return &indexpb.DescribeIndexResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_UnexpectedError,
-					Reason:    "fail reason",
-				},
-				IndexInfos: nil,
-			}, nil
-		}
-		dit.indexCoord = ic
-		dit.IndexName = ""
-
-		err := dit.Execute(ctx)
-		assert.Error(t, err)
-	})
-
-	t.Run("index not exist", func(t *testing.T) {
-		ic.DescribeIndexFunc = func(ctx context.Context, request *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error) {
-			return &indexpb.DescribeIndexResponse{
-				Status: &commonpb.Status{
-					ErrorCode: commonpb.ErrorCode_IndexNotExist,
-					Reason:    "index not exist",
-				},
-				IndexInfos: nil,
-			}, nil
-		}
-		dit.indexCoord = ic
-		dit.IndexName = ""
-
-		err := dit.Execute(ctx)
-		assert.NoError(t, err)
-	})
+	return &schemapb.CollectionSchema{
+		Name:               "test",
+		Description:        "schema for test used",
+		AutoID:             true,
+		Fields:             fields,
+		EnableDynamicField: true,
+	}
 }

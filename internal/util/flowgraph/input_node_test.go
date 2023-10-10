@@ -22,8 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 func TestInputNode(t *testing.T) {
@@ -32,8 +32,7 @@ func TestInputNode(t *testing.T) {
 
 	msgStream, _ := factory.NewMsgStream(context.TODO())
 	channels := []string{"cc"}
-	msgStream.AsConsumer(channels, "sub", mqwrapper.SubscriptionPositionEarliest)
-	msgStream.Start()
+	msgStream.AsConsumer(context.Background(), channels, "sub", mqwrapper.SubscriptionPositionEarliest)
 
 	msgPack := generateMsgPack()
 	produceStream, _ := factory.NewMsgStream(context.TODO())
@@ -41,7 +40,7 @@ func TestInputNode(t *testing.T) {
 	produceStream.Produce(&msgPack)
 
 	nodeName := "input_node"
-	inputNode := NewInputNode(msgStream, nodeName, 100, 100)
+	inputNode := NewInputNode(msgStream.Chan(), nodeName, 100, 100, "", 0, 0, "")
 	defer inputNode.Close()
 
 	isInputNode := inputNode.IsInputNode()
@@ -49,9 +48,6 @@ func TestInputNode(t *testing.T) {
 
 	name := inputNode.Name()
 	assert.Equal(t, name, nodeName)
-
-	stream := inputNode.InStream()
-	assert.NotNil(t, stream)
 
 	output := inputNode.Operate(nil)
 	assert.NotNil(t, output)
@@ -64,7 +60,7 @@ func Test_NewInputNode(t *testing.T) {
 	nodeName := "input_node"
 	var maxQueueLength int32
 	var maxParallelism int32 = 100
-	node := NewInputNode(nil, nodeName, maxQueueLength, maxParallelism)
+	node := NewInputNode(nil, nodeName, maxQueueLength, maxParallelism, "", 0, 0, "")
 	assert.NotNil(t, node)
 	assert.Equal(t, node.name, nodeName)
 	assert.Equal(t, node.maxQueueLength, maxQueueLength)

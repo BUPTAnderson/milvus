@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type fakeTaskState int
@@ -155,21 +157,18 @@ func newTask(cancelStage fakeTaskState, reterror map[fakeTaskState]error, expect
 }
 
 func TestIndexTaskScheduler(t *testing.T) {
-	Params.Init()
+	paramtable.Init()
 
-	scheduler, err := NewTaskScheduler(context.TODO())
-	assert.Nil(t, err)
+	scheduler := NewTaskScheduler(context.TODO())
 	scheduler.Start()
 
 	tasks := make([]task, 0)
 
 	tasks = append(tasks,
-		newTask(fakeTaskEnqueued, nil, commonpb.IndexState_Failed),
-		newTask(fakeTaskLoadedData, nil, commonpb.IndexState_Failed),
-		newTask(fakeTaskPrepared, nil, commonpb.IndexState_Failed),
-		newTask(fakeTaskBuiltIndex, nil, commonpb.IndexState_Failed),
+		newTask(fakeTaskEnqueued, nil, commonpb.IndexState_Retry),
+		newTask(fakeTaskPrepared, nil, commonpb.IndexState_Retry),
+		newTask(fakeTaskBuiltIndex, nil, commonpb.IndexState_Retry),
 		newTask(fakeTaskSavedIndexes, nil, commonpb.IndexState_Finished),
-		newTask(fakeTaskSavedIndexes, map[fakeTaskState]error{fakeTaskLoadedData: ErrNoSuchKey}, commonpb.IndexState_Failed),
 		newTask(fakeTaskSavedIndexes, map[fakeTaskState]error{fakeTaskSavedIndexes: fmt.Errorf("auth failed")}, commonpb.IndexState_Retry))
 
 	for _, task := range tasks {
@@ -179,24 +178,22 @@ func TestIndexTaskScheduler(t *testing.T) {
 	scheduler.Close()
 	scheduler.wg.Wait()
 
-	for _, task := range tasks[:len(tasks)-2] {
+	for _, task := range tasks[:len(tasks)-1] {
 		assert.Equal(t, task.GetState(), task.(*fakeTask).expectedState)
 		assert.Equal(t, task.Ctx().(*stagectx).curstate, task.Ctx().(*stagectx).state2cancel)
 	}
-	assert.Equal(t, tasks[len(tasks)-2].GetState(), tasks[len(tasks)-2].(*fakeTask).expectedState)
-	assert.Equal(t, tasks[len(tasks)-2].Ctx().(*stagectx).curstate, fakeTaskState(fakeTaskLoadedData))
+
 	assert.Equal(t, tasks[len(tasks)-1].GetState(), tasks[len(tasks)-1].(*fakeTask).expectedState)
 	assert.Equal(t, tasks[len(tasks)-1].Ctx().(*stagectx).curstate, fakeTaskState(fakeTaskSavedIndexes))
 
-	scheduler, err = NewTaskScheduler(context.TODO())
-	assert.Nil(t, err)
+	scheduler = NewTaskScheduler(context.TODO())
 	tasks = make([]task, 0, 1024)
 	for i := 0; i < 1024; i++ {
 		tasks = append(tasks, newTask(fakeTaskSavedIndexes, nil, commonpb.IndexState_Finished))
 		assert.Nil(t, scheduler.IndexBuildQueue.Enqueue(tasks[len(tasks)-1]))
 	}
 	failTask := newTask(fakeTaskSavedIndexes, nil, commonpb.IndexState_Finished)
-	err = scheduler.IndexBuildQueue.Enqueue(failTask)
+	err := scheduler.IndexBuildQueue.Enqueue(failTask)
 	assert.Error(t, err)
 	failTask.Reset()
 

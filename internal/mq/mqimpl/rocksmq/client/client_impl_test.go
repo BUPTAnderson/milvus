@@ -12,20 +12,32 @@
 package client
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/milvus-io/milvus/internal/mq/mqimpl/rocksmq/server"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 var rmqPath = "/tmp/rocksmq_client"
 
+func TestMain(m *testing.M) {
+	paramtable.Init()
+	code := m.Run()
+	os.Exit(code)
+}
+
 func TestClient(t *testing.T) {
 	client, err := NewClient(Options{})
 	assert.NotNil(t, client)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 }
 
 func TestClient_CreateProducer(t *testing.T) {
@@ -127,6 +139,29 @@ func TestClient_Subscribe(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestClient_SubscribeError(t *testing.T) {
+	mockMQ := server.NewMockRocksMQ(t)
+	client, err := NewClient(Options{
+		Server: mockMQ,
+	})
+	testTopic := newTopicName()
+	testGroupName := newConsumerName()
+
+	assert.NoError(t, err)
+	mockMQ.EXPECT().ExistConsumerGroup(testTopic, testGroupName).Return(false, nil, nil)
+	mockMQ.EXPECT().CreateConsumerGroup(testTopic, testGroupName).Return(nil)
+	mockMQ.EXPECT().RegisterConsumer(mock.Anything).Return(nil)
+	mockMQ.EXPECT().SeekToLatest(testTopic, testGroupName).Return(fmt.Errorf("test error"))
+
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:                       testTopic,
+		SubscriptionName:            testGroupName,
+		SubscriptionInitialPosition: mqwrapper.SubscriptionPositionLatest,
+	})
+	assert.Error(t, err)
+	assert.Nil(t, consumer)
+}
+
 func TestClient_SeekLatest(t *testing.T) {
 	os.MkdirAll(rmqPath, os.ModePerm)
 	rmqPathTest := rmqPath + "/seekLatest"
@@ -154,10 +189,11 @@ func TestClient_SeekLatest(t *testing.T) {
 	assert.NotNil(t, producer)
 	assert.NoError(t, err)
 	msg := &ProducerMessage{
-		Payload: make([]byte, 10),
+		Payload:    make([]byte, 10),
+		Properties: map[string]string{},
 	}
 	id, err := producer.Send(msg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	msgChan := consumer1.Chan()
 	msgRead, ok := <-msgChan
@@ -177,17 +213,19 @@ func TestClient_SeekLatest(t *testing.T) {
 
 	msgChan = consumer2.Chan()
 	loop := true
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 	for loop {
 		select {
 		case msg := <-msgChan:
 			assert.Equal(t, len(msg.Payload), 8)
 			loop = false
-		case <-time.After(2 * time.Second):
+		case <-ticker.C:
 			msg := &ProducerMessage{
 				Payload: make([]byte, 8),
 			}
 			_, err = producer.Send(msg)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 		}
 	}
 
@@ -228,7 +266,7 @@ func TestClient_consume(t *testing.T) {
 		Payload: make([]byte, 10),
 	}
 	id, err := producer.Send(msg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	msgChan := consumer.Chan()
 	msgConsume, ok := <-msgChan

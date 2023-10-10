@@ -3,16 +3,21 @@ package planparserv2
 import (
 	"fmt"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/planpb"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
 	"github.com/antlr/antlr4/runtime/Go/antlr"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 func handleExpr(schema *typeutil.SchemaHelper, exprStr string) interface{} {
-	if exprStr == "" {
-		return nil
+	if isEmptyExpression(exprStr) {
+		return &ExprWithType{
+			dataType: schemapb.DataType_Bool,
+			expr:     alwaysTrueExpr(),
+		}
 	}
 
 	inputStream := antlr.NewInputStream(exprStr)
@@ -33,6 +38,11 @@ func handleExpr(schema *typeutil.SchemaHelper, exprStr string) interface{} {
 		return errorListener.err
 	}
 
+	if parser.GetCurrentToken().GetTokenType() != antlr.TokenEOF {
+		log.Info("invalid expression", zap.String("expr", exprStr))
+		return fmt.Errorf("invalid expression: %s", exprStr)
+	}
+
 	// lexer & parser won't be used by this thread, can be put into pool.
 	putLexer(lexer)
 	putParser(parser)
@@ -42,10 +52,6 @@ func handleExpr(schema *typeutil.SchemaHelper, exprStr string) interface{} {
 }
 
 func ParseExpr(schema *typeutil.SchemaHelper, exprStr string) (*planpb.Expr, error) {
-	if len(exprStr) <= 0 {
-		return nil, nil
-	}
-
 	ret := handleExpr(schema, exprStr)
 
 	if err := getError(ret); err != nil {
@@ -56,12 +62,29 @@ func ParseExpr(schema *typeutil.SchemaHelper, exprStr string) (*planpb.Expr, err
 	if predicate == nil {
 		return nil, fmt.Errorf("cannot parse expression: %s", exprStr)
 	}
-
-	if !typeutil.IsBoolType(predicate.dataType) {
+	if !canBeExecuted(predicate) {
 		return nil, fmt.Errorf("predicate is not a boolean expression: %s, data type: %s", exprStr, predicate.dataType)
 	}
 
 	return predicate.expr, nil
+}
+
+func ParseIdentifier(schema *typeutil.SchemaHelper, identifier string, checkFunc func(*planpb.Expr) error) error {
+	ret := handleExpr(schema, identifier)
+
+	if err := getError(ret); err != nil {
+		return fmt.Errorf("cannot parse identifier: %s, error: %s", identifier, err)
+	}
+
+	predicate := getExpr(ret)
+	if predicate == nil {
+		return fmt.Errorf("cannot parse identifier: %s", identifier)
+	}
+	if predicate.expr.GetColumnExpr() == nil {
+		return fmt.Errorf("cannot parse identifier: %s", identifier)
+	}
+
+	return checkFunc(predicate.expr)
 }
 
 func CreateRetrievePlan(schemaPb *schemapb.CollectionSchema, exprStr string) (*planpb.PlanNode, error) {
@@ -76,8 +99,10 @@ func CreateRetrievePlan(schemaPb *schemapb.CollectionSchema, exprStr string) (*p
 	}
 
 	planNode := &planpb.PlanNode{
-		Node: &planpb.PlanNode_Predicates{
-			Predicates: expr,
+		Node: &planpb.PlanNode_Query{
+			Query: &planpb.QueryPlanNode{
+				Predicates: expr,
+			},
 		},
 	}
 	return planNode, nil
@@ -89,25 +114,41 @@ func CreateSearchPlan(schemaPb *schemapb.CollectionSchema, exprStr string, vecto
 		return nil, err
 	}
 
-	expr, err := ParseExpr(schema, exprStr)
+	parse := func() (*planpb.Expr, error) {
+		if len(exprStr) <= 0 {
+			return nil, nil
+		}
+		return ParseExpr(schema, exprStr)
+	}
+
+	expr, err := parse()
 	if err != nil {
+		log.Info("CreateSearchPlan failed", zap.Error(err))
 		return nil, err
 	}
 	vectorField, err := schema.GetFieldFromName(vectorFieldName)
 	if err != nil {
+		log.Info("CreateSearchPlan failed", zap.Error(err))
 		return nil, err
 	}
 	fieldID := vectorField.FieldID
 	dataType := vectorField.DataType
 
+	var vectorType planpb.VectorType
 	if !typeutil.IsVectorType(dataType) {
 		return nil, fmt.Errorf("field (%s) to search is not of vector data type", vectorFieldName)
 	}
-
+	if dataType == schemapb.DataType_FloatVector {
+		vectorType = planpb.VectorType_FloatVector
+	} else if dataType == schemapb.DataType_BinaryVector {
+		vectorType = planpb.VectorType_BinaryVector
+	} else {
+		vectorType = planpb.VectorType_Float16Vector
+	}
 	planNode := &planpb.PlanNode{
 		Node: &planpb.PlanNode_VectorAnns{
 			VectorAnns: &planpb.VectorANNS{
-				IsBinary:       dataType == schemapb.DataType_BinaryVector,
+				VectorType:     vectorType,
 				Predicates:     expr,
 				QueryInfo:      queryInfo,
 				PlaceholderTag: "$0",

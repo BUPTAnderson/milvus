@@ -3,9 +3,8 @@ package planparserv2
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-
 	"github.com/antlr/antlr4/runtime/Go/antlr"
+	"github.com/stretchr/testify/assert"
 
 	antlrparser "github.com/milvus-io/milvus/internal/parser/planparserv2/generated"
 )

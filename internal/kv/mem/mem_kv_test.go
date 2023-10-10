@@ -20,6 +20,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/internal/kv/predicates"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 func TestMemoryKV_SaveAndLoadBytes(t *testing.T) {
@@ -197,4 +200,61 @@ func TestMemoryKV_MultiSaveBytesAndRemoveWithPrefix(t *testing.T) {
 	assert.ElementsMatch(t, keys, _keys)
 	assert.ElementsMatch(t, values, _values)
 	assert.NoError(t, err)
+}
+
+func TestHas(t *testing.T) {
+	kv := NewMemoryKV()
+
+	has, err := kv.Has("key1")
+	assert.NoError(t, err)
+	assert.False(t, has)
+
+	err = kv.Save("key1", "value1")
+	assert.NoError(t, err)
+
+	has, err = kv.Has("key1")
+	assert.NoError(t, err)
+	assert.True(t, has)
+
+	err = kv.Remove("key1")
+	assert.NoError(t, err)
+
+	has, err = kv.Has("key1")
+	assert.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestHasPrefix(t *testing.T) {
+	kv := NewMemoryKV()
+
+	has, err := kv.HasPrefix("key")
+	assert.NoError(t, err)
+	assert.False(t, has)
+
+	err = kv.Save("key1", "value1")
+	assert.NoError(t, err)
+
+	has, err = kv.HasPrefix("key")
+	assert.NoError(t, err)
+	assert.True(t, has)
+
+	err = kv.Remove("key1")
+	assert.NoError(t, err)
+
+	has, err = kv.HasPrefix("key")
+	assert.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestPredicates(t *testing.T) {
+	kv := NewMemoryKV()
+
+	// predicates not supported for mem kv for now
+	err := kv.MultiSaveAndRemove(map[string]string{}, []string{}, predicates.ValueEqual("a", "b"))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, merr.ErrServiceUnavailable)
+
+	err = kv.MultiSaveAndRemoveWithPrefix(map[string]string{}, []string{}, predicates.ValueEqual("a", "b"))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, merr.ErrServiceUnavailable)
 }

@@ -18,27 +18,29 @@ package dist
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/log"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
-	"github.com/milvus-io/milvus/internal/util/commonpbutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-	"go.uber.org/zap"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 const (
-	distReqTimeout  = 3 * time.Second
-	maxFailureTimes = 3
+	distReqTimeout         = 3 * time.Second
+	heartBeatLagBehindWarn = 3 * time.Second
+	maxFailureTimes        = 3
 )
 
 type distHandler struct {
@@ -56,56 +58,34 @@ type distHandler struct {
 
 func (dh *distHandler) start(ctx context.Context) {
 	defer dh.wg.Done()
-	logger := log.With(zap.Int64("nodeID", dh.nodeID))
-	logger.Info("start dist handler")
-	ticker := time.NewTicker(Params.QueryCoordCfg.DistPullInterval)
-	id := int64(1)
+	log := log.Ctx(ctx).With(zap.Int64("nodeID", dh.nodeID)).WithRateGroup("qcv2.distHandler", 1, 60)
+	log.Info("start dist handler")
+	ticker := time.NewTicker(Params.QueryCoordCfg.DistPullInterval.GetAsDuration(time.Millisecond))
+	defer ticker.Stop()
 	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("close dist handler due to context done")
+			log.Info("close dist handler due to context done")
 			return
 		case <-dh.c:
-			logger.Info("close dist handelr")
+			log.Info("close dist handler")
 			return
 		case <-ticker.C:
-			dh.mu.Lock()
-			cctx, cancel := context.WithTimeout(ctx, distReqTimeout)
-			resp, err := dh.client.GetDataDistribution(cctx, dh.nodeID, &querypb.GetDataDistributionRequest{
-				Base: commonpbutil.NewMsgBase(
-					commonpbutil.WithMsgType(commonpb.MsgType_GetDistribution),
-				),
-			})
-			cancel()
-
-			if err != nil || resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-				failures++
-				dh.logFailureInfo(resp, err)
+			resp, err := dh.getDistribution(ctx)
+			if err != nil {
+				node := dh.nodeManager.Get(dh.nodeID)
+				fields := []zap.Field{zap.Int("times", failures)}
+				if node != nil {
+					fields = append(fields, zap.Time("lastHeartbeat", node.LastHeartbeat()))
+				}
+				fields = append(fields, zap.Error(err))
+				log.RatedWarn(30.0, "failed to get data distribution", fields...)
 			} else {
 				failures = 0
 				dh.handleDistResp(resp)
 			}
-
-			if failures >= maxFailureTimes {
-				log.RatedInfo(30.0, fmt.Sprintf("can not get data distribution from node %d for %d times", dh.nodeID, failures))
-				// TODO: kill the querynode server and stop the loop?
-			}
-			id++
-			dh.mu.Unlock()
 		}
-	}
-}
-
-func (dh *distHandler) logFailureInfo(resp *querypb.GetDataDistributionResponse, err error) {
-	log.With(zap.Int64("nodeID", dh.nodeID))
-	if err != nil {
-		log.Warn("failed to get data distribution",
-			zap.Error(err))
-	} else if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		log.Warn("failed to get data distribution",
-			zap.Any("errorCode", resp.GetStatus().GetErrorCode()),
-			zap.Any("reason", resp.GetStatus().GetReason()))
 	}
 }
 
@@ -116,6 +96,11 @@ func (dh *distHandler) handleDistResp(resp *querypb.GetDataDistributionResponse)
 			session.WithSegmentCnt(len(resp.GetSegments())),
 			session.WithChannelCnt(len(resp.GetChannels())),
 		)
+		if time.Since(node.LastHeartbeat()) > heartBeatLagBehindWarn {
+			log.Warn("node last heart beat time lag too behind", zap.Time("now", time.Now()),
+				zap.Time("lastHeartBeatTime", node.LastHeartbeat()), zap.Int64("nodeID", node.ID()))
+		}
+		node.SetLastHeartbeat(time.Now())
 	}
 
 	dh.updateSegmentsDistribution(resp)
@@ -128,7 +113,12 @@ func (dh *distHandler) handleDistResp(resp *querypb.GetDataDistributionResponse)
 func (dh *distHandler) updateSegmentsDistribution(resp *querypb.GetDataDistributionResponse) {
 	updates := make([]*meta.Segment, 0, len(resp.GetSegments()))
 	for _, s := range resp.GetSegments() {
-		segmentInfo := dh.target.GetSegment(s.GetID())
+		// for collection which is already loaded
+		segmentInfo := dh.target.GetHistoricalSegment(s.GetCollection(), s.GetID(), meta.CurrentTarget)
+		if segmentInfo == nil {
+			// for collection which is loading
+			segmentInfo = dh.target.GetHistoricalSegment(s.GetCollection(), s.GetID(), meta.NextTarget)
+		}
 		var segment *meta.Segment
 		if segmentInfo == nil {
 			segment = &meta.Segment{
@@ -138,14 +128,18 @@ func (dh *distHandler) updateSegmentsDistribution(resp *querypb.GetDataDistribut
 					PartitionID:   s.GetPartition(),
 					InsertChannel: s.GetChannel(),
 				},
-				Node:    resp.GetNodeID(),
-				Version: s.GetVersion(),
+				Node:               resp.GetNodeID(),
+				Version:            s.GetVersion(),
+				LastDeltaTimestamp: s.GetLastDeltaTimestamp(),
+				IndexInfo:          s.GetIndexInfo(),
 			}
 		} else {
 			segment = &meta.Segment{
-				SegmentInfo: proto.Clone(segmentInfo).(*datapb.SegmentInfo),
-				Node:        resp.GetNodeID(),
-				Version:     s.GetVersion(),
+				SegmentInfo:        proto.Clone(segmentInfo).(*datapb.SegmentInfo),
+				Node:               resp.GetNodeID(),
+				Version:            s.GetVersion(),
+				LastDeltaTimestamp: s.GetLastDeltaTimestamp(),
+				IndexInfo:          s.GetIndexInfo(),
 			}
 		}
 		updates = append(updates, segment)
@@ -157,7 +151,7 @@ func (dh *distHandler) updateSegmentsDistribution(resp *querypb.GetDataDistribut
 func (dh *distHandler) updateChannelsDistribution(resp *querypb.GetDataDistributionResponse) {
 	updates := make([]*meta.DmChannel, 0, len(resp.GetChannels()))
 	for _, ch := range resp.GetChannels() {
-		channelInfo := dh.target.GetDmChannel(ch.GetChannel())
+		channelInfo := dh.target.GetDmChannel(ch.GetCollection(), ch.GetChannel(), meta.CurrentTarget)
 		var channel *meta.DmChannel
 		if channelInfo == nil {
 			channel = &meta.DmChannel{
@@ -180,12 +174,36 @@ func (dh *distHandler) updateChannelsDistribution(resp *querypb.GetDataDistribut
 func (dh *distHandler) updateLeaderView(resp *querypb.GetDataDistributionResponse) {
 	updates := make([]*meta.LeaderView, 0, len(resp.GetLeaderViews()))
 	for _, lview := range resp.GetLeaderViews() {
+		segments := make(map[int64]*meta.Segment)
+
+		for ID, position := range lview.GrowingSegments {
+			segments[ID] = &meta.Segment{
+				SegmentInfo: &datapb.SegmentInfo{
+					ID:            ID,
+					CollectionID:  lview.GetCollection(),
+					StartPosition: position,
+					InsertChannel: lview.GetChannel(),
+				},
+				Node: resp.NodeID,
+			}
+		}
+
+		var version int64
+		for _, channel := range resp.GetChannels() {
+			if channel.GetChannel() == lview.GetChannel() {
+				version = channel.GetVersion()
+				break
+			}
+		}
+
 		view := &meta.LeaderView{
 			ID:              resp.GetNodeID(),
 			CollectionID:    lview.GetCollection(),
 			Channel:         lview.GetChannel(),
+			Version:         version,
 			Segments:        lview.GetSegmentDist(),
-			GrowingSegments: typeutil.NewUniqueSet(lview.GetGrowingSegmentIDs()...),
+			GrowingSegments: segments,
+			TargetVersion:   lview.TargetVersion,
 		}
 		updates = append(updates, view)
 	}
@@ -193,28 +211,45 @@ func (dh *distHandler) updateLeaderView(resp *querypb.GetDataDistributionRespons
 	dh.dist.LeaderViewManager.Update(resp.GetNodeID(), updates...)
 }
 
-func (dh *distHandler) getDistribution(ctx context.Context) {
+func (dh *distHandler) getDistribution(ctx context.Context) (*querypb.GetDataDistributionResponse, error) {
 	dh.mu.Lock()
 	defer dh.mu.Unlock()
-	cctx, cancel := context.WithTimeout(ctx, distReqTimeout)
-	resp, err := dh.client.GetDataDistribution(cctx, dh.nodeID, &querypb.GetDataDistributionRequest{
+
+	channels := make(map[string]*msgpb.MsgPosition)
+	for _, channel := range dh.dist.ChannelDistManager.GetByNode(dh.nodeID) {
+		targetChannel := dh.target.GetDmChannel(channel.GetCollectionID(), channel.GetChannelName(), meta.CurrentTarget)
+		if targetChannel == nil {
+			continue
+		}
+
+		channels[channel.GetChannelName()] = targetChannel.GetSeekPosition()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, distReqTimeout)
+	defer cancel()
+	resp, err := dh.client.GetDataDistribution(ctx, dh.nodeID, &querypb.GetDataDistributionRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_GetDistribution),
 		),
+		Checkpoints: channels,
 	})
-	cancel()
-
-	if err != nil || resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		dh.logFailureInfo(resp, err)
-	} else {
-		dh.handleDistResp(resp)
+	if err != nil {
+		return nil, err
 	}
+	if !merr.Ok(resp.GetStatus()) {
+		return nil, merr.Error(resp.GetStatus())
+	}
+	return resp, nil
 }
 
 func (dh *distHandler) stop() {
 	dh.stopOnce.Do(func() {
 		close(dh.c)
 		dh.wg.Wait()
+
+		// clear dist
+		dh.dist.ChannelDistManager.Update(dh.nodeID)
+		dh.dist.SegmentDistManager.Update(dh.nodeID)
 	})
 }
 

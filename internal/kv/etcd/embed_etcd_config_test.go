@@ -20,25 +20,24 @@ import (
 	"os"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-
-	embed_etcd_kv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	embed_etcd_kv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestEtcdConfigLoad(te *testing.T) {
 	te.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
-	param := new(paramtable.ServiceParam)
+	param := new(paramtable.ComponentParam)
 
 	te.Setenv("etcd.use.embed", "true")
-	// TODO, not sure if the relative path works for ci environment
 	te.Setenv("etcd.config.path", "../../../configs/advanced/etcd.yaml")
 	te.Setenv("etcd.data.dir", "etcd.test.data.dir")
 
-	param.Init()
-	//clean up data
+	param.Init(paramtable.NewBaseTable())
+	// clean up data
 	defer func() {
 		os.RemoveAll("etcd.test.data.dir")
 	}()

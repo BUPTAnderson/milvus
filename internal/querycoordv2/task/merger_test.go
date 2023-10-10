@@ -21,10 +21,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
-	"github.com/stretchr/testify/suite"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type MergerSuite struct {
@@ -39,8 +41,8 @@ type MergerSuite struct {
 }
 
 func (suite *MergerSuite) SetupSuite() {
-	Params.Init()
-	Params.QueryCoordCfg.TaskMergeCap = 3
+	paramtable.Init()
+	paramtable.Get().Save(Params.QueryCoordCfg.TaskMergeCap.Key, "3")
 	suite.collectionID = 1000
 	suite.replicaID = 100
 	suite.nodeID = 1
@@ -54,7 +56,7 @@ func (suite *MergerSuite) SetupSuite() {
 					InsertChannel: "dmc0",
 				},
 			},
-			DeltaPositions: []*internalpb.MsgPosition{
+			DeltaPositions: []*msgpb.MsgPosition{
 				{
 					ChannelName: "dmc0",
 					Timestamp:   2,
@@ -74,7 +76,7 @@ func (suite *MergerSuite) SetupSuite() {
 					InsertChannel: "dmc0",
 				},
 			},
-			DeltaPositions: []*internalpb.MsgPosition{
+			DeltaPositions: []*msgpb.MsgPosition{
 				{
 					ChannelName: "dmc0",
 					Timestamp:   3,
@@ -94,7 +96,7 @@ func (suite *MergerSuite) SetupSuite() {
 					InsertChannel: "dmc0",
 				},
 			},
-			DeltaPositions: []*internalpb.MsgPosition{
+			DeltaPositions: []*msgpb.MsgPosition{
 				{
 					ChannelName: "dmc0",
 					Timestamp:   1,
@@ -120,9 +122,9 @@ func (suite *MergerSuite) TestMerge() {
 	ctx := context.Background()
 
 	for segmentID := int64(1); segmentID <= 3; segmentID++ {
-		task := NewSegmentTask(ctx, timeout, 0, suite.collectionID, suite.replicaID,
+		task, err := NewSegmentTask(ctx, timeout, 0, suite.collectionID, suite.replicaID,
 			NewSegmentAction(suite.nodeID, ActionTypeGrow, "", segmentID))
-
+		suite.NoError(err)
 		suite.merger.Add(NewLoadSegmentsTask(task, 0, suite.requests[segmentID]))
 	}
 
@@ -134,6 +136,9 @@ func (suite *MergerSuite) TestMerge() {
 	suite.Len(task.steps, 3)
 	suite.EqualValues(1, task.Result().DeltaPositions[0].Timestamp)
 	suite.EqualValues(1, task.Result().DeltaPositions[1].Timestamp)
+	suite.merger.Stop()
+	_, ok := <-suite.merger.Chan()
+	suite.Equal(ok, false)
 }
 
 func TestMerger(t *testing.T) {

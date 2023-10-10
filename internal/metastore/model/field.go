@@ -1,39 +1,46 @@
 package model
 
 import (
-	"github.com/milvus-io/milvus/internal/common"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
 )
 
 type Field struct {
-	FieldID      int64
-	Name         string
-	IsPrimaryKey bool
-	Description  string
-	DataType     schemapb.DataType
-	TypeParams   []*commonpb.KeyValuePair
-	IndexParams  []*commonpb.KeyValuePair
-	AutoID       bool
-	State        schemapb.FieldState
+	FieldID        int64
+	Name           string
+	IsPrimaryKey   bool
+	Description    string
+	DataType       schemapb.DataType
+	TypeParams     []*commonpb.KeyValuePair
+	IndexParams    []*commonpb.KeyValuePair
+	AutoID         bool
+	State          schemapb.FieldState
+	IsDynamic      bool
+	IsPartitionKey bool // partition key mode, multi logic partitions share a physical partition
+	DefaultValue   *schemapb.ValueField
+	ElementType    schemapb.DataType
 }
 
-func (f Field) Available() bool {
+func (f *Field) Available() bool {
 	return f.State == schemapb.FieldState_FieldCreated
 }
 
-func (f Field) Clone() *Field {
+func (f *Field) Clone() *Field {
 	return &Field{
-		FieldID:      f.FieldID,
-		Name:         f.Name,
-		IsPrimaryKey: f.IsPrimaryKey,
-		Description:  f.Description,
-		DataType:     f.DataType,
-		TypeParams:   common.CloneKeyValuePairs(f.TypeParams),
-		IndexParams:  common.CloneKeyValuePairs(f.IndexParams),
-		AutoID:       f.AutoID,
-		State:        f.State,
+		FieldID:        f.FieldID,
+		Name:           f.Name,
+		IsPrimaryKey:   f.IsPrimaryKey,
+		Description:    f.Description,
+		DataType:       f.DataType,
+		TypeParams:     common.CloneKeyValuePairs(f.TypeParams),
+		IndexParams:    common.CloneKeyValuePairs(f.IndexParams),
+		AutoID:         f.AutoID,
+		State:          f.State,
+		IsDynamic:      f.IsDynamic,
+		IsPartitionKey: f.IsPartitionKey,
+		DefaultValue:   f.DefaultValue,
+		ElementType:    f.ElementType,
 	}
 }
 
@@ -50,15 +57,19 @@ func checkParamsEqual(paramsA, paramsB []*commonpb.KeyValuePair) bool {
 	return A.Equal(paramsB)
 }
 
-func (f Field) Equal(other Field) bool {
+func (f *Field) Equal(other Field) bool {
 	return f.FieldID == other.FieldID &&
 		f.Name == other.Name &&
 		f.IsPrimaryKey == other.IsPrimaryKey &&
 		f.Description == other.Description &&
 		f.DataType == other.DataType &&
-		checkParamsEqual(f.TypeParams, f.TypeParams) &&
+		checkParamsEqual(f.TypeParams, other.TypeParams) &&
 		checkParamsEqual(f.IndexParams, other.IndexParams) &&
-		f.AutoID == other.AutoID
+		f.AutoID == other.AutoID &&
+		f.IsPartitionKey == other.IsPartitionKey &&
+		f.IsDynamic == other.IsDynamic &&
+		f.DefaultValue == other.DefaultValue &&
+		f.ElementType == other.ElementType
 }
 
 func CheckFieldsEqual(fieldsA, fieldsB []*Field) bool {
@@ -80,14 +91,18 @@ func MarshalFieldModel(field *Field) *schemapb.FieldSchema {
 	}
 
 	return &schemapb.FieldSchema{
-		FieldID:      field.FieldID,
-		Name:         field.Name,
-		IsPrimaryKey: field.IsPrimaryKey,
-		Description:  field.Description,
-		DataType:     field.DataType,
-		TypeParams:   field.TypeParams,
-		IndexParams:  field.IndexParams,
-		AutoID:       field.AutoID,
+		FieldID:        field.FieldID,
+		Name:           field.Name,
+		IsPrimaryKey:   field.IsPrimaryKey,
+		Description:    field.Description,
+		DataType:       field.DataType,
+		TypeParams:     field.TypeParams,
+		IndexParams:    field.IndexParams,
+		AutoID:         field.AutoID,
+		IsDynamic:      field.IsDynamic,
+		IsPartitionKey: field.IsPartitionKey,
+		DefaultValue:   field.DefaultValue,
+		ElementType:    field.ElementType,
 	}
 }
 
@@ -109,14 +124,18 @@ func UnmarshalFieldModel(fieldSchema *schemapb.FieldSchema) *Field {
 	}
 
 	return &Field{
-		FieldID:      fieldSchema.FieldID,
-		Name:         fieldSchema.Name,
-		IsPrimaryKey: fieldSchema.IsPrimaryKey,
-		Description:  fieldSchema.Description,
-		DataType:     fieldSchema.DataType,
-		TypeParams:   fieldSchema.TypeParams,
-		IndexParams:  fieldSchema.IndexParams,
-		AutoID:       fieldSchema.AutoID,
+		FieldID:        fieldSchema.FieldID,
+		Name:           fieldSchema.Name,
+		IsPrimaryKey:   fieldSchema.IsPrimaryKey,
+		Description:    fieldSchema.Description,
+		DataType:       fieldSchema.DataType,
+		TypeParams:     fieldSchema.TypeParams,
+		IndexParams:    fieldSchema.IndexParams,
+		AutoID:         fieldSchema.AutoID,
+		IsDynamic:      fieldSchema.IsDynamic,
+		IsPartitionKey: fieldSchema.IsPartitionKey,
+		DefaultValue:   fieldSchema.DefaultValue,
+		ElementType:    fieldSchema.ElementType,
 	}
 }
 

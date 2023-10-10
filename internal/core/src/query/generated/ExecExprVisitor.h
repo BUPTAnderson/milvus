@@ -14,13 +14,19 @@
 // DO NOT EDIT
 #include <optional>
 #include <boost/variant.hpp>
+#include <type_traits>
 #include <utility>
 #include <deque>
 #include "segcore/SegmentGrowingImpl.h"
 #include "query/ExprImpl.h"
 #include "ExprVisitor.h"
+#include "ExecPlanNodeVisitor.h"
 
 namespace milvus::query {
+
+void
+AppendOneChunk(BitsetType& result, const FixedVector<bool>& chunk_res);
+
 class ExecExprVisitor : public ExprVisitor {
  public:
     void
@@ -44,9 +50,33 @@ class ExecExprVisitor : public ExprVisitor {
     void
     visit(CompareExpr& expr) override;
 
+    void
+    visit(ExistsExpr& expr) override;
+
+    void
+    visit(AlwaysTrueExpr& expr) override;
+
+    void
+    visit(JsonContainsExpr& expr) override;
+
  public:
-    ExecExprVisitor(const segcore::SegmentInternalInterface& segment, int64_t row_count, Timestamp timestamp)
-        : segment_(segment), row_count_(row_count), timestamp_(timestamp) {
+    ExecExprVisitor(const segcore::SegmentInternalInterface& segment,
+                    int64_t row_count,
+                    Timestamp timestamp)
+        : segment_(segment),
+          row_count_(row_count),
+          timestamp_(timestamp),
+          plan_visitor_(nullptr) {
+    }
+
+    ExecExprVisitor(const segcore::SegmentInternalInterface& segment,
+                    ExecPlanNodeVisitor* plan_visitor,
+                    int64_t row_count,
+                    Timestamp timestamp)
+        : segment_(segment),
+          plan_visitor_(plan_visitor),
+          row_count_(row_count),
+          timestamp_(timestamp) {
     }
 
     BitsetType
@@ -62,19 +92,57 @@ class ExecExprVisitor : public ExprVisitor {
  public:
     template <typename T, typename IndexFunc, typename ElementFunc>
     auto
-    ExecRangeVisitorImpl(FieldId field_id, IndexFunc func, ElementFunc element_func) -> BitsetType;
+    ExecRangeVisitorImpl(FieldId field_id,
+                         IndexFunc func,
+                         ElementFunc element_func) -> BitsetType;
 
     template <typename T, typename IndexFunc, typename ElementFunc>
     auto
-    ExecDataRangeVisitorImpl(FieldId field_id, IndexFunc index_func, ElementFunc element_func) -> BitsetType;
+    ExecDataRangeVisitorImpl(FieldId field_id,
+                             IndexFunc index_func,
+                             ElementFunc element_func) -> BitsetType;
+
+    template <typename T>
+    auto
+    ExecUnaryRangeVisitorDispatcherImpl(UnaryRangeExpr& expr_raw) -> BitsetType;
 
     template <typename T>
     auto
     ExecUnaryRangeVisitorDispatcher(UnaryRangeExpr& expr_raw) -> BitsetType;
 
+    template <typename ExprValueType>
+    auto
+    ExecUnaryRangeVisitorDispatcherJson(UnaryRangeExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecUnaryRangeVisitorDispatcherArray(UnaryRangeExpr& expr_raw)
+        -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecBinaryArithOpEvalRangeVisitorDispatcherJson(
+        BinaryArithOpEvalRangeExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecBinaryArithOpEvalRangeVisitorDispatcherArray(
+        BinaryArithOpEvalRangeExpr& expr_raw) -> BitsetType;
+
     template <typename T>
     auto
-    ExecBinaryArithOpEvalRangeVisitorDispatcher(BinaryArithOpEvalRangeExpr& expr_raw) -> BitsetType;
+    ExecBinaryArithOpEvalRangeVisitorDispatcher(
+        BinaryArithOpEvalRangeExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecBinaryRangeVisitorDispatcherJson(BinaryRangeExpr& expr_raw)
+        -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecBinaryRangeVisitorDispatcherArray(BinaryRangeExpr& expr_raw)
+        -> BitsetType;
 
     template <typename T>
     auto
@@ -84,9 +152,87 @@ class ExecExprVisitor : public ExprVisitor {
     auto
     ExecTermVisitorImpl(TermExpr& expr_raw) -> BitsetType;
 
+    template <typename T>
+    auto
+    ExecTermVisitorImplTemplate(TermExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecTermJsonVariableInField(TermExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecTermArrayVariableInField(TermExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecTermJsonFieldInVariable(TermExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecTermArrayFieldInVariable(TermExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecTermVisitorImplTemplateJson(TermExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecTermVisitorImplTemplateArray(TermExpr& expr_raw) -> BitsetType;
+
     template <typename CmpFunc>
     auto
-    ExecCompareExprDispatcher(CompareExpr& expr, CmpFunc cmp_func) -> BitsetType;
+    ExecCompareExprDispatcher(CompareExpr& expr, CmpFunc cmp_func)
+        -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecJsonContains(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecArrayContains(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    auto
+    ExecJsonContainsArray(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    auto
+    ExecJsonContainsWithDiffType(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecJsonContainsAll(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    template <typename ExprValueType>
+    auto
+    ExecArrayContainsAll(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    auto
+    ExecJsonContainsAllArray(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    auto
+    ExecJsonContainsAllWithDiffType(JsonContainsExpr& expr_raw) -> BitsetType;
+
+    template <typename CmpFunc>
+    BitsetType
+    ExecCompareExprDispatcherForNonIndexedSegment(CompareExpr& expr,
+                                                  CmpFunc cmp_func);
+
+    // This function only used to compare sealed segment
+    // which has only one chunk.
+    template <typename T, typename U, typename CmpFunc>
+    TargetBitmap
+    ExecCompareRightType(const T* left_raw_data,
+                         const FieldId& right_field_id,
+                         const int64_t current_chunk_id,
+                         CmpFunc cmp_func);
+
+    template <typename T, typename CmpFunc>
+    BitsetType
+    ExecCompareLeftType(const FieldId& left_field_id,
+                        const FieldId& right_field_id,
+                        const DataType& right_field_type,
+                        CmpFunc cmp_func);
 
  private:
     const segcore::SegmentInternalInterface& segment_;
@@ -94,5 +240,6 @@ class ExecExprVisitor : public ExprVisitor {
     int64_t row_count_;
 
     BitsetTypeOpt bitset_opt_;
+    ExecPlanNodeVisitor* plan_visitor_;
 };
 }  // namespace milvus::query

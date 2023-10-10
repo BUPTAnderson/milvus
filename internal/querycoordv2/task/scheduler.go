@@ -18,50 +18,61 @@ package task
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"time"
 
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	. "github.com/milvus-io/milvus/internal/util/typeutil"
-	"go.uber.org/zap"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	. "github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 const (
 	TaskTypeGrow Type = iota + 1
 	TaskTypeReduce
 	TaskTypeMove
-
-	taskPoolSize = 256
+	TaskTypeUpdate
 )
 
-var (
-	ErrConflictTaskExisted = errors.New("ConflictTaskExisted")
+var TaskTypeName = map[Type]string{
+	TaskTypeGrow:   "Grow",
+	TaskTypeReduce: "Reduce",
+	TaskTypeMove:   "Move",
+	TaskTypeUpdate: "Update",
+}
 
-	// The task is canceled or timeout
-	ErrTaskCanceled = errors.New("TaskCanceled")
+type Type int32
 
-	// The target node is offline,
-	// or the target segment is not in TargetManager,
-	// or the target channel is not in TargetManager
-	ErrTaskStale = errors.New("TaskStale")
-
-	// No enough memory to load segment
-	ErrResourceNotEnough = errors.New("ResourceNotEnough")
-
-	ErrTaskQueueFull = errors.New("TaskQueueFull")
-
-	ErrFailedResponse = errors.New("RpcFailed")
-)
-
-type Type = int32
+func (t Type) String() string {
+	return TaskTypeName[t]
+}
 
 type replicaSegmentIndex struct {
 	ReplicaID int64
 	SegmentID int64
+	IsGrowing bool
+}
+
+func NewReplicaSegmentIndex(task *SegmentTask) replicaSegmentIndex {
+	isGrowing := task.Actions()[0].(*SegmentAction).Scope() == querypb.DataScope_Streaming
+	return replicaSegmentIndex{
+		ReplicaID: task.ReplicaID(),
+		SegmentID: task.SegmentID(),
+		IsGrowing: isGrowing,
+	}
 }
 
 type replicaChannelIndex struct {
@@ -70,17 +81,17 @@ type replicaChannelIndex struct {
 }
 
 type taskQueue struct {
-	// TaskPriority -> Tasks
-	buckets [][]Task
-
-	cap int
+	// TaskPriority -> TaskID -> Task
+	buckets []map[int64]Task
 }
 
-func newTaskQueue(cap int) *taskQueue {
+func newTaskQueue() *taskQueue {
+	buckets := make([]map[int64]Task, len(TaskPriorities))
+	for i := range buckets {
+		buckets[i] = make(map[int64]Task)
+	}
 	return &taskQueue{
-		buckets: make([][]Task, len(TaskPriorities)),
-
-		cap: cap,
+		buckets: buckets,
 	}
 }
 
@@ -93,35 +104,21 @@ func (queue *taskQueue) Len() int {
 	return taskNum
 }
 
-func (queue *taskQueue) Cap() int {
-	return queue.cap
-}
-
-func (queue *taskQueue) Add(task Task) bool {
-	if queue.Len() >= queue.Cap() {
-		return false
-	}
-
-	queue.buckets[task.Priority()] = append(queue.buckets[task.Priority()], task)
-	return true
+func (queue *taskQueue) Add(task Task) {
+	bucket := queue.buckets[task.Priority()]
+	bucket[task.ID()] = task
 }
 
 func (queue *taskQueue) Remove(task Task) {
-	bucket := &queue.buckets[task.Priority()]
-
-	for i := range *bucket {
-		if (*bucket)[i].ID() == task.ID() {
-			*bucket = append((*bucket)[:i], (*bucket)[i+1:]...)
-			break
-		}
-	}
+	bucket := queue.buckets[task.Priority()]
+	delete(bucket, task.ID())
 }
 
 // Range iterates all tasks in the queue ordered by priority from high to low
 func (queue *taskQueue) Range(fn func(task Task) bool) {
 	for priority := len(queue.buckets) - 1; priority >= 0; priority-- {
-		for i := range queue.buckets[priority] {
-			if !fn(queue.buckets[priority][i]) {
+		for _, task := range queue.buckets[priority] {
+			if !fn(task) {
 				return
 			}
 		}
@@ -129,25 +126,30 @@ func (queue *taskQueue) Range(fn func(task Task) bool) {
 }
 
 type Scheduler interface {
-	Start(ctx context.Context)
+	Start()
 	Stop()
+	AddExecutor(nodeID int64)
+	RemoveExecutor(nodeID int64)
 	Add(task Task) error
 	Dispatch(node int64)
 	RemoveByNode(node int64)
 	GetNodeSegmentDelta(nodeID int64) int
 	GetNodeChannelDelta(nodeID int64) int
+	GetChannelTaskNum() int
+	GetSegmentTaskNum() int
 }
 
 type taskScheduler struct {
 	rwmutex     sync.RWMutex
 	ctx         context.Context
-	executor    *Executor
+	executors   map[int64]*Executor // NodeID -> Executor
 	idAllocator func() UniqueID
 
 	distMgr   *meta.DistributionManager
 	meta      *meta.Meta
 	targetMgr *meta.TargetManager
 	broker    meta.Broker
+	cluster   session.Cluster
 	nodeMgr   *session.NodeManager
 
 	tasks        UniqueSet
@@ -163,11 +165,12 @@ func NewScheduler(ctx context.Context,
 	targetMgr *meta.TargetManager,
 	broker meta.Broker,
 	cluster session.Cluster,
-	nodeMgr *session.NodeManager) *taskScheduler {
-	id := int64(0)
+	nodeMgr *session.NodeManager,
+) *taskScheduler {
+	id := time.Now().UnixMilli()
 	return &taskScheduler{
-		ctx:      ctx,
-		executor: NewExecutor(meta, distMgr, broker, targetMgr, cluster, nodeMgr),
+		ctx:       ctx,
+		executors: make(map[int64]*Executor),
 		idAllocator: func() UniqueID {
 			id++
 			return id
@@ -177,22 +180,66 @@ func NewScheduler(ctx context.Context,
 		meta:      meta,
 		targetMgr: targetMgr,
 		broker:    broker,
+		cluster:   cluster,
 		nodeMgr:   nodeMgr,
 
 		tasks:        make(UniqueSet),
 		segmentTasks: make(map[replicaSegmentIndex]Task),
 		channelTasks: make(map[replicaChannelIndex]Task),
-		processQueue: newTaskQueue(taskPoolSize),
-		waitQueue:    newTaskQueue(taskPoolSize * 10),
+		processQueue: newTaskQueue(),
+		waitQueue:    newTaskQueue(),
 	}
 }
 
-func (scheduler *taskScheduler) Start(ctx context.Context) {
-	scheduler.executor.Start(ctx)
-}
+func (scheduler *taskScheduler) Start() {}
 
 func (scheduler *taskScheduler) Stop() {
-	scheduler.executor.Stop()
+	scheduler.rwmutex.Lock()
+	defer scheduler.rwmutex.Unlock()
+
+	for nodeID, executor := range scheduler.executors {
+		executor.Stop()
+		delete(scheduler.executors, nodeID)
+	}
+
+	for _, task := range scheduler.segmentTasks {
+		scheduler.remove(task)
+	}
+	for _, task := range scheduler.channelTasks {
+		scheduler.remove(task)
+	}
+}
+
+func (scheduler *taskScheduler) AddExecutor(nodeID int64) {
+	scheduler.rwmutex.Lock()
+	defer scheduler.rwmutex.Unlock()
+
+	if _, exist := scheduler.executors[nodeID]; exist {
+		return
+	}
+
+	executor := NewExecutor(scheduler.meta,
+		scheduler.distMgr,
+		scheduler.broker,
+		scheduler.targetMgr,
+		scheduler.cluster,
+		scheduler.nodeMgr)
+
+	scheduler.executors[nodeID] = executor
+	executor.Start(scheduler.ctx)
+	log.Info("add executor for new QueryNode", zap.Int64("nodeID", nodeID))
+}
+
+func (scheduler *taskScheduler) RemoveExecutor(nodeID int64) {
+	scheduler.rwmutex.Lock()
+	defer scheduler.rwmutex.Unlock()
+
+	executor, ok := scheduler.executors[nodeID]
+	if ok {
+		executor.Stop()
+		delete(scheduler.executors, nodeID)
+		log.Info("remove executor of offline QueryNode", zap.Int64("nodeID", nodeID))
+	}
 }
 
 func (scheduler *taskScheduler) Add(task Task) error {
@@ -201,53 +248,101 @@ func (scheduler *taskScheduler) Add(task Task) error {
 
 	err := scheduler.preAdd(task)
 	if err != nil {
+		task.Cancel(err)
 		return err
 	}
 
 	task.SetID(scheduler.idAllocator())
+	scheduler.waitQueue.Add(task)
 	scheduler.tasks.Insert(task.ID())
 	switch task := task.(type) {
 	case *SegmentTask:
-		index := replicaSegmentIndex{task.ReplicaID(), task.SegmentID()}
+		index := NewReplicaSegmentIndex(task)
 		scheduler.segmentTasks[index] = task
 
 	case *ChannelTask:
 		index := replicaChannelIndex{task.ReplicaID(), task.Channel()}
 		scheduler.channelTasks[index] = task
 	}
-	if !scheduler.waitQueue.Add(task) {
-		log.Warn("failed to add task", zap.String("task", task.String()))
-		return nil
-	}
-	log.Info("task added", zap.String("task", task.String()))
+
+	scheduler.updateTaskMetrics()
+	log.Ctx(task.Context()).Info("task added", zap.String("task", task.String()))
 	return nil
 }
 
-// check checks whether the task is valid to add,
-// must hold lock
-func (scheduler *taskScheduler) preAdd(task Task) error {
-	if scheduler.waitQueue.Len() >= scheduler.waitQueue.Cap() {
-		return ErrTaskQueueFull
+func (scheduler *taskScheduler) updateTaskMetrics() {
+	segmentGrowNum, segmentReduceNum, segmentMoveNum := 0, 0, 0
+	channelGrowNum, channelReduceNum, channelMoveNum := 0, 0, 0
+	for _, task := range scheduler.segmentTasks {
+		taskType := GetTaskType(task)
+		switch taskType {
+		case TaskTypeGrow:
+			segmentGrowNum++
+		case TaskTypeReduce:
+			segmentReduceNum++
+		case TaskTypeMove:
+			segmentMoveNum++
+		}
 	}
 
+	for _, task := range scheduler.channelTasks {
+		taskType := GetTaskType(task)
+		switch taskType {
+		case TaskTypeGrow:
+			channelGrowNum++
+		case TaskTypeReduce:
+			channelReduceNum++
+		case TaskTypeMove:
+			channelMoveNum++
+		}
+	}
+
+	metrics.QueryCoordTaskNum.WithLabelValues(metrics.SegmentGrowTaskLabel).Set(float64(segmentGrowNum))
+	metrics.QueryCoordTaskNum.WithLabelValues(metrics.SegmentReduceTaskLabel).Set(float64(segmentReduceNum))
+	metrics.QueryCoordTaskNum.WithLabelValues(metrics.SegmentMoveTaskLabel).Set(float64(segmentMoveNum))
+	metrics.QueryCoordTaskNum.WithLabelValues(metrics.ChannelGrowTaskLabel).Set(float64(channelGrowNum))
+	metrics.QueryCoordTaskNum.WithLabelValues(metrics.ChannelReduceTaskLabel).Set(float64(channelReduceNum))
+	metrics.QueryCoordTaskNum.WithLabelValues(metrics.ChannelMoveTaskLabel).Set(float64(channelMoveNum))
+}
+
+// check whether the task is valid to add,
+// must hold lock
+func (scheduler *taskScheduler) preAdd(task Task) error {
 	switch task := task.(type) {
 	case *SegmentTask:
-		index := replicaSegmentIndex{task.ReplicaID(), task.segmentID}
+		index := NewReplicaSegmentIndex(task)
 		if old, ok := scheduler.segmentTasks[index]; ok {
 			if task.Priority() > old.Priority() {
 				log.Info("replace old task, the new one with higher priority",
 					zap.Int64("oldID", old.ID()),
-					zap.Int32("oldPriority", old.Priority()),
+					zap.String("oldPriority", old.Priority().String()),
 					zap.Int64("newID", task.ID()),
-					zap.Int32("newPriority", task.Priority()),
+					zap.String("newPriority", task.Priority().String()),
 				)
-				old.SetStatus(TaskStatusCanceled)
-				old.SetErr(utils.WrapError("replaced with the other one with higher priority", ErrTaskCanceled))
+				old.Cancel(merr.WrapErrServiceInternal("replaced with the other one with higher priority"))
 				scheduler.remove(old)
 				return nil
 			}
 
-			return ErrConflictTaskExisted
+			return merr.WrapErrServiceInternal("task with the same segment exists")
+		}
+
+		taskType := GetTaskType(task)
+
+		if taskType == TaskTypeGrow {
+			leaderSegmentDist := scheduler.distMgr.LeaderViewManager.GetSealedSegmentDist(task.SegmentID())
+			nodeSegmentDist := scheduler.distMgr.SegmentDistManager.GetSegmentDist(task.SegmentID())
+			if lo.Contains(leaderSegmentDist, task.Actions()[0].Node()) &&
+				lo.Contains(nodeSegmentDist, task.Actions()[0].Node()) {
+				return merr.WrapErrServiceInternal("segment loaded, it can be only balanced")
+			}
+		} else if taskType == TaskTypeMove {
+			leaderSegmentDist := scheduler.distMgr.LeaderViewManager.GetSealedSegmentDist(task.SegmentID())
+			nodeSegmentDist := scheduler.distMgr.SegmentDistManager.GetSegmentDist(task.SegmentID())
+			if !lo.Contains(leaderSegmentDist, task.Actions()[1].Node()) ||
+				!lo.Contains(nodeSegmentDist, task.Actions()[1].Node()) {
+				return merr.WrapErrServiceInternal("source segment released, stop balancing")
+			}
 		}
 
 	case *ChannelTask:
@@ -256,65 +351,55 @@ func (scheduler *taskScheduler) preAdd(task Task) error {
 			if task.Priority() > old.Priority() {
 				log.Info("replace old task, the new one with higher priority",
 					zap.Int64("oldID", old.ID()),
-					zap.Int32("oldPriority", old.Priority()),
+					zap.String("oldPriority", old.Priority().String()),
 					zap.Int64("newID", task.ID()),
-					zap.Int32("newPriority", task.Priority()),
+					zap.String("newPriority", task.Priority().String()),
 				)
-				old.SetStatus(TaskStatusCanceled)
-				old.SetErr(utils.WrapError("replaced with the other one with higher priority", ErrTaskCanceled))
+				old.Cancel(merr.WrapErrServiceInternal("replaced with the other one with higher priority"))
 				scheduler.remove(old)
 				return nil
 			}
 
-			return ErrConflictTaskExisted
+			return merr.WrapErrServiceInternal("task with the same channel exists")
 		}
 
+		taskType := GetTaskType(task)
+		if taskType == TaskTypeGrow {
+			nodesWithChannel := scheduler.distMgr.LeaderViewManager.GetChannelDist(task.Channel())
+			replicaNodeMap := utils.GroupNodesByReplica(scheduler.meta.ReplicaManager, task.CollectionID(), nodesWithChannel)
+			if _, ok := replicaNodeMap[task.ReplicaID()]; ok {
+				return merr.WrapErrServiceInternal("channel subscribed, it can be only balanced")
+			}
+		} else if taskType == TaskTypeMove {
+			channelDist := scheduler.distMgr.LeaderViewManager.GetChannelDist(task.Channel())
+			if !lo.Contains(channelDist, task.Actions()[1].Node()) {
+				return merr.WrapErrServiceInternal("source channel unsubscribed, stop balancing")
+			}
+		}
 	default:
 		panic(fmt.Sprintf("preAdd: forget to process task type: %+v", task))
 	}
-
 	return nil
-}
-
-func (scheduler *taskScheduler) promote(task Task) error {
-	log := log.With(
-		zap.Int64("collectionID", task.CollectionID()),
-		zap.Int64("taskID", task.ID()),
-		zap.Int64("source", task.SourceID()),
-	)
-	err := scheduler.prePromote(task)
-	if err != nil {
-		log.Info("failed to promote task", zap.Error(err))
-		return err
-	}
-
-	if scheduler.processQueue.Add(task) {
-		task.SetStatus(TaskStatusStarted)
-		return nil
-	}
-
-	return ErrTaskQueueFull
 }
 
 func (scheduler *taskScheduler) tryPromoteAll() {
 	// Promote waiting tasks
-	toPromote := make([]Task, 0, scheduler.processQueue.Cap()-scheduler.processQueue.Len())
+	toPromote := make([]Task, 0, scheduler.waitQueue.Len())
 	toRemove := make([]Task, 0)
 	scheduler.waitQueue.Range(func(task Task) bool {
 		err := scheduler.promote(task)
-		if errors.Is(err, ErrTaskStale) { // Task canceled or stale
-			task.SetStatus(TaskStatusStale)
-			task.SetErr(err)
+		if err != nil {
+			task.Cancel(err)
 			toRemove = append(toRemove, task)
-		} else if errors.Is(err, ErrTaskCanceled) {
-			task.SetStatus(TaskStatusCanceled)
-			task.SetErr(err)
-			toRemove = append(toRemove, task)
-		} else if err == nil {
+			log.Warn("failed to promote task",
+				zap.Int64("taskID", task.ID()),
+				zap.Error(err),
+			)
+		} else {
 			toPromote = append(toPromote, task)
 		}
 
-		return !errors.Is(err, ErrTaskQueueFull)
+		return true
 	})
 
 	for _, task := range toPromote {
@@ -331,13 +416,21 @@ func (scheduler *taskScheduler) tryPromoteAll() {
 	}
 }
 
-func (scheduler *taskScheduler) prePromote(task Task) error {
-	if scheduler.checkCanceled(task) {
-		return ErrTaskCanceled
-	} else if scheduler.checkStale(task) {
-		return ErrTaskStale
+func (scheduler *taskScheduler) promote(task Task) error {
+	log := log.With(
+		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.Int64("source", task.SourceID()),
+	)
+
+	if err := scheduler.check(task); err != nil {
+		log.Info("failed to promote task", zap.Error(err))
+		return err
 	}
 
+	scheduler.processQueue.Add(task)
+	task.SetStatus(TaskStatusStarted)
 	return nil
 }
 
@@ -347,6 +440,8 @@ func (scheduler *taskScheduler) Dispatch(node int64) {
 		log.Info("scheduler stopped")
 
 	default:
+		scheduler.rwmutex.Lock()
+		defer scheduler.rwmutex.Unlock()
 		scheduler.schedule(node)
 	}
 }
@@ -363,6 +458,20 @@ func (scheduler *taskScheduler) GetNodeChannelDelta(nodeID int64) int {
 	defer scheduler.rwmutex.RUnlock()
 
 	return calculateNodeDelta(nodeID, scheduler.channelTasks)
+}
+
+func (scheduler *taskScheduler) GetChannelTaskNum() int {
+	scheduler.rwmutex.RLock()
+	defer scheduler.rwmutex.RUnlock()
+
+	return len(scheduler.channelTasks)
+}
+
+func (scheduler *taskScheduler) GetSegmentTaskNum() int {
+	scheduler.rwmutex.RLock()
+	defer scheduler.rwmutex.RUnlock()
+
+	return len(scheduler.segmentTasks)
 }
 
 func calculateNodeDelta[K comparable, T ~map[K]Task](nodeID int64, tasks T) int {
@@ -393,7 +502,7 @@ func (scheduler *taskScheduler) GetNodeSegmentCntDelta(nodeID int64) int {
 				continue
 			}
 			segmentAction := action.(*SegmentAction)
-			segment := scheduler.targetMgr.GetSegment(segmentAction.SegmentID())
+			segment := scheduler.targetMgr.GetHistoricalSegment(task.CollectionID(), segmentAction.SegmentID(), meta.NextTarget)
 			if action.Type() == ActionTypeGrow {
 				delta += int(segment.GetNumOfRows())
 			} else {
@@ -405,13 +514,10 @@ func (scheduler *taskScheduler) GetNodeSegmentCntDelta(nodeID int64) int {
 }
 
 // schedule selects some tasks to execute, follow these steps for each started selected tasks:
-// 1. check whether this task is stale, set status to failed if stale
+// 1. check whether this task is stale, set status to canceled if stale
 // 2. step up the task's actions, set status to succeeded if all actions finished
 // 3. execute the current action of task
 func (scheduler *taskScheduler) schedule(node int64) {
-	scheduler.rwmutex.Lock()
-	defer scheduler.rwmutex.Unlock()
-
 	if scheduler.tasks.Len() == 0 {
 		return
 	}
@@ -430,10 +536,11 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	)
 
 	// Process tasks
+	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
 	scheduler.processQueue.Range(func(task Task) bool {
-		if scheduler.isRelated(task, node) {
-			scheduler.process(task)
+		if scheduler.preProcess(task) && scheduler.isRelated(task, node) {
+			toProcess = append(toProcess, task)
 		}
 		if task.Status() != TaskStatusStarted {
 			toRemove = append(toRemove, task)
@@ -442,14 +549,27 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		return true
 	})
 
+	// The scheduler doesn't limit the number of tasks,
+	// to commit tasks to executors as soon as possible, to reach higher merge possibility
+	failCount := atomic.NewInt32(0)
+	funcutil.ProcessFuncParallel(len(toProcess), runtime.GOMAXPROCS(0), func(idx int) error {
+		if !scheduler.process(toProcess[idx]) {
+			failCount.Inc()
+		}
+		return nil
+	}, "process")
+
 	for _, task := range toRemove {
 		scheduler.remove(task)
 	}
 
 	log.Info("processed tasks",
-		zap.Int("toRemoveNum", len(toRemove)))
+		zap.Int("toProcessNum", len(toProcess)),
+		zap.Int32("failCount", failCount.Load()),
+		zap.Int("toRemoveNum", len(toRemove)),
+	)
 
-	log.Debug("process tasks related to node done",
+	log.Info("process tasks related to node done",
 		zap.Int("processingTaskNum", scheduler.processQueue.Len()),
 		zap.Int("waitingTaskNum", scheduler.waitQueue.Len()),
 		zap.Int("segmentTaskNum", len(scheduler.segmentTasks)),
@@ -463,7 +583,13 @@ func (scheduler *taskScheduler) isRelated(task Task, node int64) bool {
 			return true
 		}
 		if task, ok := task.(*SegmentTask); ok {
-			segment := scheduler.targetMgr.GetSegment(task.SegmentID())
+			taskType := GetTaskType(task)
+			var segment *datapb.SegmentInfo
+			if taskType == TaskTypeMove || taskType == TaskTypeUpdate {
+				segment = scheduler.targetMgr.GetHistoricalSegment(task.CollectionID(), task.SegmentID(), meta.CurrentTarget)
+			} else {
+				segment = scheduler.targetMgr.GetHistoricalSegment(task.CollectionID(), task.SegmentID(), meta.NextTarget)
+			}
 			if segment == nil {
 				continue
 			}
@@ -483,46 +609,62 @@ func (scheduler *taskScheduler) isRelated(task Task, node int64) bool {
 	return false
 }
 
+// preProcess checks the finished actions of task,
+// and converts the task's status,
+// return true if the task should be executed,
+// false otherwise
+func (scheduler *taskScheduler) preProcess(task Task) bool {
+	if task.Status() != TaskStatusStarted {
+		return false
+	}
+
+	actions, step := task.Actions(), task.Step()
+	for step < len(actions) && actions[step].IsFinished(scheduler.distMgr) {
+		task.StepUp()
+		step++
+	}
+
+	if task.IsFinished(scheduler.distMgr) {
+		task.SetStatus(TaskStatusSucceeded)
+	} else {
+		if err := scheduler.check(task); err != nil {
+			task.Cancel(err)
+		}
+	}
+
+	return task.Status() == TaskStatusStarted
+}
+
 // process processes the given task,
 // return true if the task is started and succeeds to commit the current action
 func (scheduler *taskScheduler) process(task Task) bool {
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
-		zap.Int32("type", GetTaskType(task)),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.String("type", GetTaskType(task).String()),
 		zap.Int64("source", task.SourceID()),
 	)
 
-	if task.IsFinished(scheduler.distMgr) {
-		task.SetStatus(TaskStatusSucceeded)
-	} else if scheduler.checkCanceled(task) {
-		task.SetStatus(TaskStatusCanceled)
-		if task.Err() == nil {
-			task.SetErr(ErrTaskCanceled)
-		}
-	} else if scheduler.checkStale(task) {
-		task.SetStatus(TaskStatusStale)
-		task.SetErr(ErrTaskStale)
+	actions, step := task.Actions(), task.Step()
+	executor, ok := scheduler.executors[actions[step].Node()]
+	if !ok {
+		log.Warn("no executor for QueryNode",
+			zap.Int("step", step),
+			zap.Int64("nodeID", actions[step].Node()))
+		return false
 	}
 
-	step := task.Step()
-	log = log.With(zap.Int("step", step))
-	switch task.Status() {
-	case TaskStatusStarted:
-		if scheduler.executor.Execute(task, step) {
-			return true
-		}
+	return executor.Execute(task, step)
+}
 
-	case TaskStatusSucceeded:
-		log.Info("task succeeded")
-
-	case TaskStatusCanceled, TaskStatusStale:
-		log.Warn("failed to execute task", zap.Error(task.Err()))
-
-	default:
-		panic(fmt.Sprintf("invalid task status: %v", task.Status()))
+func (scheduler *taskScheduler) check(task Task) error {
+	err := task.Context().Err()
+	if err == nil {
+		err = scheduler.checkStale(task)
 	}
 
-	return false
+	return err
 }
 
 func (scheduler *taskScheduler) RemoveByNode(node int64) {
@@ -541,21 +683,40 @@ func (scheduler *taskScheduler) RemoveByNode(node int64) {
 	}
 }
 
-func (scheduler *taskScheduler) remove(task Task) {
-	log := log.With(
+func (scheduler *taskScheduler) recordSegmentTaskError(task *SegmentTask) {
+	log.Warn("task scheduler recordSegmentTaskError",
 		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.Int64("segmentID", task.SegmentID()),
+		zap.Int32("taskStatus", task.Status()),
+		zap.Error(task.err),
+	)
+	meta.GlobalFailedLoadCache.Put(task.collectionID, task.Err())
+}
+
+func (scheduler *taskScheduler) remove(task Task) {
+	log := log.Ctx(task.Context()).With(
+		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int32("taskStatus", task.Status()),
 	)
-	task.Cancel()
+	task.Cancel(nil)
 	scheduler.tasks.Remove(task.ID())
 	scheduler.waitQueue.Remove(task)
 	scheduler.processQueue.Remove(task)
 
 	switch task := task.(type) {
 	case *SegmentTask:
-		index := replicaSegmentIndex{task.ReplicaID(), task.SegmentID()}
+		index := NewReplicaSegmentIndex(task)
 		delete(scheduler.segmentTasks, index)
 		log = log.With(zap.Int64("segmentID", task.SegmentID()))
+		if task.Status() == TaskStatusFailed &&
+			task.Err() != nil &&
+			!errors.IsAny(task.Err(), merr.ErrChannelNotFound, merr.ErrServiceRequestLimitExceeded) {
+			scheduler.recordSegmentTaskError(task)
+		}
 
 	case *ChannelTask:
 		index := replicaChannelIndex{task.ReplicaID(), task.Channel()}
@@ -563,40 +724,27 @@ func (scheduler *taskScheduler) remove(task Task) {
 		log = log.With(zap.String("channel", task.Channel()))
 	}
 
-	log.Debug("task removed")
+	scheduler.updateTaskMetrics()
+	log.Debug("task removed", zap.Stack("stack"))
 }
 
-func (scheduler *taskScheduler) checkCanceled(task Task) bool {
+func (scheduler *taskScheduler) checkStale(task Task) error {
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
-		zap.Int64("source", task.SourceID()),
-	)
-
-	select {
-	case <-task.Context().Done():
-		log.Warn("the task is timeout or canceled")
-		return true
-
-	default:
-		return false
-	}
-}
-
-func (scheduler *taskScheduler) checkStale(task Task) bool {
-	log := log.With(
-		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int64("source", task.SourceID()),
 	)
 
 	switch task := task.(type) {
 	case *SegmentTask:
-		if scheduler.checkSegmentTaskStale(task) {
-			return true
+		if err := scheduler.checkSegmentTaskStale(task); err != nil {
+			return err
 		}
 
 	case *ChannelTask:
-		if scheduler.checkChannelTaskStale(task) {
-			return true
+		if err := scheduler.checkChannelTaskStale(task); err != nil {
+			return err
 		}
 
 	default:
@@ -610,91 +758,77 @@ func (scheduler *taskScheduler) checkStale(task Task) bool {
 
 		if scheduler.nodeMgr.Get(action.Node()) == nil {
 			log.Warn("the task is stale, the target node is offline")
-			return true
+			return merr.WrapErrNodeNotFound(action.Node())
 		}
 	}
 
-	return false
+	return nil
 }
 
-func (scheduler *taskScheduler) checkSegmentTaskStale(task *SegmentTask) bool {
+func (scheduler *taskScheduler) checkSegmentTaskStale(task *SegmentTask) error {
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int64("source", task.SourceID()),
 	)
 
 	for _, action := range task.Actions() {
 		switch action.Type() {
 		case ActionTypeGrow:
-			segment := scheduler.targetMgr.GetSegment(task.SegmentID())
-			if segment == nil {
-				log.Warn("task stale due tu the segment to load not exists in targets",
-					zap.Int64("segment", task.segmentID))
-				return true
+			taskType := GetTaskType(task)
+			var segment *datapb.SegmentInfo
+			if taskType == TaskTypeMove || taskType == TaskTypeUpdate {
+				segment = scheduler.targetMgr.GetHistoricalSegment(task.CollectionID(), task.SegmentID(), meta.CurrentTarget)
+			} else {
+				segment = scheduler.targetMgr.GetHistoricalSegment(task.CollectionID(), task.SegmentID(), meta.NextTarget)
 			}
+			if segment == nil {
+				log.Warn("task stale due to the segment to load not exists in targets",
+					zap.Int64("segment", task.segmentID),
+					zap.String("taskType", taskType.String()),
+				)
+				return merr.WrapErrSegmentReduplicate(task.SegmentID(), "target doesn't contain this segment")
+			}
+
 			replica := scheduler.meta.ReplicaManager.GetByCollectionAndNode(task.CollectionID(), action.Node())
 			if replica == nil {
 				log.Warn("task stale due to replica not found")
-				return true
+				return merr.WrapErrReplicaNotFound(task.CollectionID(), "by collectionID")
 			}
 			_, ok := scheduler.distMgr.GetShardLeader(replica, segment.GetInsertChannel())
 			if !ok {
 				log.Warn("task stale due to leader not found")
-				return true
+				return merr.WrapErrChannelNotFound(segment.GetInsertChannel(), "failed to get shard delegator")
 			}
 
 		case ActionTypeReduce:
-			// Do nothing here,
-			// the task should succeeded if the segment not exists
-			// sealed := scheduler.distMgr.SegmentDistManager.GetByNode(action.Node())
-			// growing := scheduler.distMgr.LeaderViewManager.GetSegmentByNode(action.Node())
-			// segments := make([]int64, 0, len(sealed)+len(growing))
-			// for _, segment := range sealed {
-			// 	segments = append(segments, segment.GetID())
-			// }
-			// segments = append(segments, growing...)
-			// if !funcutil.SliceContain(segments, task.SegmentID()) {
-			// 	log.Warn("the task is stale, the segment to release not exists in dist",
-			// 		zap.Int64("segment", task.segmentID))
-			// 	return true
-			// }
+			// do nothing here
 		}
 	}
-	return false
+	return nil
 }
 
-func (scheduler *taskScheduler) checkChannelTaskStale(task *ChannelTask) bool {
+func (scheduler *taskScheduler) checkChannelTaskStale(task *ChannelTask) error {
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int64("source", task.SourceID()),
 	)
 
 	for _, action := range task.Actions() {
 		switch action.Type() {
 		case ActionTypeGrow:
-			if !scheduler.targetMgr.ContainDmChannel(task.Channel()) {
+			if scheduler.targetMgr.GetDmChannel(task.collectionID, task.Channel(), meta.NextTarget) == nil {
 				log.Warn("the task is stale, the channel to subscribe not exists in targets",
 					zap.String("channel", task.Channel()))
-				return true
+				return merr.WrapErrChannelReduplicate(task.Channel(), "target doesn't contain this channel")
 			}
 
 		case ActionTypeReduce:
-			// Do nothing here,
-			// the task should succeeded if the channel not exists
-			// hasChannel := false
-			// views := scheduler.distMgr.LeaderViewManager.GetLeaderView(action.Node())
-			// for _, view := range views {
-			// 	if view.Channel == task.Channel() {
-			// 		hasChannel = true
-			// 		break
-			// 	}
-			// }
-			// if !hasChannel {
-			// 	log.Warn("the task is stale, the channel to unsubscribe not exists in dist",
-			// 		zap.String("channel", task.Channel()))
-			// 	return true
-			// }
+			// do nothing here
 		}
 	}
-	return false
+	return nil
 }
